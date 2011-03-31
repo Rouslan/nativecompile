@@ -1,0 +1,31 @@
+Experimental bytecode to machine code compiler
+
+CPython 3.2 is required. Higher versions might work, but since the Python
+bytecode can vary from version to version, its completely hit or miss.
+
+Currently only x86 compatible builds are supported. This will run on x86_64
+processors but only if Python was compiled in 32-bit mode.
+
+Currently only the following bytecode instructions are implemented:
+POP_TOP
+LOAD_NAME
+LOAD_GLOBAL
+LOAD_CONST
+CALL_FUNCTION
+RETURN_VALUE
+
+
+Basic Usage:
+
+>>> import nativecompile
+>>> bcode = compile('print("Hello World!")','<string>','exec')
+>>> mcode = nativecompile.compile(bcode)
+>>> mcode()
+Hello World!
+
+
+This is a very unsophisticated compiler. The bytecode is translated into the
+equivalent machine code with no optimizations (almost; some push and pop
+instructions can be eliminated by using registers instead). However, this does
+remove the overhead of the interpreter loop and thus should result in a modest
+performance boost.
