@@ -30,6 +30,13 @@
     #define REF_DEBUG_VAL 0
 #endif
 
+#ifdef COUNT_ALLOCS
+    #define COUNT_ALLOCS_VAL 1
+#else
+    #define COUNT_ALLOCS_VAL 0
+#endif
+
+
 
 /* copied from Python/ceval.c */
 #define NAME_ERROR_MSG \
@@ -51,6 +58,8 @@ static PyObject *_call_function(unsigned int arg,...) {
     PyObject *func;
     PyObject *val;
     PyObject *key;
+    int r;
+    int titems;
     int pos_count = arg & 0xFF;
     int kw_count = (arg & 0xFF00) >> 8;
     kw = NULL;
@@ -58,29 +67,27 @@ static PyObject *_call_function(unsigned int arg,...) {
     va_start(stack,arg);
     
     if(kw_count) {
-        if(!(kw = PyDict_New())) {
-            va_end(stack);
-            return NULL;
-        }
+        if(!(kw = PyDict_New())) goto err;
         
-        for(;kw_count > 0; --kw_count) {
+        while(kw_count--) {
             val = va_arg(stack,PyObject*);
             key = va_arg(stack,PyObject*);
-            if(PyDict_SetItem(kw,key,val) == -1) {
-                va_end(stack);
+            r = PyDict_SetItem(kw,key,val);
+            Py_DECREF(val);
+            Py_DECREF(key);
+            if(r == -1) {
                 Py_DECREF(kw);
-                return NULL;
+                goto err;
             }
         }
     }
     
     if(!(pos = PyTuple_New(pos_count))) {
-        va_end(stack);
         Py_XDECREF(kw);
-        return NULL;
+        goto err;
     }
     
-    while(--pos_count >= 0) {
+    while(pos_count--) {
         val = va_arg(stack,PyObject*);
         Py_INCREF(val);
         PyTuple_SET_ITEM(pos,pos_count,val);
@@ -96,6 +103,17 @@ static PyObject *_call_function(unsigned int arg,...) {
     Py_DECREF(pos);
     
     return val;
+
+err:
+    titems = kw_count * 2 + pos_count + 1;
+    for(;kw_count > 0; --kw_count) {
+        val = va_arg(stack,PyObject*);
+        Py_DECREF(val);
+    }
+    
+    va_end(stack);
+    
+    return NULL;
 }
 
 /* copied from Python/ceval.c */
@@ -324,8 +342,10 @@ PyInit_pyinternals(void) {
     m = PyModule_Create(&this_module);
     if(PyModule_AddIntConstant(m,"refcnt_offset",offsetof(PyObject,ob_refcnt)) == -1) return NULL;
     if(PyModule_AddIntConstant(m,"type_offset",offsetof(PyObject,ob_type)) == -1) return NULL;
+    if(PyModule_AddIntConstant(m,"type_dealloc_offset",offsetof(PyTypeObject,tp_dealloc)) == -1) return NULL;
     if(PyModule_AddStringConstant(m,"architecture",ARCHITECTURE) == -1) return NULL;
     if(PyModule_AddObject(m,"ref_debug",PyBool_FromLong(REF_DEBUG_VAL)) == -1) return NULL;
+    if(PyModule_AddObject(m,"count_allocs",PyBool_FromLong(COUNT_ALLOCS_VAL)) == -1) return NULL;
     
     addrs = PyDict_New();
     if(!addrs) return NULL;
@@ -335,7 +355,9 @@ PyInit_pyinternals(void) {
     ADD_ADDR(Py_IncRef)
     ADD_ADDR(Py_DecRef)
     ADD_ADDR(PyDict_GetItem)
+    ADD_ADDR(PyDict_SetItem)
     ADD_ADDR(PyObject_GetItem)
+    ADD_ADDR(PyObject_SetItem)
     ADD_ADDR(PyEval_GetGlobals)
     ADD_ADDR(PyEval_GetBuiltins)
     ADD_ADDR(PyEval_GetLocals)
@@ -343,6 +365,25 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyErr_ExceptionMatches)
     ADD_ADDR(PyErr_Clear)
     ADD_ADDR(PyErr_Format)
+    ADD_ADDR(PyNumber_Multiply)
+    ADD_ADDR(PyNumber_TrueDivide)
+    ADD_ADDR(PyNumber_FloorDivide)
+    ADD_ADDR(PyNumber_Subtract)
+    ADD_ADDR(PyNumber_Lshift)
+    ADD_ADDR(PyNumber_Rshift)
+    ADD_ADDR(PyNumber_And)
+    ADD_ADDR(PyNumber_Xor)
+    ADD_ADDR(PyNumber_Or)
+    ADD_ADDR(PyNumber_InPlaceMultiply)
+    ADD_ADDR(PyNumber_InPlaceTrueDivide)
+    ADD_ADDR(PyNumber_InPlaceFloorDivide)
+    ADD_ADDR(PyNumber_InPlaceRemainder)
+    ADD_ADDR(PyNumber_InPlaceSubtract)
+    ADD_ADDR(PyNumber_InPlaceLshift)
+    ADD_ADDR(PyNumber_InPlaceRshift)
+    ADD_ADDR(PyNumber_InPlaceAnd)
+    ADD_ADDR(PyNumber_InPlaceXor)
+    ADD_ADDR(PyNumber_InPlaceOr)
     ADD_ADDR(_call_function)
     ADD_ADDR(format_exc_check_arg)
     

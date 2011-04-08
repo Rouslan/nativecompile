@@ -1,4 +1,6 @@
 
+import binascii
+from functools import partial
 
 from .multimethod import multimethod
 
@@ -19,9 +21,6 @@ def fits_in_sbyte(x):
     return -128 <= x <= 127
 
 
-def opcode_assembly(op,*args):
-    return '{:12} {}\n'.format(op,', '.join(map(str,args)))
-
 
 class Register:
     def __init__(self,w,reg,name):
@@ -31,6 +30,7 @@ class Register:
     
     def __str__(self):
         return '%' + self.name
+
 
 class Address:
     def __init__(self,offset=0,base=None,index=None,scale=1):
@@ -51,9 +51,7 @@ class Address:
             ((self.index.reg if self.index else 0b100) << 3) | 
             (self.base.reg if self.base else 0b101)])
     
-    def mod_rm_sib_disp(self):
-        """Get the mod field, the r/m field and the SIB and displacement bytes"""
-        
+    def _mod_rm_sib_disp(self):
         if self.index or (self.base and self.base.reg == 0b100):
             # The opcode format is a little different when the base is 0b101 and 
             # mod is 0b00 so to use %ebp, we'll have to go with the next mod value.
@@ -78,16 +76,21 @@ class Address:
             return 0b01, self.base.reg, int_to_8(self.offset)
         
         return 0b10, self.base.reg, int_to_32(self.offset)
-        
+    
+    def mod_rm_sib_disp(self,mid):
+        """Get the mod field, the r/m field and the SIB and displacement bytes"""
+    
+        mod,rm,extra = self._mod_rm_sib_disp()
+        return bytes([(mod << 6) | (mid << 3) | rm]) + extra
     
     def __str__(self):
         if self.scale != 1:
-            return '{0}({1},{2},{3})'.format(self.offset or '',self.base or '',self.index,self.scale)
+            return '{}({},{},{})'.format(hex(self.offset) if self.offset else '',self.base or '',self.index,self.scale)
         if self.index is not None:
-            return '{0}({1},{2})'.format(self.offset or '',self.base or '',self.index)
+            return '{}({},{})'.format(hex(self.offset) if self.offset else '',self.base or '',self.index)
         if self.base is not None:
-            return '{0}({1})'.format(self.offset or '',self.base)
-        return str(self.offset)
+            return '{}({})'.format(hex(self.offset) if self.offset else '',self.base)
+        return hex(self.offset)
 
     def offset_only(self):
         return self.base is None and self.index is None and self.scale == 1
@@ -113,6 +116,71 @@ class Test:
     
     def __int__(self):
         return self.val
+    
+    @property
+    def mnemonic(self):
+        return ['o','no','b','nb','e','ne','be','a','s','ns','p','np','l','ge','le','g'][self.val]
+
+
+def asm_str(indirect,nextaddr,x):
+    if isinstance(x,int):
+        return '${:#x}'.format(x)
+    if isinstance(x,Displacement):
+        return '{:x}'.format(x.val + nextaddr)
+    if indirect and isinstance(x,(Address,Register)):
+        return '*'+str(x)
+    return str(x)
+
+
+class AsmSequence:
+    def __init__(self,ops=None):
+        self.ops = ops or []
+    
+    def __len__(self):
+        return sum(len(op[0]) for op in self.ops)
+    
+    def __add__(self,b):
+        if isinstance(b,AsmSequence):
+            return AsmSequence(self.ops+b.ops)
+            
+        return NotImplemented
+    
+    def __iadd__(self,b):
+        if isinstance(b,AsmSequence):
+            self.ops += b.ops
+            return self
+        
+        return NotImplemented
+    
+    def dump(self,base=0):
+        lines = []
+        addr = base
+        for bin,name,args in self.ops:
+            indirect = name == 'call' or name == 'jmp'
+            nextaddr = addr + len(bin)
+            
+            lines.append('{:8x}: {:16}{:8} {}\n'.format(
+                addr,
+                binascii.hexlify(bin).decode(),
+                name,
+                ', '.join(asm_str(indirect,nextaddr,arg) for arg in args) ))
+                
+            addr = nextaddr
+        
+        return ''.join(lines)
+
+
+class Assembly:
+    @staticmethod
+    def op(name,*args):
+        return AsmSequence([(globals()[name](*args),name,args)])
+        
+    def __getattr__(self,name):
+        return partial(Assembly.op,name)
+    
+    def jcc(self,test,x):
+        return Assembly.op('j'+test.mnemonic,x)
+
 
 
 al = Register(0,0b000,'al')
@@ -161,9 +229,6 @@ test_G = Test(0b1111)
 
 
 
-def op(op,*args,assembly=False):
-    return opcode_assembly(op,*args) if assembly else globals()[op](*args)
-
 
 def _op_reg_reg(byte1,a,b):
     assert a.w == b.w
@@ -172,10 +237,7 @@ def _op_reg_reg(byte1,a,b):
         0b11000000 | (a.reg << 3) | b.reg])
 
 def _op_addr_reg(byte1,a,b,reverse):
-    mod,rm,extra = a.mod_rm_sib_disp()
-    return bytes([
-        byte1 | (reverse << 1) | b.w,
-        (mod << 6) | (b.reg << 3) | rm]) + extra
+    return bytes([byte1 | (reverse << 1) | b.w]) + a.mod_rm_sib_disp(b.reg)
 
 def _op_imm_reg(byte1,mid,byte_alt,a,b):
     if b.reg == 0b000:
@@ -188,10 +250,7 @@ def _op_imm_reg(byte1,mid,byte_alt,a,b):
 
 def _op_imm_addr(byte1,mid,a,b,w):
     fits = fits_in_sbyte(a)
-    mod,rm,extra = b.mod_rm_sib_disp()
-    return bytes([
-        byte1 | (fits << 1) | w,
-        (mod << 6) | (mid << 3) | rm]) + extra + immediate_data(not fits,a)
+    return bytes([byte1 | (fits << 1) | w]) + b.mod_rm_sib_disp(mid) + immediate_data(not fits,a)
 
 
 
@@ -238,10 +297,7 @@ def call(proc : Register):
 
 @multimethod
 def call(proc : Address):
-    mod,rm,extra = proc.mod_rm_sib_disp()
-    return bytes([
-        0b11111111,
-        0b00010000 | (mod << 6) | rm]) + extra
+    return bytes([0b11111111]) + proc.mod_rm_sib_disp(0b010)
 
 
 @multimethod
@@ -280,10 +336,7 @@ def dec(x : Register):
             0b11001000 | x.reg])
 
 def dec_addr(x,w):
-    mod,rm,extra = x.mod_rm_sib_disp()
-    return bytes([
-        0b11111110 | w,
-        0b00001000 | (mod << 6) | rm]) + extra
+    return bytes([0b11111110 | w]) + x.mod_rm_sib_disp(0b001)
 
 @multimethod
 def decb(x : Address):
@@ -305,10 +358,7 @@ def inc(x : Register):
             0b11000000 | x.reg])
 
 def inc_addr(x,w):
-    mod,rm,extra = x.mod_rm_sib_disp()
-    return bytes([
-        0b11111110 | w,
-        (mod << 6) | rm]) + extra
+    return bytes([0b11111110 | w]) + x.mod_rm_sib_disp(0)
 
 @multimethod
 def incb(x : Address):
@@ -327,6 +377,9 @@ def jcc(test : Test,x : Displacement):
     return bytes([
         0b00001111,
         0b10000000 | test.val]) + int_to_32(x.val)
+
+jcc.min_len = 2
+jcc.max_len = 6
 
 def jo(x): return jcc(test_O,x)
 def jno(x): return jcc(test_NO,x)
@@ -363,10 +416,30 @@ def jmp(x : Register):
 
 @multimethod
 def jmp(x : Address):
-    mod,rm,extra = x.mod_rm_sib_disp()
-    return bytes([
-        0b11111111,
-        0b00100000 | (mod << 6) | rm]) + extra
+    return bytes([0b11111111]) + x.mod_rm_sib_disp(0b100)
+
+
+
+def leave():
+    return bytes([0b11001001])
+
+
+
+@multimethod
+def loop(x : Displacement):
+    return bytes([0b11100010]) + int_to_8(x.val)
+
+@multimethod
+def loopz(x : Displacement):
+    return bytes([0b11100001]) + int_to_8(x.val)
+
+loope = loopz
+    
+@multimethod
+def loopnz(x : Displacement):
+    return bytes([0b11100000]) + int_to_8(x.val)
+
+loopne = loopnz
 
 
 
@@ -393,10 +466,7 @@ def mov(a : int,b : Register):
     return bytes([0b10110000 | (b.w << 3) | b.reg]) + immediate_data(b.w,a)
 
 def mov_imm_addr(a,b,w):
-    mod,rm,extra = b.mod_rm_sib_disp()
-    return bytes([
-        0b11000110 | w,
-        (mod << 6) | rm]) + extra + immediate_data(w,a)
+    return bytes([0b11000110 | w]) + b.mod_rm_sib_disp(0) + immediate_data(w,a)
 
 @multimethod
 def movb(a : int,b : Address):
@@ -414,10 +484,7 @@ def pop(x : Register):
 
 @multimethod
 def pop(x : Address):
-    mod,rm,extra = x.mod_rm_sib_disp()
-    return bytes([
-        0b10001111,
-        (mod << 6) | rm]) + extra
+    return bytes([0b10001111]) + x.mod_rm_sib_disp(0)
 
 
 
@@ -427,10 +494,7 @@ def push(x : Register):
 
 @multimethod
 def push(x : Address):
-    mod,rm,extra = x.mod_rm_sib_disp()
-    return bytes([
-        0b11111111,
-        0b00110000 | (mod << 6) | rm]) + extra
+    return bytes([0b11111111]) + x.mod_rm_sib_disp(0b110)
 
 @multimethod
 def push(x : int):
@@ -446,6 +510,88 @@ def ret():
 @multimethod
 def ret(pop : int):
     return bytes([0b11000010]) + int_to_16(pop)
+
+
+
+def shx_imm_reg(amount,x,shiftright):
+    if amount == 1:
+        return bytes([
+            0b11010000 | x.w,
+            0b11100000 | (shiftright << 3) | x.reg])
+    
+    return bytes([
+        0b11000000 | x.w,
+        0b11100000 | (shiftright << 3) | x.reg]) + immediate_data(False,amount)
+
+def shx_reg_reg(amount,x,shiftright):
+    assert amount is cl
+    
+    return bytes([
+        0b11010010 | x.w,
+        0b11100000 | (shiftright << 3) | x.reg])
+
+def shx_imm_addr(amount,x,w,shiftright):
+    rmsd = x.mod_rm_sib_disp(0b100 | shiftright)
+    if amount == 1:
+        return bytes([0b11010000 | w]) + rmsd
+    
+    return bytes([0b11000000 | w]) + rmsd + immediate_data(False,amount)
+
+def shx_reg_addr(amount,x,w,shiftright):
+    assert amount is cl
+    
+    return bytes([0b11010010 | w]) + x.mod_rm_sib_disp(0b100 | shiftright)
+
+
+@multimethod
+def shl(amount : int,x : Register):
+    return shx_imm_reg(amount,x,False)
+
+@multimethod
+def shl(amount : Register,x : Register):
+    return shx_reg_reg(amount,x,False)
+
+@multimethod
+def shlb(amount : int,x : Address):
+    return shx_imm_addr(amount,x,False,False)
+
+@multimethod
+def shll(amount : int,x : Address):
+    return shx_imm_addr(amount,x,True,False)
+
+@multimethod
+def shlb(amount : Register,x : Address):
+    return shx_reg_addr(amount,x,False,False)
+
+@multimethod
+def shll(amount : Register,x : Address):
+    return shx_reg_addr(amount,x,True,False)
+
+
+
+@multimethod
+def shr(amount : int,x : Register):
+    return shx_imm_reg(amount,x,True)
+
+@multimethod
+def shr(amount : Register,x : Register):
+    return shx_reg_reg(amount,x,True)
+
+@multimethod
+def shrb(amount : int,x : Address):
+    return shx_imm_addr(amount,x,False,True)
+
+@multimethod
+def shrl(amount : int,x : Address):
+    return shx_imm_addr(amount,x,True,True)
+
+@multimethod
+def shrb(amount : Register,x : Address):
+    return shx_reg_addr(amount,x,False,True)
+
+@multimethod
+def shrl(amount : Register,x : Address):
+    return shx_reg_addr(amount,x,True,True)
 
 
 
@@ -488,10 +634,7 @@ def test(a : int,b : Register):
     return _op_imm_reg(0b11110110,0,0b10101000,a,b)
 
 def test_imm_addr(a,b,w):
-    mode,rm,extra = b.mod_rm_sib_disp()
-    return bytes([
-        0b11110110 | w,
-        (mod << 6) | rm]) + extra + immedate_data(w,a)
+    return bytes([0b11110110 | w]) + b.mod_rm_sib_disp(0) + immedate_data(w,a)
 
 @multimethod
 def testb(a : int,b : Address):
