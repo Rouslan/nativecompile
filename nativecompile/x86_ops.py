@@ -378,8 +378,8 @@ def jcc(test : Test,x : Displacement):
         0b00001111,
         0b10000000 | test.val]) + int_to_32(x.val)
 
-jcc.min_len = 2
-jcc.max_len = 6
+JCC_MIN_LEN = 2
+JCC_MAX_LEN = 6
 
 def jo(x): return jcc(test_O,x)
 def jno(x): return jcc(test_NO,x)
@@ -406,6 +406,9 @@ def jg(x): return jcc(test_G,x)
 def jmp(x : Displacement):
     fits = fits_in_sbyte(x.val)
     return bytes([0b11101001 | (fits << 1)]) + ([int_to_32,int_to_8][fits])(x.val)
+
+JMP_DISP_MIN_LEN = 2
+JMP_DISP_MAX_LEN = 5
 
 @multimethod
 def jmp(x : Register):
@@ -475,6 +478,11 @@ def movb(a : int,b : Address):
 @multimethod
 def movl(a : int,b : Address):
     return mov_imm_addr(a,b,True)
+
+
+
+def nop():
+    return bytes([0b10010000])
 
 
 

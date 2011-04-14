@@ -68,6 +68,28 @@ class JumpSource:
         return self.op(dis) if dis.val else b'' #optimize away useless jumps
 
 
+class JumpRSource:
+    def __init__(self,op,max_size,target):
+        self.op = op
+        self.size = max_size
+        target.sources.append(self)
+
+    def displace(self,amount):
+        self.displacement += amount
+
+    def compile(self):
+        c = self.op(ops.Displacement(-self.displacement))
+        assert len(c) <= self.size
+        # pad the instruction with NOPs if it's too short
+        return c + ops.nop() * (self.size - len(c))
+
+    def __len__(self):
+        return self.size
+
+class JumpRTarget:
+    def __init__(self):
+        self.sources = []
+
 
 #def disassemble(co):
 #    code = co.co_code
@@ -145,6 +167,14 @@ class Frame:
         self.stack = StackManager(op)
         self.end = JumpTarget()
         self._local_name = None
+        self.blockends = []
+        self.byte_offset = None
+
+        # Although JUMP_ABSOLUTE could jump to any instruction, we assume
+        # compiled Python code only uses it in certain cases. Thus, we can make
+        # small optimizations between successive instructions without needing an
+        # extra pass over the byte code to determine all the jump targets.
+        self.rtargets = {}
     
     def check_err(self,inverted=False):
         return [
@@ -231,6 +261,17 @@ class Frame:
             mid
         ]
 
+    def rtarget(self):
+        t = JumpRTarget()
+        self.rtargets[self.byte_offset] = t
+        return t
+
+    def rtarget_at(self,offset):
+        try:
+            return self.rtargets[offset]
+        except KeyError:
+            raise Exception('unexpected jump target')
+
 
 
 
@@ -244,7 +285,7 @@ def _binary_op(f,func):
         f.op.push(ops.Address(STACK_ITEM_SIZE,ops.esp))
         
     ] + f.call(func) + [
-        f.op.add(STACK_ITEM_SIZE,ops.esp)
+        f.discard_stack_items(1)
     ] + f.check_err() + [
         f.stack.pop(ops.edx)
     ] + f.decref(ops.edx,True) + [
@@ -430,6 +471,57 @@ def _op_CALL_FUNCTION(f,arg):
 def _op_RETURN_VALUE(f):
     return [f.goto(f.end)] if f.stack.use_tos() else [f.stack.pop(ops.eax),f.goto(f.end)]
 
+@handler
+def _op_SETUP_LOOP(f,to):
+    f.blockends.append(JumpTarget())
+    return []
+
+@handler
+def _op_POP_BLOCK(f):
+    assert not f.stack.tos_in_eax
+    return ([
+        f.blockends.pop(),
+        f.stack.pop(ops.eax)
+        ] + f.decref()
+    )
+
+@handler
+def _op_GET_ITER(f):
+    return (
+        f.stack.push_tos() +
+        f.call('PyObject_GetIter') +
+        f.check_err() + [
+        f.op.pop(ops.edx),
+        f.op.push(ops.eax)
+    ] + f.decref(ops.edx)
+    )
+
+@handler
+def _op_FOR_ITER(f,to):
+    return (
+        f.stack.push_tos(True) + [
+        f.rtarget(),
+        f.op.mov(ops.Address(base=ops.esp),ops.eax),
+        f.op.mov(ops.Address(pyinternals.type_offset,ops.eax),ops.eax),
+        f.op.mov(ops.Address(pyinternals.type_iternext_offset,ops.eax),ops.eax),
+        f.op.call(ops.eax)
+    ] + f.if_eax_is_zero(
+            f.call('PyErr_Occurred') +
+            f.if_eax_is_not_zero(
+                f.invoke('PyErr_ExceptionMatches',pyinternals.raw_addresses['PyExc_StopIteration']) + [
+                f.op.test(ops.eax,ops.eax),
+                JumpSource(f.op.jz,f.end)
+            ] + f.call('PyErr_Clear')
+            ) + [
+            f.goto(f.blockends[-1])
+        ])
+    )
+
+@handler
+def _op_JUMP_ABSOLUTE(f,to):
+    assert to < f.byte_offset
+    return f.stack.push_tos() + [
+        JumpRSource(f.op.jmp,ops.JMP_DISP_MAX_LEN,f.rtarget_at(to))]
 
 
 def join(x):
@@ -441,11 +533,15 @@ def join(x):
 
 def resolve_jumps(chunks):
     targets = weakref.WeakSet()
+    rsources = set()
     
     for i in range(len(chunks)-1,-1,-1):
         if isinstance(chunks[i],JumpTarget):
             chunks[i].displacement = 0
             targets.add(chunks[i])
+            del chunks[i]
+        elif isinstance(chunks[i],JumpRTarget):
+            rsources.difference_update(chunks[i].sources)
             del chunks[i]
         else:
             if isinstance(chunks[i],JumpSource):
@@ -453,12 +549,17 @@ def resolve_jumps(chunks):
                 if not chunks[i]:
                     del chunks[i]
                     continue
+            elif isinstance(chunks[i],JumpRSource):
+                chunks[i].displacement = 0
+                rsources.add(chunks[i])
             
             l = len(chunks[i])
             for t in targets:
                 t.displace(l)
+            for s in rsources:
+                s.displace(l)
     
-    return join(chunks)
+    return join((c if isinstance(c,bytes) else c.compile()) for c in chunks)
 
 
 def local_name_func(f):
@@ -547,6 +648,7 @@ def compile_raw(code,binary = True):
     
     i = 0
     extended_arg = 0
+    f.byte_offset = 0
     while i < len(code.co_code):
         bop = code.co_code[i]
         i += 1
@@ -561,18 +663,22 @@ def compile_raw(code,binary = True):
                 extended_arg = 0
                 
                 opcodes += get_handler(bop)(f,boparg)
+                f.byte_offset = i
+                #print('{}, {}'.format(dis.opname[bop],f.stack.offset))
         else:
             opcodes += get_handler(bop)(f)
+            f.byte_offset = i
+            #print('{}, {}'.format(dis.opname[bop],f.stack.offset))
     
     
     assert f.stack.offset == stack_prolog, 'stack.offset should be {0}, but is {1}'.format(stack_prolog,f.stack.offset)
     
     dr = join([f.op.pop(ops.edx)] + f.decref(ops.edx,True))
     
-    cmpjl = f.op.cmp(ops.esp,ops.ebp)
-    jlen = -(len(dr) + len(cmpjl) + ops.jcc.min_len)
-    #assert ops.fits_in_sbyte(jlen)
-    cmpjl += f.op.jl(ops.Displacement(jlen))
+    cmpjl = f.op.cmp(ops.ebp,ops.esp)
+    jlen = -(len(dr) + len(cmpjl) + ops.JCC_MIN_LEN)
+    assert ops.fits_in_sbyte(jlen)
+    cmpjl += f.op.jb(ops.Displacement(jlen))
     
     # call Py_DECREF on anything left on the stack and return %eax
     opcodes += [

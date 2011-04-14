@@ -343,6 +343,7 @@ PyInit_pyinternals(void) {
     if(PyModule_AddIntConstant(m,"refcnt_offset",offsetof(PyObject,ob_refcnt)) == -1) return NULL;
     if(PyModule_AddIntConstant(m,"type_offset",offsetof(PyObject,ob_type)) == -1) return NULL;
     if(PyModule_AddIntConstant(m,"type_dealloc_offset",offsetof(PyTypeObject,tp_dealloc)) == -1) return NULL;
+    if(PyModule_AddIntConstant(m,"type_iternext_offset",offsetof(PyTypeObject,tp_iternext)) == -1) return NULL;
     if(PyModule_AddStringConstant(m,"architecture",ARCHITECTURE) == -1) return NULL;
     if(PyModule_AddObject(m,"ref_debug",PyBool_FromLong(REF_DEBUG_VAL)) == -1) return NULL;
     if(PyModule_AddObject(m,"count_allocs",PyBool_FromLong(COUNT_ALLOCS_VAL)) == -1) return NULL;
@@ -358,6 +359,7 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyDict_SetItem)
     ADD_ADDR(PyObject_GetItem)
     ADD_ADDR(PyObject_SetItem)
+    ADD_ADDR(PyObject_GetIter)
     ADD_ADDR(PyEval_GetGlobals)
     ADD_ADDR(PyEval_GetBuiltins)
     ADD_ADDR(PyEval_GetLocals)
@@ -390,6 +392,7 @@ PyInit_pyinternals(void) {
     ADD_ADDR_NAME(&PyDict_Type,"PyDict_Type")
     ADD_ADDR(PyExc_KeyError)
     ADD_ADDR(PyExc_NameError)
+    ADD_ADDR(PyExc_StopIteration)
     ADD_ADDR(NAME_ERROR_MSG)
     ADD_ADDR(GLOBAL_NAME_ERROR_MSG)
     ADD_ADDR(UNBOUNDLOCAL_ERROR_MSG)
