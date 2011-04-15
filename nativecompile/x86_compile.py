@@ -35,10 +35,12 @@ class StackManager:
         self.offset += amount
         return self.op.sub(amount,ops.esp)
     
-    def push_tos(self,set_again = False):
+    def push_tos(self,set_again = False,extra_push = False):
         """%eax is needed right now so if the TOS item hasn't been pushed onto 
         the stack, do it now."""
         r = [self.push(ops.eax)] if self.tos_in_eax else []
+        if extra_push:
+            r.append(self.op.push(ops.eax if self.tos_in_eax else ops.Address(base=ops.esp)))
         self.tos_in_eax = set_again
         return r
     
@@ -69,9 +71,10 @@ class JumpSource:
 
 
 class JumpRSource:
-    def __init__(self,op,max_size,target):
+    def __init__(self,opset,op,max_size,target):
         self.op = op
         self.size = max_size
+        self.opset = opset
         target.sources.append(self)
 
     def displace(self,amount):
@@ -81,7 +84,7 @@ class JumpRSource:
         c = self.op(ops.Displacement(-self.displacement))
         assert len(c) <= self.size
         # pad the instruction with NOPs if it's too short
-        return c + ops.nop() * (self.size - len(c))
+        return c + self.opset.nop() * (self.size - len(c))
 
     def __len__(self):
         return self.size
@@ -277,15 +280,10 @@ class Frame:
 
 def _binary_op(f,func):
     return (
-        f.stack.push_tos(True) + [
-        
-        # reverse the order of the top two items
-        # This could be avoided by reordering the bytecode instructions. I'm not
-        # sure if it would be worth the extra time and memory needed to do that.
-        f.op.push(ops.Address(STACK_ITEM_SIZE,ops.esp))
-        
+        f.stack.push_tos(True,True) + [
+        f.op.push(ops.Address(STACK_ITEM_SIZE*2,ops.esp))
     ] + f.call(func) + [
-        f.discard_stack_items(1)
+        f.discard_stack_items(2)
     ] + f.check_err() + [
         f.stack.pop(ops.edx)
     ] + f.decref(ops.edx,True) + [
@@ -396,18 +394,16 @@ def _op_LOAD_NAME(f,name):
 def _op_STORE_NAME(f,name):
     mid = f.op.mov(pyinternals.raw_addresses['PyDict_SetItem'],ops.ecx)
     return (
-        f.stack.push_tos() + [
-        f.stack.push(address_of(name)),
-        
+        f.stack.push_tos(extra_push=True) + [
+        f.op.push(address_of(name)),
         f.op.mov(pyinternals.raw_addresses['PyObject_SetItem'],ops.ecx),
-        
         f.op.mov(LOCALS,ops.eax),
-        f.stack.push(ops.eax),
+        f.op.push(ops.eax),
         f.op.cmpl(pyinternals.raw_addresses['PyDict_Type'],ops.Address(pyinternals.type_offset,ops.eax)),
         f.op.jne(ops.Displacement(len(mid))),
         mid,
         f.op.call(ops.ecx),
-        f.stack.add_to(2 * STACK_ITEM_SIZE)
+        f.discard_stack_items(3)
     ] + f.check_err(True) + [
         f.stack.pop(ops.eax)
     ] + f.decref()
@@ -416,36 +412,30 @@ def _op_STORE_NAME(f,name):
 @hasname
 def _op_LOAD_GLOBAL(f,name):
     return (
-        f.stack.push_tos(True) + [
-        f.op.push(address_of(name)),
-        f.op.push(GLOBALS)
-    ] + f.call('PyDict_GetItem') + 
-        f.if_eax_is_zero([
-            f.discard_stack_items(1),
-            f.op.push(BUILTINS)
-        ] + call('PyDict_GetItem') + 
-            f.if_eax_is_zero([
-                f.discard_stack_items(1),
-                f.op.push(pyinternals.raw_addresses['GLOBAL_NAME_ERROR_MSG']),
-                f.op.push(pyinternals.raw_addresses['PyExc_NameError'])
-            ] + f.call('format_exc_check_arg') + [
-                f.discard_stack_items(2),
+        f.stack.push_tos(True) + 
+        f.invoke('PyDict_GetItem',GLOBALS,address_of(name)) + 
+        f.if_eax_is_zero(
+            call('PyDict_GetItem',BUILTINS,address_of(name)) + 
+            f.if_eax_is_zero(
+                f.invoke('format_exc_check_arg',
+                     pyinternals.raw_addresses['PyExc_NameError'],
+                     pyinternals.raw_addresses['GLOBAL_NAME_ERROR_MSG'],
+                     address_of(name)) + [
                 f.goto(f.end)
             ])
-        ) + [
-        f.discard_stack_items(2)
-    ] + f.incref()
+        ) +
+        f.incref()
     )
 
 @hasname
 def _op_STORE_GLOBAL(f,name):
     return (
-        f.stack.push_tos() + [
-        f.stack.push(address_of(name)),
-        f.stack.push(GLOBALS),
-    ] + f.call('PyDict_SetItem') +
-        f.check_err(True) + [
-        f.stack.add_to(2 * STACK_ITEM_SIZE),
+        f.stack.push_tos(extra_push=True) + [
+        f.op.push(address_of(name)),
+        f.op.push(GLOBALS)
+    ] + f.call('PyDict_SetItem') + [
+        f.discard_stack_items(3)
+    ] + f.check_err(True) + [
         f.stack.pop(ops.eax)
     ] + f.decref()
     )
@@ -488,9 +478,10 @@ def _op_POP_BLOCK(f):
 @handler
 def _op_GET_ITER(f):
     return (
-        f.stack.push_tos() +
-        f.call('PyObject_GetIter') +
-        f.check_err() + [
+        f.stack.push_tos(extra_push=True) +
+        f.call('PyObject_GetIter') + [
+        f.discard_stack_items(1)
+    ] + f.check_err() + [
         f.op.pop(ops.edx),
         f.op.push(ops.eax)
     ] + f.decref(ops.edx)
@@ -501,10 +492,12 @@ def _op_FOR_ITER(f,to):
     return (
         f.stack.push_tos(True) + [
         f.rtarget(),
+        f.op.push(ops.Address(base=ops.esp)),
         f.op.mov(ops.Address(base=ops.esp),ops.eax),
         f.op.mov(ops.Address(pyinternals.type_offset,ops.eax),ops.eax),
         f.op.mov(ops.Address(pyinternals.type_iternext_offset,ops.eax),ops.eax),
-        f.op.call(ops.eax)
+        f.op.call(ops.eax),
+        f.discard_stack_items(1)
     ] + f.if_eax_is_zero(
             f.call('PyErr_Occurred') +
             f.if_eax_is_not_zero(
@@ -521,7 +514,7 @@ def _op_FOR_ITER(f,to):
 def _op_JUMP_ABSOLUTE(f,to):
     assert to < f.byte_offset
     return f.stack.push_tos() + [
-        JumpRSource(f.op.jmp,ops.JMP_DISP_MAX_LEN,f.rtarget_at(to))]
+        JumpRSource(f.op,f.op.jmp,ops.JMP_DISP_MAX_LEN,f.rtarget_at(to))]
 
 
 def join(x):
@@ -559,7 +552,7 @@ def resolve_jumps(chunks):
             for s in rsources:
                 s.displace(l)
     
-    return join((c if isinstance(c,bytes) else c.compile()) for c in chunks)
+    return join((c.compile() if isinstance(c,JumpRSource) else c) for c in chunks)
 
 
 def local_name_func(f):
@@ -578,46 +571,37 @@ def local_name_func(f):
         # if (%eax)->ob_type != PyDict_Type:
         f.op.cmpl(pyinternals.raw_addresses['PyDict_Type'],ops.Address(pyinternals.type_offset,ops.eax)),
         JumpSource(f.op.je,else_)
-    ] +     f.call('PyObject_GetItem') +
-            f.call('PyErr_Occurred') + [
+    ] +     f.call('PyObject_GetItem') + [
+            f.discard_stack_items(2),
             f.op.test(ops.eax,ops.eax),
-            JumpSource(f.op.jnz,endif),
+            JumpSource(f.op.jnz,found),
             
-            f.op.push(pyinternals.raw_addresses['PyExc_KeyError'])
-        ] + f.call('PyErr_ExceptionMatches') +
+        ] + f.invoke('PyErr_ExceptionMatches',pyinternals.raw_addresses['PyExc_KeyError']) +
             f.if_eax_is_zero(
-                f.discard_stack_items(3) +
                 f.op.ret(STACK_ITEM_SIZE)
-            ) + [
-            f.discard_stack_items(1)
-    ] +     f.call('PyErr_Clear') + [
+            ) +
+            f.call('PyErr_Clear') + [
 
             f.goto(endif),
         else_
     ] +     f.call('PyDict_GetItem') + [
+            f.discard_stack_items(2),
             f.op.test(ops.eax,ops.eax),
-        endif,
+            JumpSource(f.op.jnz,found),
+        endif
     
-        JumpSource(f.op.jnz,found),
-        f.discard_stack_items(1),
-        f.op.push(GLOBALS)
-    ] + f.call('PyDict_GetItem') + 
-        f.if_eax_is_zero([
-            f.discard_stack_items(1),
-            f.op.push(BUILTINS)
-        ] + f.call('PyDict_GetItem') + 
-            f.if_eax_is_zero([
-                f.discard_stack_items(1),
-                f.op.push(pyinternals.raw_addresses['NAME_ERROR_MSG']),
-                f.op.push(pyinternals.raw_addresses['PyExc_NameError'])
-            ] + f.call('format_exc_check_arg') + [
-                f.discard_stack_items(3),
+    ] + f.invoke('PyDict_GetItem',GLOBALS,ops.Address(STACK_ITEM_SIZE,ops.esp)) + 
+        f.if_eax_is_zero(
+            f.invoke('PyDict_GetItem',BUILTINS,ops.Address(STACK_ITEM_SIZE,ops.esp)) + 
+            f.if_eax_is_zero(
+                f.invoke('format_exc_check_arg',
+                     pyinternals.raw_addresses['NAME_ERROR_MSG'],
+                     pyinternals.raw_addresses['PyExc_NameError']) + [
                 f.op.ret(STACK_ITEM_SIZE)
             ])
         ) + [
         
         found,
-        f.discard_stack_items(2),
         f.op.ret(STACK_ITEM_SIZE),
     ])
 

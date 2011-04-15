@@ -151,6 +151,19 @@ class AsmSequence:
             return self
         
         return NotImplemented
+
+    def __mul__(self,b):
+        if isinstance(b,int):
+            return AsmSequence(self.ops*b)
+
+        return NotImplemented
+
+    def __imul__(self,b):
+        if isinstance(b,int):
+            self.ops *= b
+            return self
+
+        return NotImplemented
     
     def dump(self,base=0):
         lines = []
