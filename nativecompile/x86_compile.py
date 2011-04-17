@@ -137,7 +137,16 @@ address_of = id
 handlers = [None] * 0xFF
 
 def handler(func,name = None):
-    handlers[dis.opmap[(name or func.__name__)[len('_op_'):]]] = func
+    def inner(f,*extra):
+        r = f()
+        if f.forward_targets and f.forward_targets[0][0] <= f.byte_offset:
+            ft = f.forward_targets.pop(0)
+            assert ft[0] == f.byte_offset
+            r.push_tos()(ft[1])
+
+        return r + func(f,*extra)
+
+    handlers[dis.opmap[(name or func.__name__)[len('_op_'):]]] = inner
     return func
 
 def hasconst(func):
@@ -172,6 +181,7 @@ class Frame:
         self._local_name = None
         self.blockends = []
         self.byte_offset = None
+        self.forward_targets = []
 
         # Although JUMP_ABSOLUTE could jump to any instruction, we assume
         # compiled Python code only uses it in certain cases. Thus, we can make
@@ -275,6 +285,102 @@ class Frame:
         except KeyError:
             raise Exception('unexpected jump target')
 
+    def forward_target(self,at):
+        assert at > self.byte_offset
+
+        # there will rarely be more than two targets at any given time
+        for i,ft in enumerate(self.forward_targets):
+            if ft[0] == at:
+                return ft[1]
+            if ft[0] > at:
+                t = JumpTarget()
+                self.foward_targets.insert(i,(at,t))
+                return t
+
+        t = JumpTarget()
+        self.forward_targets.append((at,t))
+        return t
+
+    def __call__(self):
+        return Stitch(self)
+
+
+class Stitch:
+    def __init__(self,frame,code=None):
+        self.f = frame
+        self.code = code or []
+
+    def goto(self,target):
+        self.code.append(self.f.goto(target))
+        return self
+
+    def discard_stack_items(self,n):
+        self.code.append(self.f.discard_stack_items(n))
+        return self
+
+    def push_tos(self,set_again = False,extra_push = False):
+        self.code += self.f.stack.push_tos(set_again,extra_push)
+        return self
+
+    def counted_push(self,x):
+        self.code.append(self.f.stack.push(x))
+        return self
+
+    def counted_pop(self,x):
+        self.code.append(self.f.stack.pop(x))
+        return self
+
+    def counted_discard_stack_items(self,n):
+        self.code.append(self.f.stack.add_to(STACK_ITEM_SIZE*n))
+        return self
+
+    def __add__(self,b):
+        if isinstance(b,Stitch):
+            assert self.f is b.f
+            return Stitch(self.f,self.code+b.code)
+        if isinstance(b,list):
+            return Stitch(self.f,self.code+b)
+            
+        return NotImplemented
+    
+    def __iadd__(self,b):
+        if isinstance(b,Stitch):
+            assert self.f is b.f
+            self.code += b.code
+            return self
+        if isinstance(b,list):
+            self.code += b
+            return self
+        
+        return NotImplemented
+
+    def __getattr__(self,name):
+        func = getattr(self.f.op,name)
+        def inner(*args):
+            self.code.append(func(*args))
+            return self
+        return inner
+
+    def __call__(self,op):
+        self.code.append(op)
+        return self
+
+
+def _forward_list_func(func):
+    def inner(self,*args,**kwds):
+        self.code += func(self.f,*args,**kwds)
+        return self
+    return inner
+
+for func in [
+    'check_err',
+    'call',
+    'invoke',
+    'if_eax_is_zero',
+    'if_eax_is_not_zero',
+    'incref',
+    'decref']:
+    setattr(Stitch,func,_forward_list_func(getattr(Frame,func)))
 
 
 
@@ -472,7 +578,7 @@ def _op_POP_BLOCK(f):
     return ([
         f.blockends.pop(),
         f.stack.pop(ops.eax)
-        ] + f.decref()
+    ] + f.decref()
     )
 
 @handler
@@ -516,12 +622,52 @@ def _op_JUMP_ABSOLUTE(f,to):
     return f.stack.push_tos() + [
         JumpRSource(f.op,f.op.jmp,ops.JMP_DISP_MAX_LEN,f.rtarget_at(to))]
 
+@hasname
+def _op_LOAD_ATTR(f,name):
+    pn = f.op.push(address_of(name))
+    return (
+        (f().counted_push(ops.eax)(pn).push(ops.eax)
+        if f.stack.use_tos() else
+        f()(pn).push(ops.Address(STACK_ITEM_SIZE,ops.esp))) + f()
+        .call('PyObject_GetAttr')
+        .discard_stack_items(2)
+        .check_err()
+        .pop(ops.edx)
+        .push(ops.eax)
+        .decref(ops.edx)
+    )
+
+def _op_pop_jump_if_(f,to,state):
+    dont_jump = JumpTarget()
+    jop1,jop2 = (f.op.jz,f.op.jg) if state else (f.op.jg,f.op.jz)
+    return (f()
+        .push_tos(extra_push=True)
+        .call('PyObject_IsTrue')
+        .discard_stack_items(1)
+        .counted_pop(ops.edx)
+        .decref(ops.edx,True)
+        .test(ops.eax,ops.eax)
+        (JumpSource(jop1,dont_jump))
+        (JumpSource(jop2,f.forward_target(to)))
+        .xor(ops.eax,ops.eax)
+        .goto(f.end)
+        (dont_jump)
+    )
+
+@handler
+def _op_POP_JUMP_IF_FALSE(f,to):
+    return _op_pop_jump_if_(f,to,False)
+
+@handler
+def _op_POP_JUMP_IF_TRUE(f,to):
+    return _op_pop_jump_if_(f,to,True)
+
+
 
 def join(x):
     try:
-        return reduce(operator.concat,x)
+        return b''.join(x)
     except TypeError:
-        # because there is no way to overload the concat operator in Python code
         return reduce(operator.add,x)
 
 def resolve_jumps(chunks):
@@ -620,10 +766,10 @@ def function_get(f,func):
 def compile_raw(code,binary = True):
     f = Frame(code,ops if binary else ops.Assembly())
     
-    opcodes = ([
-        f.stack.push(ops.ebp),
-        f.op.mov(ops.esp,ops.ebp)
-    ] + function_get(f,'PyEval_GetGlobals') +
+    opcodes = (f()
+        .counted_push(ops.ebp)
+        .mov(ops.esp,ops.ebp) +
+        function_get(f,'PyEval_GetGlobals') +
         function_get(f,'PyEval_GetBuiltins') +
         function_get(f,'PyEval_GetLocals')
     )
@@ -678,6 +824,6 @@ def compile_raw(code,binary = True):
     if f._local_name:
         opcodes += [f._local_name] + local_name_func(f)
     
-    return resolve_jumps(opcodes)
+    return resolve_jumps(opcodes.code)
 
 

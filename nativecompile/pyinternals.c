@@ -360,6 +360,8 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyObject_GetItem)
     ADD_ADDR(PyObject_SetItem)
     ADD_ADDR(PyObject_GetIter)
+    ADD_ADDR(PyObject_GetAttr)
+    ADD_ADDR(PyObject_IsTrue)
     ADD_ADDR(PyEval_GetGlobals)
     ADD_ADDR(PyEval_GetBuiltins)
     ADD_ADDR(PyEval_GetLocals)

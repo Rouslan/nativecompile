@@ -665,3 +665,28 @@ def testb(a : int,b : Address):
 def testl(a : int,b : Address):
     return test_imm_addr(a,b,True)
 
+
+
+@multimethod
+def xor(a : Register,b : Register):
+    return _op_reg_reg(0b00110000,a,b)
+
+@multimethod
+def xor(a : Register,b : Address):
+    return _op_addr_reg(0b00110000,b,a,True)
+
+@multimethod
+def xor(a : Address,b : Register):
+    return _op_addr_reg(0b00110000,a,b,False)
+
+@multimethod
+def xor(a : int,b : Register):
+    return _op_imm_reg(0b10000000,0b110,0b00110100,a,b)
+
+@multimethod
+def xorb(a : int,b : Address):
+    return _op_imm_addr(0b10000000,0b110,a,b,False)
+
+@multimethod
+def xorl(a : int,b : Address):
+    return _op_imm_addr(0b10000000,0b110,a,b,True)
