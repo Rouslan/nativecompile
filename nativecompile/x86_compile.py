@@ -9,7 +9,7 @@ from . import pyinternals
 
 
 STACK_ITEM_SIZE = 4
-BUILD_SEQ_LOOP_THRESHHOLD = 3
+BUILD_SEQ_LOOP_THRESHHOLD = 5
 
 
 
@@ -280,7 +280,7 @@ class Frame:
         self.rtargets[self.byte_offset] = t
         return t
 
-    def rtarget_at(self,offset):
+    def reverse_target(self,offset):
         try:
             return self.rtargets[offset]
         except KeyError:
@@ -301,6 +301,9 @@ class Frame:
         t = JumpTarget()
         self.forward_targets.append((at,t))
         return t
+
+    def jump_to(self,op,max_size,to):
+        return JumpSource(op,self.forward_target(to)) if to > self.byte_offset else JumpRSource(self.op,op,max_size,self.reverse_target(to))
 
     def __call__(self):
         return Stitch(self)
@@ -333,6 +336,13 @@ class Stitch:
 
     def counted_discard_stack_items(self,n):
         self.code.append(self.f.stack.add_to(STACK_ITEM_SIZE*n))
+        return self
+
+    def call(self,x):
+        if isinstance(x,str):
+            self.code += self.f.call(x)
+        else:
+            self.code.append(self.f.op.call(x))
         return self
 
     def __add__(self,b):
@@ -375,7 +385,6 @@ def _forward_list_func(func):
 
 for func in [
     'check_err',
-    'call',
     'invoke',
     'if_eax_is_zero',
     'if_eax_is_not_zero',
@@ -386,16 +395,16 @@ for func in [
 
 
 def _binary_op(f,func):
-    return (
-        f.stack.push_tos(True,True) + [
-        f.op.push(ops.Address(STACK_ITEM_SIZE*2,ops.esp))
-    ] + f.call(func) + [
-        f.discard_stack_items(2)
-    ] + f.check_err() + [
-        f.stack.pop(ops.edx)
-    ] + f.decref(ops.edx,True) + [
-        f.stack.pop(ops.edx)
-    ] + f.decref(ops.edx,True)
+    return (f()
+        .push_tos(True,True)
+        .push(ops.Address(STACK_ITEM_SIZE*2,ops.esp))
+        .call(func)
+        .discard_stack_items(2)
+        .check_err()
+        .counted_pop(ops.edx)
+        .decref(ops.edx,True)
+        .counted_pop(ops.edx)
+        .decref(ops.edx,True)
     )
 
 @handler
@@ -498,50 +507,50 @@ def _op_POP_TOP(f):
 
 @hasname
 def _op_LOAD_NAME(f,name):
-    return (
-        f.stack.push_tos(True) + [
-        f.op.push(address_of(name)),
-        JumpSource(f.op.call,f.local_name()),
-        f.op.test(ops.eax,ops.eax),
-        JumpSource(f.op.jz,f.end)
-    ] + f.incref()
+    return (f()
+        .push_tos(True)
+        .push(address_of(name))
+        (JumpSource(f.op.call,f.local_name()))
+        .test(ops.eax,ops.eax)
+        (JumpSource(f.op.jz,f.end))
+        .incref()
     )
 
 @hasname
 def _op_STORE_NAME(f,name):
     mid = f.op.mov(pyinternals.raw_addresses['PyDict_SetItem'],ops.ecx)
-    return (
-        f.stack.push_tos(extra_push=True) + [
-        f.op.push(address_of(name)),
-        f.op.mov(pyinternals.raw_addresses['PyObject_SetItem'],ops.ecx),
-        f.op.mov(LOCALS,ops.eax),
-        f.op.push(ops.eax),
-        f.op.cmpl(pyinternals.raw_addresses['PyDict_Type'],ops.Address(pyinternals.type_offset,ops.eax)),
-        f.op.jne(ops.Displacement(len(mid))),
-        mid,
-        f.op.call(ops.ecx),
-        f.discard_stack_items(3)
-    ] + f.check_err(True) + [
-        f.stack.pop(ops.eax)
-    ] + f.decref()
+    return (f()
+        .push_tos(extra_push=True)
+        .push(address_of(name))
+        .mov(pyinternals.raw_addresses['PyObject_SetItem'],ops.ecx)
+        .mov(LOCALS,ops.eax)
+        .push(ops.eax)
+        .cmpl(pyinternals.raw_addresses['PyDict_Type'],ops.Address(pyinternals.type_offset,ops.eax))
+        .jne(ops.Displacement(len(mid)))
+        (mid)
+        .call(ops.ecx)
+        .discard_stack_items(3)
+        .check_err(True)
+        .counted_pop(ops.eax)
+        .decref()
     )
 
 @hasname
 def _op_LOAD_GLOBAL(f,name):
-    return (
-        f.stack.push_tos(True) + 
-        f.invoke('PyDict_GetItem',GLOBALS,address_of(name)) + 
-        f.if_eax_is_zero(
-            call('PyDict_GetItem',BUILTINS,address_of(name)) + 
-            f.if_eax_is_zero(
-                f.invoke('format_exc_check_arg',
+    return (f()
+        .push_tos(True)
+        .invoke('PyDict_GetItem',GLOBALS,address_of(name))
+        .if_eax_is_zero(f()
+            .invoke('PyDict_GetItem',BUILTINS,address_of(name))
+            .if_eax_is_zero(f()
+                .invoke('format_exc_check_arg',
                      pyinternals.raw_addresses['PyExc_NameError'],
                      pyinternals.raw_addresses['GLOBAL_NAME_ERROR_MSG'],
-                     address_of(name)) + [
-                f.goto(f.end)
-            ])
-        ) +
-        f.incref()
+                     address_of(name))
+                .goto(f.end)
+            )
+        )
+        .incref()
     )
 
 @hasname
@@ -559,10 +568,10 @@ def _op_STORE_GLOBAL(f,name):
 
 @hasconst
 def _op_LOAD_CONST(f,const):
-    return (
-        f.stack.push_tos(True) + [
-        f.op.mov(address_of(const),ops.eax),
-    ] + f.incref()
+    return (f()
+        .push_tos(True)
+        .mov(address_of(const),ops.eax)
+        .incref()
     )
 
 @handler
@@ -631,15 +640,16 @@ def _op_FOR_ITER(f,to):
 def _op_JUMP_ABSOLUTE(f,to):
     assert to < f.byte_offset
     return f.stack.push_tos() + [
-        JumpRSource(f.op,f.op.jmp,ops.JMP_DISP_MAX_LEN,f.rtarget_at(to))]
+        JumpRSource(f.op,f.op.jmp,ops.JMP_DISP_MAX_LEN,f.reverse_target(to))]
 
 @hasname
 def _op_LOAD_ATTR(f,name):
+    in_eax = f.stack.tos_in_eax
     pn = f.op.push(address_of(name))
-    return (
-        (f().counted_push(ops.eax)(pn).push(ops.eax)
-        if f.stack.use_tos() else
-        f()(pn).push(ops.Address(STACK_ITEM_SIZE,ops.esp))) + f()
+    return (f()
+        .push_tos()
+        .push(address_of(name))
+        .push(ops.eax if in_eax else ops.Address(STACK_ITEM_SIZE,ops.esp))
         .call('PyObject_GetAttr')
         .discard_stack_items(2)
         .check_err()
@@ -659,7 +669,7 @@ def _op_pop_jump_if_(f,to,state):
         .decref(ops.edx,True)
         .test(ops.eax,ops.eax)
         (JumpSource(jop1,dont_jump))
-        (JumpSource(jop2,f.forward_target(to)))
+        (f.jump_to(jop2,ops.JCC_MAX_LEN,to))
         .xor(ops.eax,ops.eax)
         .goto(f.end)
         (dont_jump)
@@ -680,26 +690,31 @@ def _op_BUILD_(f,items,new,item_offset,deref):
         .check_err())
 
     if items:
-        if deref:
-            r.mov(ops.Address(item_offset,ops.eax),ops.ebx)
-
-            lbody = (
-                f.op.pop(ops.edx) +
-                f.op.mov(ops.edx,ops.Address(-STACK_ITEM_SIZE,ops.ebx,ops.ecx,STACK_ITEM_SIZE)))
-        else:
-            lbody = (
-                f.op.pop(ops.edx) +
-                f.op.mov(ops.edx,ops.Address(item_offset-STACK_ITEM_SIZE,ops.eax,ops.ecx,STACK_ITEM_SIZE)))
-
         f.stack.offset -= STACK_ITEM_SIZE * items
 
         if items >= BUILD_SEQ_LOOP_THRESHHOLD:
+            if deref:
+                r.mov(ops.Address(item_offset,ops.eax),ops.ebx)
+
+                lbody = (
+                    f.op.pop(ops.edx) +
+                    f.op.mov(ops.edx,ops.Address(-STACK_ITEM_SIZE,ops.ebx,ops.ecx,STACK_ITEM_SIZE)))
+            else:
+                lbody = (
+                    f.op.pop(ops.edx) +
+                    f.op.mov(ops.edx,ops.Address(item_offset-STACK_ITEM_SIZE,ops.eax,ops.ecx,STACK_ITEM_SIZE)))
+
             (r
                 .mov(items,ops.ecx)
                 (lbody)
                 .loop(ops.Displacement(-(len(lbody) + ops.LOOP_LEN))))
         else:
-            r += [lbody] * items
+            if deref:
+                r.mov(ops.Address(item_offset,ops.eax),ops.ebx)
+
+            for i in reversed(range(items)):
+                addr = ops.Address(STACK_ITEM_SIZE*i,ops.ebx) if deref else ops.Address(item_offset+STACK_ITEM_SIZE*i,ops.eax)
+                r.pop(ops.edx).mov(ops.edx,addr)
 
     return r
 
@@ -710,6 +725,26 @@ def _op_BUILD_LIST(f,items):
 @handler
 def _op_BUILD_TUPLE(f,items):
     return _op_BUILD_(f,items,'PyTuple_New',pyinternals.tuple_item_offset,False)
+
+@handler
+def _op_STORE_SUBSCR(f):
+    in_eax = f.stack.tos_in_eax
+    return (f()
+        .push_tos()
+        .push(ops.Address(STACK_ITEM_SIZE*2,ops.esp))
+        .push(ops.eax if in_eax else ops.Address(STACK_ITEM_SIZE,ops.esp))
+        .push(ops.Address(STACK_ITEM_SIZE*3,ops.esp))
+        .call('PyObject_SetItem')
+        .discard_stack_items(3)
+        .check_err(True)
+        .counted_pop(ops.eax)
+        .decref()
+        .counted_pop(ops.eax)
+        .decref()
+        .counted_pop(ops.eax)
+        .decref()
+    )
+
 
 
 
