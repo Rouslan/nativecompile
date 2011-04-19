@@ -457,6 +457,8 @@ def loopnz(x : Displacement):
 
 loopne = loopnz
 
+LOOP_LEN = 2
+
 
 
 @multimethod

@@ -344,6 +344,8 @@ PyInit_pyinternals(void) {
     if(PyModule_AddIntConstant(m,"type_offset",offsetof(PyObject,ob_type)) == -1) return NULL;
     if(PyModule_AddIntConstant(m,"type_dealloc_offset",offsetof(PyTypeObject,tp_dealloc)) == -1) return NULL;
     if(PyModule_AddIntConstant(m,"type_iternext_offset",offsetof(PyTypeObject,tp_iternext)) == -1) return NULL;
+    if(PyModule_AddIntConstant(m,"list_item_offset",offsetof(PyListObject,ob_item)) == -1) return NULL;
+    if(PyModule_AddIntConstant(m,"tuple_item_offset",offsetof(PyTupleObject,ob_item)) == -1) return NULL;
     if(PyModule_AddStringConstant(m,"architecture",ARCHITECTURE) == -1) return NULL;
     if(PyModule_AddObject(m,"ref_debug",PyBool_FromLong(REF_DEBUG_VAL)) == -1) return NULL;
     if(PyModule_AddObject(m,"count_allocs",PyBool_FromLong(COUNT_ALLOCS_VAL)) == -1) return NULL;
@@ -372,6 +374,7 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyNumber_Multiply)
     ADD_ADDR(PyNumber_TrueDivide)
     ADD_ADDR(PyNumber_FloorDivide)
+    ADD_ADDR(PyNumber_Add)
     ADD_ADDR(PyNumber_Subtract)
     ADD_ADDR(PyNumber_Lshift)
     ADD_ADDR(PyNumber_Rshift)
@@ -382,12 +385,15 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyNumber_InPlaceTrueDivide)
     ADD_ADDR(PyNumber_InPlaceFloorDivide)
     ADD_ADDR(PyNumber_InPlaceRemainder)
+    ADD_ADDR(PyNumber_InPlaceAdd)
     ADD_ADDR(PyNumber_InPlaceSubtract)
     ADD_ADDR(PyNumber_InPlaceLshift)
     ADD_ADDR(PyNumber_InPlaceRshift)
     ADD_ADDR(PyNumber_InPlaceAnd)
     ADD_ADDR(PyNumber_InPlaceXor)
     ADD_ADDR(PyNumber_InPlaceOr)
+    ADD_ADDR(PyList_New)
+    ADD_ADDR(PyTuple_New)
     ADD_ADDR(_call_function)
     ADD_ADDR(format_exc_check_arg)
     

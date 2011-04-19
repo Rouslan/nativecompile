@@ -9,6 +9,7 @@ from . import pyinternals
 
 
 STACK_ITEM_SIZE = 4
+BUILD_SEQ_LOOP_THRESHHOLD = 3
 
 
 
@@ -410,6 +411,11 @@ def _op_BINARY_FLOOR_DIVIDE(f):
     return _binary_op(f,'PyNumber_FloorDivide')
 
 @handler
+def _op_BINARY_ADD(f):
+    # TODO: implement the optimization that ceval.c uses for unicode strings
+    return _binary_op(f,'PyNumber_Add')
+
+@handler
 def _op_BINARY_SUBTRACT(f):
     return _binary_op(f,'PyNumber_Subtract')
 
@@ -452,6 +458,11 @@ def _op_INPLACE_FLOOR_DIVIDE(f):
 @handler
 def _op_INPLACE_MODULO(f):
     return _binary_op(f,'PyNumber_InPlaceRemainder')
+
+@handler
+def _op_INPLACE_ADD(f):
+    # TODO: implement the optimization that ceval.c uses for unicode strings
+    return _binary_op(f,'PyNumber_InPlaceAdd')
 
 @handler
 def _op_INPLACE_SUBTRACT(f):
@@ -662,6 +673,44 @@ def _op_POP_JUMP_IF_FALSE(f,to):
 def _op_POP_JUMP_IF_TRUE(f,to):
     return _op_pop_jump_if_(f,to,True)
 
+def _op_BUILD_(f,items,new,item_offset,deref):
+    r = (f()
+        .push_tos(True)
+        .invoke(new,items)
+        .check_err())
+
+    if items:
+        if deref:
+            r.mov(ops.Address(item_offset,ops.eax),ops.ebx)
+
+            lbody = (
+                f.op.pop(ops.edx) +
+                f.op.mov(ops.edx,ops.Address(-STACK_ITEM_SIZE,ops.ebx,ops.ecx,STACK_ITEM_SIZE)))
+        else:
+            lbody = (
+                f.op.pop(ops.edx) +
+                f.op.mov(ops.edx,ops.Address(item_offset-STACK_ITEM_SIZE,ops.eax,ops.ecx,STACK_ITEM_SIZE)))
+
+        f.stack.offset -= STACK_ITEM_SIZE * items
+
+        if items >= BUILD_SEQ_LOOP_THRESHHOLD:
+            (r
+                .mov(items,ops.ecx)
+                (lbody)
+                .loop(ops.Displacement(-(len(lbody) + ops.LOOP_LEN))))
+        else:
+            r += [lbody] * items
+
+    return r
+
+@handler
+def _op_BUILD_LIST(f,items):
+    return _op_BUILD_(f,items,'PyList_New',pyinternals.list_item_offset,True)
+
+@handler
+def _op_BUILD_TUPLE(f,items):
+    return _op_BUILD_(f,items,'PyTuple_New',pyinternals.tuple_item_offset,False)
+
 
 
 def join(x):
@@ -768,6 +817,7 @@ def compile_raw(code,binary = True):
     
     opcodes = (f()
         .counted_push(ops.ebp)
+        .counted_push(ops.ebx)
         .mov(ops.esp,ops.ebp) +
         function_get(f,'PyEval_GetGlobals') +
         function_get(f,'PyEval_GetBuiltins') +
@@ -813,11 +863,12 @@ def compile_raw(code,binary = True):
     # call Py_DECREF on anything left on the stack and return %eax
     opcodes += [
         f.end,
-        f.op.sub(stack_prolog - STACK_ITEM_SIZE,ops.ebp),
+        f.op.sub(stack_prolog - STACK_ITEM_SIZE*2,ops.ebp),
         f.op.jmp(ops.Displacement(len(dr))),
         dr,
         cmpjl,
-        f.op.add(stack_prolog - STACK_ITEM_SIZE,ops.esp),
+        f.op.add(stack_prolog - STACK_ITEM_SIZE*2,ops.esp),
+        f.op.pop(ops.ebx),
         f.op.pop(ops.ebp),
         f.op.ret()]
     
