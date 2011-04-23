@@ -17,9 +17,6 @@ def int_to_8(x):
 def immediate_data(w,data):
     return data.to_bytes(4 if w else 1,byteorder='little',signed=data<0)
 
-def fits_in_sbyte(x):
-    return -128 <= x <= 127
-
 
 
 class Register:
@@ -103,8 +100,16 @@ class Displacement:
     displacement and not an absolute address.
     
     """
-    def __init__(self,value):
+    def __init__(self,value,force_full_size=False):
         self.val = value
+        self.force_full_size = force_full_size
+
+
+def fits_in_sbyte(x):
+    if isinstance(x,Displacement):
+        if x.force_full_size: return False
+        x = x.val
+    return -128 <= x <= 127
 
 
 class Test:
@@ -169,16 +174,19 @@ class AsmSequence:
         lines = []
         addr = base
         for bin,name,args in self.ops:
-            indirect = name == 'call' or name == 'jmp'
-            nextaddr = addr + len(bin)
+            if name == '$COMMENT$':
+                lines.append('; {}\n'.format(args))
+            else:
+                indirect = name == 'call' or name == 'jmp'
+                nextaddr = addr + len(bin)
             
-            lines.append('{:8x}: {:16}{:8} {}\n'.format(
-                addr,
-                binascii.hexlify(bin).decode(),
-                name,
-                ', '.join(asm_str(indirect,nextaddr,arg) for arg in args) ))
+                lines.append('{:8x}: {:16}{:8} {}\n'.format(
+                    addr,
+                    binascii.hexlify(bin).decode(),
+                    name,
+                    ', '.join(asm_str(indirect,nextaddr,arg) for arg in args) ))
                 
-            addr = nextaddr
+                addr = nextaddr
         
         return ''.join(lines)
 
@@ -187,12 +195,15 @@ class Assembly:
     @staticmethod
     def op(name,*args):
         return AsmSequence([(globals()[name](*args),name,args)])
-        
+    
     def __getattr__(self,name):
         return partial(Assembly.op,name)
     
     def jcc(self,test,x):
         return Assembly.op('j'+test.mnemonic,x)
+
+    def comment(self,comm):
+        return AsmSequence([(b'','$COMMENT$',comm)])
 
 
 
@@ -384,7 +395,7 @@ def incl(x : Address):
 
 
 def jcc(test : Test,x : Displacement):
-    if fits_in_sbyte(x.val):
+    if fits_in_sbyte(x):
         return bytes([0b01110000 | test.val]) + int_to_8(x.val)
     
     return bytes([
@@ -417,7 +428,7 @@ def jg(x): return jcc(test_G,x)
 
 @multimethod
 def jmp(x : Displacement):
-    fits = fits_in_sbyte(x.val)
+    fits = fits_in_sbyte(x)
     return bytes([0b11101001 | (fits << 1)]) + ([int_to_32,int_to_8][fits])(x.val)
 
 JMP_DISP_MIN_LEN = 2

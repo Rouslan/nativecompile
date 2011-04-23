@@ -1,6 +1,7 @@
 
 #include <Python.h>
 #include <structmember.h>
+#include <frameobject.h>
 
 #if defined(__linux__) || defined(__linux) || defined(linux)
     #include <sys/mman.h>
@@ -50,73 +51,223 @@
     " in enclosing scope"
 
 
-/* implements the CALL_FUNCTION bytecode, except using the real stack */
-static PyObject *_call_function(unsigned int arg,...) {
-    va_list stack;
-    PyObject *kw;
-    PyObject *pos;
-    PyObject *func;
-    PyObject *val;
-    PyObject *key;
-    int r;
-    int titems;
-    int pos_count = arg & 0xFF;
-    int kw_count = (arg & 0xFF00) >> 8;
-    kw = NULL;
-    
-    va_start(stack,arg);
-    
-    if(kw_count) {
-        if(!(kw = PyDict_New())) goto err;
-        
-        while(kw_count--) {
-            val = va_arg(stack,PyObject*);
-            key = va_arg(stack,PyObject*);
-            r = PyDict_SetItem(kw,key,val);
-            Py_DECREF(val);
-            Py_DECREF(key);
-            if(r == -1) {
-                Py_DECREF(kw);
-                goto err;
+
+static PyObject *load_args(PyObject ***pp_stack, int na);
+static void err_args(PyObject *func, int flags, int nargs);
+static PyObject *fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk);
+static PyObject *do_call(PyObject *func, PyObject ***pp_stack, int na, int nk);
+
+/* The following 7 are modified versions of functions in Python/ceval.c.
+ * Profiling and statistics code has been removed because it uses global
+ * variables not accessable to this module. */
+
+#define EXT_POP(STACK_POINTER) (*(STACK_POINTER)++)
+
+static PyObject *
+call_function(PyObject **pp_stack, int oparg)
+{
+    int na = oparg & 0xff;
+    int nk = (oparg>>8) & 0xff;
+    int n = na + 2 * nk;
+    PyObject **pfunc = pp_stack + n;
+    PyObject *func = *pfunc;
+    PyObject *x, *w;
+
+    if (PyCFunction_Check(func) && nk == 0) {
+        int flags = PyCFunction_GET_FLAGS(func);
+
+        if (flags & (METH_NOARGS | METH_O)) {
+            PyCFunction meth = PyCFunction_GET_FUNCTION(func);
+            PyObject *self = PyCFunction_GET_SELF(func);
+            if (flags & METH_NOARGS && na == 0) {
+                x = (*meth)(self,NULL);
+            }
+            else if (flags & METH_O && na == 1) {
+                PyObject *arg = EXT_POP(pp_stack);
+                x = (*meth)(self,arg);
+                Py_DECREF(arg);
+            }
+            else {
+                err_args(func, flags, na);
+                x = NULL;
             }
         }
+        else {
+            PyObject *callargs;
+            callargs = load_args(&pp_stack, na);
+            x = PyCFunction_Call(func,callargs,NULL);
+            Py_XDECREF(callargs);
+        }
+    } else {
+        if (PyMethod_Check(func) && PyMethod_GET_SELF(func) != NULL) {
+            PyObject *self = PyMethod_GET_SELF(func);
+            Py_INCREF(self);
+            func = PyMethod_GET_FUNCTION(func);
+            Py_INCREF(func);
+            Py_DECREF(*pfunc);
+            *pfunc = self;
+            na++;
+            n++;
+        } else
+            Py_INCREF(func);
+        if (PyFunction_Check(func))
+            x = fast_function(func, &pp_stack, n, na, nk);
+        else
+            x = do_call(func, &pp_stack, na, nk);
+        Py_DECREF(func);
     }
-    
-    if(!(pos = PyTuple_New(pos_count))) {
-        Py_XDECREF(kw);
-        goto err;
-    }
-    
-    while(pos_count--) {
-        val = va_arg(stack,PyObject*);
-        Py_INCREF(val);
-        PyTuple_SET_ITEM(pos,pos_count,val);
-    }
-    
-    func = va_arg(stack,PyObject*);
-    
-    va_end(stack);
-    
-    val = PyObject_Call(func,pos,kw);
-    
-    Py_XDECREF(kw);
-    Py_DECREF(pos);
-    
-    return val;
 
-err:
-    titems = kw_count * 2 + pos_count + 1;
-    for(;kw_count > 0; --kw_count) {
-        val = va_arg(stack,PyObject*);
-        Py_DECREF(val);
+    while (pp_stack > pfunc) {
+        w = EXT_POP(pp_stack);
+        Py_DECREF(w);
     }
-    
-    va_end(stack);
-    
-    return NULL;
+    return x;
 }
 
-/* copied from Python/ceval.c */
+static PyObject *
+fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
+{
+    PyCodeObject *co = (PyCodeObject *)PyFunction_GET_CODE(func);
+    PyObject *globals = PyFunction_GET_GLOBALS(func);
+    PyObject *argdefs = PyFunction_GET_DEFAULTS(func);
+    PyObject *kwdefs = PyFunction_GET_KW_DEFAULTS(func);
+    PyObject **d = NULL;
+    int nd = 0;
+
+    if (argdefs == NULL && co->co_argcount == n &&
+        co->co_kwonlyargcount == 0 && nk==0 &&
+        co->co_flags == (CO_OPTIMIZED | CO_NEWLOCALS | CO_NOFREE)) {
+        PyFrameObject *f;
+        PyObject *retval = NULL;
+        PyThreadState *tstate = PyThreadState_GET();
+        PyObject **fastlocals, **stack;
+        int i;
+
+        assert(globals != NULL);
+        assert(tstate != NULL);
+        f = PyFrame_New(tstate, co, globals, NULL);
+        if (f == NULL)
+            return NULL;
+
+        fastlocals = f->f_localsplus;
+        stack = (*pp_stack) + n - 1;
+
+        for (i = 0; i < n; i++) {
+            Py_INCREF(*stack);
+            fastlocals[i] = *stack--;
+        }
+        retval = PyEval_EvalFrameEx(f,0);
+        ++tstate->recursion_depth;
+        Py_DECREF(f);
+        --tstate->recursion_depth;
+        return retval;
+    }
+    if (argdefs != NULL) {
+        d = &PyTuple_GET_ITEM(argdefs, 0);
+        nd = Py_SIZE(argdefs);
+    }
+    return PyEval_EvalCodeEx((PyObject*)co, globals,
+                             (PyObject *)NULL, (*pp_stack)+n-1, na,
+                             (*pp_stack)+2*nk-1, nk, d, nd, kwdefs,
+                             PyFunction_GET_CLOSURE(func));
+}
+
+static PyObject *
+update_keyword_args(PyObject *orig_kwdict, int nk, PyObject ***pp_stack,
+                    PyObject *func)
+{
+    PyObject *kwdict = NULL;
+    if (orig_kwdict == NULL)
+        kwdict = PyDict_New();
+    else {
+        kwdict = PyDict_Copy(orig_kwdict);
+        Py_DECREF(orig_kwdict);
+    }
+    if (kwdict == NULL)
+        return NULL;
+    while (--nk >= 0) {
+        int err;
+        PyObject *value = EXT_POP(*pp_stack);
+        PyObject *key = EXT_POP(*pp_stack);
+        if (PyDict_GetItem(kwdict, key) != NULL) {
+            PyErr_Format(PyExc_TypeError,
+                         "%.200s%s got multiple values "
+                         "for keyword argument '%U'",
+                         PyEval_GetFuncName(func),
+                         PyEval_GetFuncDesc(func),
+                         key);
+            Py_DECREF(key);
+            Py_DECREF(value);
+            Py_DECREF(kwdict);
+            return NULL;
+        }
+        err = PyDict_SetItem(kwdict, key, value);
+        Py_DECREF(key);
+        Py_DECREF(value);
+        if (err) {
+            Py_DECREF(kwdict);
+            return NULL;
+        }
+    }
+    return kwdict;
+}
+
+static PyObject *
+load_args(PyObject ***pp_stack, int na)
+{
+    PyObject *args = PyTuple_New(na);
+    PyObject *w;
+
+    if (args == NULL)
+        return NULL;
+    while (--na >= 0) {
+        w = EXT_POP(*pp_stack);
+        PyTuple_SET_ITEM(args, na, w);
+    }
+    return args;
+}
+
+static PyObject *
+do_call(PyObject *func, PyObject ***pp_stack, int na, int nk)
+{
+    PyObject *callargs = NULL;
+    PyObject *kwdict = NULL;
+    PyObject *result = NULL;
+
+    if (nk > 0) {
+        kwdict = update_keyword_args(NULL, nk, pp_stack, func);
+        if (kwdict == NULL)
+            goto call_fail;
+    }
+    callargs = load_args(pp_stack, na);
+    if (callargs == NULL)
+        goto call_fail;
+
+    if (PyCFunction_Check(func))
+        result = PyCFunction_Call(func, callargs, kwdict);
+    else
+        result = PyObject_Call(func, callargs, kwdict);
+call_fail:
+    Py_XDECREF(callargs);
+    Py_XDECREF(kwdict);
+    return result;
+}
+
+static void
+err_args(PyObject *func, int flags, int nargs)
+{
+    if (flags & METH_NOARGS)
+        PyErr_Format(PyExc_TypeError,
+                     "%.200s() takes no arguments (%d given)",
+                     ((PyCFunctionObject *)func)->m_ml->ml_name,
+                     nargs);
+    else
+        PyErr_Format(PyExc_TypeError,
+                     "%.200s() takes exactly one argument (%d given)",
+                     ((PyCFunctionObject *)func)->m_ml->ml_name,
+                     nargs);
+}
+
 static void
 format_exc_check_arg(PyObject *exc, const char *format_str, PyObject *obj)
 {
@@ -131,6 +282,8 @@ format_exc_check_arg(PyObject *exc, const char *format_str, PyObject *obj)
 
     PyErr_Format(exc, format_str, obj_str);
 }
+
+
 
 
 typedef struct {
@@ -290,22 +443,64 @@ static PyTypeObject CompiledCodeType = {
 };
 
 
-/*
-PyDoc_STRVAR(execute_machine_code_doc,
-"execute_machine_code(path) -> None\n\
-\n\
-Execute machine code from the file at path. \n\
-\n\
-The file must not have any sort of header and will be executed as-is. The code\n\
-is expected to start with a function that takes no arguments and return a\n\
-Python object (PyObject*), or NULL if an exception is set.\n\
-\n\
-Warning: this function is not even\n\
-remotely safe. The code has to use the correct instruction-set for the current\n\
-CPU and use the same calling convention that Python was compiled with. Any\n\
-mistake will most likely cause Python to immediately terminate.\n\
-");*/
 
+#if 0
+typedef struct {
+    PyFunctionObject pyfunc;
+    PyObject *compiled_code;
+    unsigned int entry_offset;
+} CompiledFunction;
+
+static PyObject *CompiledFunction_new(PyTypeObject *type,PyObject *args,PyObject *kwds) {
+    PyObject *compiled_code;
+    unsigned int entry_offset;
+    int i;
+    PyObject *other_args;
+    int r;
+    static char *kwlist[] = {"compiled_code","entry_offset",
+			     "code", "globals", "name","argdefs", "closure", 0};
+
+    /* a tuple for the args that the superclass will handle */
+    other_args = PyTuple_New(5);
+    if(!other_args) return NULL;
+    PyTuple_SET_ITEM(other_args,0,Py_None);
+    PyTuple_SET_ITEM(other_args,1,Py_None);
+    PyTuple_SET_ITEM(other_args,2,Py_None);
+    PyTuple_SET_ITEM(other_args,3,Py_None);
+    PyTuple_SET_ITEM(other_args,4,Py_None);
+
+    r = PyArg_ParseTupleAndKeywords(args,kwds,"O!kOO|OOO:CompiledFunction",kwlist,
+        &CompiledCodeType,&compiled_code,&entry_offset,
+	&PyTuple_GET_ITEM(other_args,0),
+	&PyTuple_GET_ITEM(other_args,1),
+	&PyTuple_GET_ITEM(other_args,2),
+	&PyTuple_GET_ITEM(other_args,3),
+	&PyTuple_GET_ITEM(other_args,4));
+
+    for(i=0; i<5; ++i) Py_INCREF(PyTuple_GET_ITEM(other_args,i));
+
+    if(!r) {
+	Py_DECREF(other_args);
+	return NULL;
+    }
+	
+    CompiledFunction *self = (CompiledFunction*)PyFunction_Type.tp_new(type,other_args,NULL);
+
+    Py_DECREF(other_args);
+
+    if(self) {
+	self->compiled_code = compiled_code;
+	Py_INCREF(compiled_code);
+	self->entry_offset = entry_offset;
+    }
+
+    return self;
+}
+
+static PyObject *CompiledFunction_call(CompiledFunction *self,PyObject *args,PyObject *kwds) {
+    (self->compiled_code->entry + self->entry_offset)();
+}
+#endif
 
 
 static struct PyModuleDef this_module = {
@@ -394,7 +589,7 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyNumber_InPlaceOr)
     ADD_ADDR(PyList_New)
     ADD_ADDR(PyTuple_New)
-    ADD_ADDR(_call_function)
+    ADD_ADDR(call_function)
     ADD_ADDR(format_exc_check_arg)
     
     ADD_ADDR_NAME(&PyDict_Type,"PyDict_Type")

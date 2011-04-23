@@ -1,7 +1,7 @@
 Experimental bytecode to machine code compiler
 
 CPython 3.2 is required. Higher versions might work, but since the Python
-bytecode can vary from version to version, its completely hit or miss.
+bytecode can vary from version to version, it's completely hit or miss.
 
 Currently only x86 compatible builds are supported. This will run on x86_64
 processors but only if Python was compiled in 32-bit mode.

@@ -82,7 +82,7 @@ class JumpRSource:
         self.displacement += amount
 
     def compile(self):
-        c = self.op(ops.Displacement(-self.displacement))
+        c = self.op(ops.Displacement(-self.displacement,True))
         assert len(c) <= self.size
         # pad the instruction with NOPs if it's too short
         return c + self.opset.nop() * (self.size - len(c))
@@ -138,8 +138,11 @@ address_of = id
 handlers = [None] * 0xFF
 
 def handler(func,name = None):
+    opname = (name or func.__name__)[len('_op_'):]
     def inner(f,*extra):
         r = f()
+        if isinstance(f.op,ops.Assembly):
+            r.comment(opname)
         if f.forward_targets and f.forward_targets[0][0] <= f.byte_offset:
             ft = f.forward_targets.pop(0)
             assert ft[0] == f.byte_offset
@@ -147,7 +150,7 @@ def handler(func,name = None):
 
         return r + func(f,*extra)
 
-    handlers[dis.opmap[(name or func.__name__)[len('_op_'):]]] = inner
+    handlers[dis.opmap[opname]] = inner
     return func
 
 def hasconst(func):
@@ -555,15 +558,15 @@ def _op_LOAD_GLOBAL(f,name):
 
 @hasname
 def _op_STORE_GLOBAL(f,name):
-    return (
-        f.stack.push_tos(extra_push=True) + [
-        f.op.push(address_of(name)),
-        f.op.push(GLOBALS)
-    ] + f.call('PyDict_SetItem') + [
-        f.discard_stack_items(3)
-    ] + f.check_err(True) + [
-        f.stack.pop(ops.eax)
-    ] + f.decref()
+    return (f()
+        .push_tos(extra_push=True)
+        .push(address_of(name))
+        .push(GLOBALS)
+        .call('PyDict_SetItem')
+        .discard_stack_items(3)
+        .check_err(True)
+        .counted_pop(ops.eax)
+        .decref()
     )
 
 @hasconst
@@ -577,15 +580,22 @@ def _op_LOAD_CONST(f,const):
 @handler
 def _op_CALL_FUNCTION(f,arg):
     ret = f.op.ret()
-    return (
-        f.stack.push_tos(True) + [f.stack.push(arg)] + f.call('_call_function') +
-        [f.stack.add_to(((arg & 0xFF) + ((arg >> 8) & 0xFF) + 2) * STACK_ITEM_SIZE)] +  # +2 for arg and the function object
-        f.check_err()
+    return (f()
+        .push_tos(True)
+        .mov(ops.esp,ops.eax)
+        .counted_push(arg)
+        .counted_push(ops.eax)
+        .call('call_function')
+
+        # +3 for arg, the function object and the address of the stack
+        .counted_discard_stack_items((arg & 0xFF) + ((arg >> 8) & 0xFF) + 3)
+
+        .check_err()
     )
 
 @handler
 def _op_RETURN_VALUE(f):
-    return [f.goto(f.end)] if f.stack.use_tos() else [f.stack.pop(ops.eax),f.goto(f.end)]
+    return f().goto(f.end) if f.stack.use_tos() else f().counted_pop(ops.eax).goto(f.end)
 
 @handler
 def _op_SETUP_LOOP(f,to):
@@ -595,22 +605,22 @@ def _op_SETUP_LOOP(f,to):
 @handler
 def _op_POP_BLOCK(f):
     assert not f.stack.tos_in_eax
-    return ([
-        f.blockends.pop(),
-        f.stack.pop(ops.eax)
-    ] + f.decref()
+    return (f()
+        (f.blockends.pop())
+        .counted_pop(ops.eax)
+        .decref()
     )
 
 @handler
 def _op_GET_ITER(f):
-    return (
-        f.stack.push_tos(extra_push=True) +
-        f.call('PyObject_GetIter') + [
-        f.discard_stack_items(1)
-    ] + f.check_err() + [
-        f.op.pop(ops.edx),
-        f.op.push(ops.eax)
-    ] + f.decref(ops.edx)
+    return (f()
+        .push_tos(extra_push=True)
+        .call('PyObject_GetIter')
+        .discard_stack_items(1)
+        .check_err()
+        .pop(ops.edx)
+        .push(ops.eax)
+        .decref(ops.edx)
     )
 
 @handler
@@ -645,7 +655,6 @@ def _op_JUMP_ABSOLUTE(f,to):
 @hasname
 def _op_LOAD_ATTR(f,name):
     in_eax = f.stack.tos_in_eax
-    pn = f.op.push(address_of(name))
     return (f()
         .push_tos()
         .push(address_of(name))
@@ -749,10 +758,7 @@ def _op_STORE_SUBSCR(f):
 
 
 def join(x):
-    try:
-        return b''.join(x)
-    except TypeError:
-        return reduce(operator.add,x)
+    return b''.join(x) if isinstance(x[0],bytes) else reduce(operator.add,x)
 
 def resolve_jumps(chunks):
     targets = weakref.WeakSet()
@@ -782,7 +788,7 @@ def resolve_jumps(chunks):
             for s in rsources:
                 s.displace(l)
     
-    return join((c.compile() if isinstance(c,JumpRSource) else c) for c in chunks)
+    return join([(c.compile() if isinstance(c,JumpRSource) else c) for c in chunks])
 
 
 def local_name_func(f):
@@ -826,9 +832,8 @@ def local_name_func(f):
             f.if_eax_is_zero(
                 f.invoke('format_exc_check_arg',
                      pyinternals.raw_addresses['NAME_ERROR_MSG'],
-                     pyinternals.raw_addresses['PyExc_NameError']) + [
-                f.op.ret(STACK_ITEM_SIZE)
-            ])
+                     pyinternals.raw_addresses['PyExc_NameError'])
+            )
         ) + [
         
         found,
@@ -840,15 +845,15 @@ def function_get(f,func):
     err = f.op.ret()
     if f.stack.offset: err = f.op.add(f.stack.offset,ops.esp) + err
     
-    return (
-        f.call(func) +
-        f.if_eax_is_zero(err) + [
-        f.stack.push(ops.eax)
-    ])
+    return (f()
+        .call(func)
+        .if_eax_is_zero(err)
+        .counted_push(ops.eax)
+    )
 
 
 def compile_raw(code,binary = True):
-    f = Frame(code,ops if binary else ops.Assembly())
+    f = Frame(code,(ops if binary else ops.Assembly()))
     
     opcodes = (f()
         .counted_push(ops.ebp)
@@ -896,16 +901,17 @@ def compile_raw(code,binary = True):
     cmpjl += f.op.jb(ops.Displacement(jlen))
     
     # call Py_DECREF on anything left on the stack and return %eax
-    opcodes += [
-        f.end,
-        f.op.sub(stack_prolog - STACK_ITEM_SIZE*2,ops.ebp),
-        f.op.jmp(ops.Displacement(len(dr))),
-        dr,
-        cmpjl,
-        f.op.add(stack_prolog - STACK_ITEM_SIZE*2,ops.esp),
-        f.op.pop(ops.ebx),
-        f.op.pop(ops.ebp),
-        f.op.ret()]
+    (opcodes
+        (f.end)
+        .sub(stack_prolog - STACK_ITEM_SIZE*2,ops.ebp)
+        .jmp(ops.Displacement(len(dr)))
+        (dr)
+        (cmpjl)
+        .add(stack_prolog - STACK_ITEM_SIZE*2,ops.esp)
+        .pop(ops.ebx)
+        .pop(ops.ebp)
+        .ret()
+    )
     
     if f._local_name:
         opcodes += [f._local_name] + local_name_func(f)
