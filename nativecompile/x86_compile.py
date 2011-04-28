@@ -72,10 +72,9 @@ class JumpSource:
 
 
 class JumpRSource:
-    def __init__(self,opset,op,max_size,target):
+    def __init__(self,op,size,target):
         self.op = op
-        self.size = max_size
-        self.opset = opset
+        self.size = size
         target.sources.append(self)
 
     def displace(self,amount):
@@ -83,9 +82,8 @@ class JumpRSource:
 
     def compile(self):
         c = self.op(ops.Displacement(-self.displacement,True))
-        assert len(c) <= self.size
-        # pad the instruction with NOPs if it's too short
-        return c + self.opset.nop() * (self.size - len(c))
+        assert len(c) == self.size
+        return c
 
     def __len__(self):
         return self.size
@@ -135,6 +133,10 @@ class JumpRTarget:
 address_of = id
 
 
+class Tuning:
+    prefer_addsub_over_incdec = True
+
+
 handlers = [None] * 0xFF
 
 def handler(func,name = None):
@@ -177,9 +179,10 @@ LOCALS = ops.Address(-12,ops.ebp)
 
 
 class Frame:
-    def __init__(self,code,op):
+    def __init__(self,code,op,tuning):
         self.code = code
         self.op = op
+        self.tuning = tuning
         self.stack = StackManager(op)
         self.end = JumpTarget()
         self._local_name = None
@@ -213,7 +216,7 @@ class Frame:
         return list(map(self.op.push,reversed(args))) + self.call(func) + [self.op.add(len(args)*STACK_ITEM_SIZE,ops.esp)]
 
     def _if_eax_is(self,test,opcodes):
-        if not isinstance(opcodes,list):
+        if isinstance(opcodes,(bytes,ops.AsmSequence)):
             return [
                 self.op.test(ops.eax,ops.eax),
                 self.op.jcc(~test,ops.Displacement(len(opcodes))),
@@ -236,11 +239,29 @@ class Frame:
     def discard_stack_items(self,n):
         return self.op.add(STACK_ITEM_SIZE * n,ops.esp)
 
+    def inc_or_add(self,x):
+        return self.op.add(1,x) if self.tuning.prefer_addsub_over_incdec else self.op.inc(x)
+
+    def incb_or_addb(self,x):
+        return self.op.addb(1,x) if self.tuning.prefer_addsub_over_incdec else self.op.incb(x)
+
+    def incl_or_addl(self,x):
+        return self.op.addl(1,x) if self.tuning.prefer_addsub_over_incdec else self.op.incl(x)
+
+    def dec_or_sub(self,x):
+        return self.op.sub(1,x) if self.tuning.prefer_addsub_over_incdec else self.op.dec(x)
+
+    def decb_or_subb(self,x):
+        return self.op.subb(1,x) if self.tuning.prefer_addsub_over_incdec else self.op.decb(x)
+
+    def decl_or_subl(self,x):
+        return self.op.subl(1,x) if self.tuning.prefer_addsub_over_incdec else self.op.decl(x)
+
     def incref(self,reg = ops.eax):
         if pyinternals.ref_debug:
             return [self.op.push(ops.eax)] + self.invoke('Py_IncRef',reg) + [self.op.pop(ops.eax)]
 
-        return [self.op.incl(ops.Address(pyinternals.refcnt_offset,reg))]
+        return [self.incl_or_addl(ops.Address(pyinternals.refcnt_offset,reg))]
 
     def decref(self,reg = ops.eax,preserve_eax = False):
         if pyinternals.ref_debug:
@@ -273,7 +294,7 @@ class Frame:
         mid = join(mid)
         
         return [
-            self.op.decl(ops.Address(pyinternals.refcnt_offset,reg)),
+            self.decl_or_subl(ops.Address(pyinternals.refcnt_offset,reg)),
             self.op.jnz(ops.Displacement(len(mid))),
             mid
         ]
@@ -306,7 +327,7 @@ class Frame:
         return t
 
     def jump_to(self,op,max_size,to):
-        return JumpSource(op,self.forward_target(to)) if to > self.byte_offset else JumpRSource(self.op,op,max_size,self.reverse_target(to))
+        return JumpSource(op,self.forward_target(to)) if to > self.byte_offset else JumpRSource(op,max_size,self.reverse_target(to))
 
     def __call__(self):
         return Stitch(self)
@@ -341,11 +362,43 @@ class Stitch:
         self.code.append(self.f.stack.add_to(STACK_ITEM_SIZE*n))
         return self
 
+    def inc_or_add(self,x):
+        self.code.append(self.f.inc_or_add(x))
+        return self
+
+    def incb_or_addb(self,x):
+        self.code.append(self.f.incb_or_addb(x))
+        return self
+
+    def incl_or_addl(self,x):
+        self.code.append(self.f.incl_or_addl(x))
+        return self
+
+    def dec_or_sub(self,x):
+        self.code.append(self.f.dec_or_sub(x))
+        return self
+
+    def decb_or_subb(self,x):
+        self.code.append(self.f.decb_or_subb(x))
+        return self
+
+    def decl_or_subl(self,x):
+        self.code.append(self.f.decl_or_subl(x))
+        return self
+
     def call(self,x):
         if isinstance(x,str):
             self.code += self.f.call(x)
         else:
             self.code.append(self.f.op.call(x))
+        return self
+
+    def if_eax_is_zero(self,opcodes):
+        self.code += self.f.if_eax_is_zero(opcodes.code if isinstance(opcodes,Stitch) else opcodes)
+        return self
+
+    def if_eax_is_not_zero(self,opcodes):
+        self.code += self.f.if_eax_is_not_zero(opcodes.code if isinstance(opcodes,Stitch) else opcodes)
         return self
 
     def __add__(self,b):
@@ -389,8 +442,6 @@ def _forward_list_func(func):
 for func in [
     'check_err',
     'invoke',
-    'if_eax_is_zero',
-    'if_eax_is_not_zero',
     'incref',
     'decref']:
     setattr(Stitch,func,_forward_list_func(getattr(Frame,func)))
@@ -625,32 +676,32 @@ def _op_GET_ITER(f):
 
 @handler
 def _op_FOR_ITER(f,to):
-    return (
-        f.stack.push_tos(True) + [
-        f.rtarget(),
-        f.op.push(ops.Address(base=ops.esp)),
-        f.op.mov(ops.Address(base=ops.esp),ops.eax),
-        f.op.mov(ops.Address(pyinternals.type_offset,ops.eax),ops.eax),
-        f.op.mov(ops.Address(pyinternals.type_iternext_offset,ops.eax),ops.eax),
-        f.op.call(ops.eax),
-        f.discard_stack_items(1)
-    ] + f.if_eax_is_zero(
-            f.call('PyErr_Occurred') +
-            f.if_eax_is_not_zero(
-                f.invoke('PyErr_ExceptionMatches',pyinternals.raw_addresses['PyExc_StopIteration']) + [
-                f.op.test(ops.eax,ops.eax),
-                JumpSource(f.op.jz,f.end)
-            ] + f.call('PyErr_Clear')
-            ) + [
-            f.goto(f.blockends[-1])
-        ])
+    return (f()
+        .push_tos(True)
+        (f.rtarget())
+        .push(ops.Address(base=ops.esp))
+        .mov(ops.Address(base=ops.esp),ops.eax)
+        .mov(ops.Address(pyinternals.type_offset,ops.eax),ops.eax)
+        .mov(ops.Address(pyinternals.type_iternext_offset,ops.eax),ops.eax)
+        .call(ops.eax)
+        .discard_stack_items(1)
+        .if_eax_is_zero(f()
+            .call('PyErr_Occurred')
+            .if_eax_is_not_zero(f()
+                .invoke('PyErr_ExceptionMatches',pyinternals.raw_addresses['PyExc_StopIteration'])
+                .test(ops.eax,ops.eax)
+                (JumpSource(f.op.jz,f.end))
+                .call('PyErr_Clear')
+            )
+            .goto(f.blockends[-1])
+        )
     )
 
 @handler
 def _op_JUMP_ABSOLUTE(f,to):
     assert to < f.byte_offset
-    return f.stack.push_tos() + [
-        JumpRSource(f.op,f.op.jmp,ops.JMP_DISP_MAX_LEN,f.reverse_target(to))]
+    return f().push_tos()(
+        JumpRSource(f.op.jmp,ops.JMP_DISP_MAX_LEN,f.reverse_target(to)))
 
 @hasname
 def _op_LOAD_ATTR(f,name):
@@ -799,69 +850,73 @@ def local_name_func(f):
     endif = JumpTarget()
     found = JumpTarget()
     
-    return ([
-        f.op.push(ops.Address(STACK_ITEM_SIZE,ops.esp)),
-        f.op.mov(LOCALS,ops.eax),
-        f.op.push(ops.eax),
+    return (f()
+        .push(ops.Address(STACK_ITEM_SIZE,ops.esp))
+        .mov(LOCALS,ops.eax)
+        .push(ops.eax)
         
         # if (%eax)->ob_type != PyDict_Type:
-        f.op.cmpl(pyinternals.raw_addresses['PyDict_Type'],ops.Address(pyinternals.type_offset,ops.eax)),
-        JumpSource(f.op.je,else_)
-    ] +     f.call('PyObject_GetItem') + [
-            f.discard_stack_items(2),
-            f.op.test(ops.eax,ops.eax),
-            JumpSource(f.op.jnz,found),
+        .cmpl(pyinternals.raw_addresses['PyDict_Type'],ops.Address(pyinternals.type_offset,ops.eax))
+        (JumpSource(f.op.je,else_))
+            .call('PyObject_GetItem')
+            .discard_stack_items(2)
+            .test(ops.eax,ops.eax)
+            (JumpSource(f.op.jnz,found))
             
-        ] + f.invoke('PyErr_ExceptionMatches',pyinternals.raw_addresses['PyExc_KeyError']) +
-            f.if_eax_is_zero(
+            .invoke('PyErr_ExceptionMatches',pyinternals.raw_addresses['PyExc_KeyError'])
+            .if_eax_is_zero(
                 f.op.ret(STACK_ITEM_SIZE)
-            ) +
-            f.call('PyErr_Clear') + [
+            )
+            .call('PyErr_Clear')
 
-            f.goto(endif),
-        else_
-    ] +     f.call('PyDict_GetItem') + [
-            f.discard_stack_items(2),
-            f.op.test(ops.eax,ops.eax),
-            JumpSource(f.op.jnz,found),
-        endif
+            .goto(endif)
+        (else_)
+            .call('PyDict_GetItem')
+            .discard_stack_items(2)
+            .test(ops.eax,ops.eax)
+            (JumpSource(f.op.jnz,found))
+        (endif)
     
-    ] + f.invoke('PyDict_GetItem',GLOBALS,ops.Address(STACK_ITEM_SIZE,ops.esp)) + 
-        f.if_eax_is_zero(
-            f.invoke('PyDict_GetItem',BUILTINS,ops.Address(STACK_ITEM_SIZE,ops.esp)) + 
-            f.if_eax_is_zero(
-                f.invoke('format_exc_check_arg',
+        .invoke('PyDict_GetItem',GLOBALS,ops.Address(STACK_ITEM_SIZE,ops.esp))
+        .if_eax_is_zero(f()
+            .invoke('PyDict_GetItem',BUILTINS,ops.Address(STACK_ITEM_SIZE,ops.esp))
+            .if_eax_is_zero(f()
+                .invoke('format_exc_check_arg',
                      pyinternals.raw_addresses['NAME_ERROR_MSG'],
                      pyinternals.raw_addresses['PyExc_NameError'])
             )
-        ) + [
+        )
         
-        found,
-        f.op.ret(STACK_ITEM_SIZE),
-    ])
-
-
-def function_get(f,func):
-    err = f.op.ret()
-    if f.stack.offset: err = f.op.add(f.stack.offset,ops.esp) + err
-    
-    return (f()
-        .call(func)
-        .if_eax_is_zero(err)
-        .counted_push(ops.eax)
+        (found)
+        .ret(STACK_ITEM_SIZE)
     )
 
 
-def compile_raw(code,binary = True):
-    f = Frame(code,(ops if binary else ops.Assembly()))
-    
+
+def _compile_eval(f):
+    """Generate a function equivalent to PyEval_EvalFrame, called with f.code"""
     opcodes = (f()
+        .push(0)
+        .push(ops.esp)
+        .call('_EnterRecursiveCall')
+        .discard_stack_items(2)
+        .if_eax_is_not_zero(
+            f.op.ret()
+        )
         .counted_push(ops.ebp)
         .counted_push(ops.ebx)
-        .mov(ops.esp,ops.ebp) +
-        function_get(f,'PyEval_GetGlobals') +
-        function_get(f,'PyEval_GetBuiltins') +
-        function_get(f,'PyEval_GetLocals')
+        .mov(ops.esp,ops.ebp)
+        .mov(ops.Address(STACK_ITEM_SIZE*3,ops.esp),ops.eax)
+        .counted_push(ops.Address(pyinternals.frame_globals_offset,ops.eax))
+        .counted_push(ops.Address(pyinternals.frame_builtins_offset,ops.eax))
+        .counted_push(ops.Address(pyinternals.frame_locals_offset,ops.eax))
+
+        # as far as I can tell, after expanding the macros and removing the
+        # "dynamic annotations" (see dynamic_annotations.h in the CPython
+        # headers), this is all that PyThreadState_GET boils down to:
+        .mov(ops.Address(pyinternals.raw_addresses['_PyThreadState_Current']),ops.ecx)
+
+        .mov(ops.eax,ops.Address(pyinternals.threadstate_frame_offset,ops.ecx))
     )
     
     stack_prolog = f.stack.offset
@@ -869,12 +924,12 @@ def compile_raw(code,binary = True):
     i = 0
     extended_arg = 0
     f.byte_offset = 0
-    while i < len(code.co_code):
-        bop = code.co_code[i]
+    while i < len(f.code.co_code):
+        bop = f.code.co_code[i]
         i += 1
         
         if bop >= dis.HAVE_ARGUMENT:
-            boparg = code.co_code[i] + (code.co_code[i+1] << 8) + extended_arg
+            boparg = f.code.co_code[i] + (f.code.co_code[i+1] << 8) + extended_arg
             i += 2
             
             if bop == dis.EXTENDED_ARG:
@@ -884,11 +939,9 @@ def compile_raw(code,binary = True):
                 
                 opcodes += get_handler(bop)(f,boparg)
                 f.byte_offset = i
-                #print('{}, {}'.format(dis.opname[bop],f.stack.offset))
         else:
             opcodes += get_handler(bop)(f)
             f.byte_offset = i
-            #print('{}, {}'.format(dis.opname[bop],f.stack.offset))
     
     
     assert f.stack.offset == stack_prolog, 'stack.offset should be {0}, but is {1}'.format(stack_prolog,f.stack.offset)
@@ -910,11 +963,23 @@ def compile_raw(code,binary = True):
         .add(stack_prolog - STACK_ITEM_SIZE*2,ops.esp)
         .pop(ops.ebx)
         .pop(ops.ebp)
+        .push(ops.eax)
+        .call('_LeaveRecursiveCall')
+        .pop(ops.eax)
         .ret()
     )
+
+    return opcodes
+
+
+def compile_raw(code,binary = True,tuning=Tuning()):
+    f = Frame(code,(ops if binary else ops.Assembly()),tuning)
+    
+    opcodes = _compile_eval(f)
     
     if f._local_name:
-        opcodes += [f._local_name] + local_name_func(f)
+        opcodes(f._local_name)
+        opcodes += local_name_func(f)
     
     return resolve_jumps(opcodes.code)
 
