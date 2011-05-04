@@ -20,18 +20,20 @@ def immediate_data(w,data):
 
 
 class Register:
-    def __init__(self,w,reg,name):
+    def __init__(self,w,reg):
         self.w = w
         self.reg = reg
-        self.name = name
     
     def __str__(self):
-        return '%' + self.name
+        return '%' + [
+            ['al','cl','dl','bl','ah','ch','dh','bh'],
+            ['eax','ecx','edx','ebx','esp','ebp','esi','edi']
+        ][self.w][self.reg]
 
 
 class Address:
     def __init__(self,offset=0,base=None,index=None,scale=1):
-        assert scale == 1 or scale == 2 or scale == 4 or scale == 8
+        assert scale in (1,2,4,8)
         assert (base is None or base.w) and (index is None or index.w)
         
         # %esp cannot be used as the index
@@ -207,22 +209,22 @@ class Assembly:
 
 
 
-al = Register(0,0b000,'al')
-cl = Register(0,0b001,'cl')
-dl = Register(0,0b010,'dl')
-bl = Register(0,0b011,'bl')
-ah = Register(0,0b100,'ah')
-ch = Register(0,0b101,'ch')
-dh = Register(0,0b110,'dh')
-bh = Register(0,0b111,'bh')
-eax = Register(1,0b000,'eax')
-ecx = Register(1,0b001,'ecx')
-edx = Register(1,0b010,'edx')
-ebx = Register(1,0b011,'ebx')
-esp = Register(1,0b100,'esp')
-ebp = Register(1,0b101,'ebp')
-esi = Register(1,0b110,'esi')
-edi = Register(1,0b111,'edi')
+al = Register(0,0b000)
+cl = Register(0,0b001)
+dl = Register(0,0b010)
+bl = Register(0,0b011)
+ah = Register(0,0b100)
+ch = Register(0,0b101)
+dh = Register(0,0b110)
+bh = Register(0,0b111)
+eax = Register(1,0b000)
+ecx = Register(1,0b001)
+edx = Register(1,0b010)
+ebx = Register(1,0b011)
+esp = Register(1,0b100)
+ebp = Register(1,0b101)
+esi = Register(1,0b110)
+edi = Register(1,0b111)
 
 
 
@@ -311,6 +313,8 @@ def addl(a : int,b : Address):
 @multimethod
 def call(proc : Displacement):
     return bytes([0b11101000]) + int_to_32(proc.val)
+
+CALL_DISP_LEN = 5
 
 @multimethod
 def call(proc : Register):
@@ -444,6 +448,13 @@ def jmp(x : Register):
 @multimethod
 def jmp(x : Address):
     return bytes([0b11111111]) + x.mod_rm_sib_disp(0b100)
+
+
+
+@multimethod
+def lea(a : Address,b : Register):
+    assert b.w
+    return bytes([0b10001101]) + a.mod_rm_sib_disp(b.reg)
 
 
 

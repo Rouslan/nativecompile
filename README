@@ -46,6 +46,10 @@ POP_JUMP_IF_TRUE
 BUILD_LIST
 BUILD_TUPLE
 STORE_SUBSCR
+MAKE_FUNCTION
+MAKE_CLOSURE
+LOAD_FAST
+STORE_FAST
 
 BINARY_ADD and INPLACE_ADD are also implemented but currently lack an
 optimization on strings that CPython normally does.
@@ -65,3 +69,14 @@ equivalent machine code with no optimizations (almost; some push and pop
 instructions can be eliminated by using registers instead). However, this does
 remove the overhead of the interpreter loop and thus should result in a modest
 performance boost.
+
+
+Implementation note:
+
+Since function objects cannot be subclassed, the compiled function code is
+instead tacked-on as an attribute with the name __compiled_entry_point__. If the
+attribute is missing or is the wrong type, the uncompiled bytecode is run
+instead. Since the function is not modified in any other way, calling it outside
+of compiled code will always run the bytecode. Additionally, functions defined
+outside of compiled code do not get compiled, even if called inside compiled
+code.

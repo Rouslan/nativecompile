@@ -24,11 +24,13 @@ def compile(code):
     
     atexit.register(delete_f)
     
+    parts,entry_points = compile_raw(code)
+    for p in parts:
+        f.write(p)
 
-    f.write(compile_raw(code))
     f.close()
     
-    return pyinternals.CompiledCode(f.name,code)
+    return pyinternals.CompiledCode(f.name,code,entry_points)
 
 
 

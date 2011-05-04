@@ -51,6 +51,7 @@
     " in enclosing scope"
 
 
+static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kwds);
 static PyObject *load_args(PyObject ***pp_stack, int na);
 static void err_args(PyObject *func, int flags, int nargs);
 static PyObject *fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk);
@@ -76,8 +77,12 @@ typedef struct {
     PyObject_HEAD
 
     PyObject *code;
-    
     PyObject *(*entry)(PyFrameObject *);
+
+    /* a tuple of CompiledEntryPoint objects, held here to prevent from being
+       garbage-collected */
+    PyObject *sub_entry_points;
+
 #ifdef USE_MMAP
     int fd;
     size_t len;
@@ -85,7 +90,9 @@ typedef struct {
 } CompiledCode;
 
 
+
 static void CompiledCode_dealloc(CompiledCode *self) {
+    Py_XDECREF(self->sub_entry_points);
     if(self->entry) {
 #ifdef USE_MMAP
         munmap(self->entry,self->len);
@@ -95,95 +102,6 @@ static void CompiledCode_dealloc(CompiledCode *self) {
 #endif
     }
     Py_DECREF(self->code);
-}
-
-
-static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kwds) {
-    CompiledCode *self;
-    PyObject *filename_o;
-    const char *filename_s;
-    PyObject *code;
-#ifdef USE_MMAP
-    off_t slen;
-    void *mem;
-#else
-    FILE *f;
-    long len;
-    size_t read;
-#endif
-
-    static char *kwlist[] = {"filename","code",NULL};
-
-    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O&O!",kwlist,
-        PyUnicode_FSConverter,
-        &filename_o,
-        &PyCode_Type,
-        &code)) return NULL;
-
-    filename_s = PyBytes_AS_STRING(filename_o);
-    
-    self = (CompiledCode*)type->tp_alloc(type,0);
-    if(self) {
-        self->entry = NULL;
-        self->code = code;
-        Py_INCREF(code);
-        
-#ifdef USE_MMAP
-        /* use mmap to create an executable region of memory (merely using
-           mprotect is not enough because some security-conscious systems don't
-           allow marking allocated memory executable unless it was already
-           executable) */
-
-        if((self->fd = open(filename_s,O_RDONLY)) == -1) goto io_error;
-        
-        /* get the file length */
-        if((slen = lseek(self->fd,0,SEEK_END)) == -1 || lseek(self->fd,0,SEEK_SET) == -1) {
-            close(self->fd);
-            goto io_error;
-        }
-        self->len = (size_t)slen;
-        
-        if((mem = mmap(0,self->len,PROT_READ|PROT_EXEC,MAP_PRIVATE,self->fd,0)) == MAP_FAILED) {
-            close(self->fd);
-            PyErr_SetFromErrno(PyExc_OSError);
-            goto error;
-        }
-        self->entry = (PyObject *(*)(PyFrameObject *))mem;
-
-#else
-        /* just load the file contents into memory */
-
-        if((f = fopen(filename_s,"rb")) == NULL) goto io_error;
-        
-        /* get the file length */
-        if(fseek(f,0,SEEK_END) || (len = ftell(f)) == -1 || fseek(f,0,SEEK_SET)) {
-            fclose(f);
-            goto io_error;
-        }
-        
-        if((self->entry = (PyObject *(*)(void))PyMem_Malloc(len)) == NULL) {
-            fclose(f);
-            goto error;
-        }
-        
-        read = fread(self->entry,1,len,f);
-        fclose(f);
-        if(read < len) goto io_error;
-
-#endif
-        goto end; /* skip over the error handling code */
-        
-    io_error:
-        PyErr_SetFromErrnoWithFilename(PyExc_IOError,filename_s);
-    error:
-        Py_DECREF(self);
-        self = NULL;
-    }
-end:
-    
-    Py_DECREF(filename_o);
-    
-    return (PyObject*)self;
 }
 
 static PyObject *CompiledCode_call(CompiledCode *self,PyObject *args,PyObject *kw) {
@@ -250,40 +168,43 @@ static PyTypeObject CompiledCodeType = {
 typedef struct {
     PyObject_HEAD
 
-    PyObject *compiled_code;
+    /* compiled_code is not set until this object is added to a CompiledCode
+       object. Once added, it cannot be removed, so its reference count is never
+       incremented to avoid an unnecessary cyclic reference. */
+    CompiledCode *compiled_code;
+
     PyObject *code_object;
-    unsigned int entry_offset;
+    unsigned int offset;
 } CompiledEntryPoint;
 
-
 static void CompiledEntryPoint_dealloc(CompiledEntryPoint *self) {
-    Py_DECREF(self->compiled_code);
     Py_DECREF(self->code_object);
 }
 
 static PyObject *CompiledEntryPoint_new(PyTypeObject *type,PyObject *args,PyObject *kwds) {
-    PyObject *compiled_code;
     PyObject *code_object;
-    unsigned int entry_offset;
-    static char *kwlist[] = {"compiled_code","entry_offset","code",0};
+    static char *kwlist[] = {"code",0};
 
-    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O!O!k",kwlist,
-        &CompiledCodeType,&compiled_code,
-        &PyCode_Type,&code_object,
-        &entry_offset)) return NULL;
+    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O!",kwlist,
+        &PyCode_Type,&code_object)) return NULL;
 	
     CompiledEntryPoint *self = (CompiledEntryPoint*)type->tp_alloc(type,0);
 
     if(self) {
-	self->compiled_code = compiled_code;
-	Py_INCREF(compiled_code);
+	self->compiled_code = NULL;
         self->code_object = code_object;
         Py_INCREF(code_object);
-	self->entry_offset = entry_offset;
+	self->offset = 0;
     }
 
     return (PyObject*)self;
 }
+
+static PyMemberDef CompiledEntryPoint_members[] = {
+    {"offset",T_UINT,offsetof(CompiledEntryPoint,offset),0,NULL},
+    {"code_object",T_OBJECT,offsetof(CompiledEntryPoint,code_object),READONLY,NULL},
+    {NULL}
+};
 
 static PyTypeObject CompiledEntryPointType = {
     PyVarObject_HEAD_INIT(NULL, 0)
@@ -314,7 +235,7 @@ static PyTypeObject CompiledEntryPointType = {
     0,	                       /* tp_iter */
     0,	                       /* tp_iternext */
     0,                         /* tp_methods */
-    0,                         /* tp_members */
+    CompiledEntryPoint_members, /* tp_members */
     0,                         /* tp_getset */
     0,                         /* tp_base */
     0,                         /* tp_dict */
@@ -326,6 +247,114 @@ static PyTypeObject CompiledEntryPointType = {
     CompiledEntryPoint_new,    /* tp_new */
 };
 
+
+static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kwds) {
+    CompiledCode *self;
+    PyObject *filename_o;
+    const char *filename_s;
+    PyObject *code;
+    PyObject *entry_points = Py_None;
+    int i;
+    PyObject *item;
+
+#ifdef USE_MMAP
+    off_t slen;
+    void *mem;
+#else
+    FILE *f;
+    long len;
+    size_t read;
+#endif
+
+    static char *kwlist[] = {"filename","code","entry_points",NULL};
+
+    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O&O!O",kwlist,
+        PyUnicode_FSConverter,
+        &filename_o,
+        &PyCode_Type,
+        &code,
+        &entry_points)) return NULL;
+
+    filename_s = PyBytes_AS_STRING(filename_o);
+    
+    self = (CompiledCode*)type->tp_alloc(type,0);
+    if(self) {
+        self->entry = NULL;
+        self->code = code;
+        Py_INCREF(code);
+
+        self->sub_entry_points = PyObject_CallFunctionObjArgs((PyObject*)&PyTuple_Type,entry_points,NULL);
+        if(!self->sub_entry_points) goto error;
+
+        i = PyTuple_Size(self->sub_entry_points);
+        if(PyErr_Occurred()) goto error;
+
+        while(--i >= 0) {
+            item = PyTuple_GET_ITEM(self->sub_entry_points,i);
+            if(!PyObject_IsInstance(item,(PyObject*)&CompiledEntryPointType)) goto error;
+
+            /* the reference count is deliberately not increased (see
+               CompiledEntryPoint) */
+            ((CompiledEntryPoint*)item)->compiled_code = self;
+        }
+        
+#ifdef USE_MMAP
+        /* use mmap to create an executable region of memory (merely using
+           mprotect is not enough because some security-conscious systems don't
+           allow marking allocated memory executable unless it was already
+           executable) */
+
+        if((self->fd = open(filename_s,O_RDONLY)) == -1) goto io_error;
+        
+        /* get the file length */
+        if((slen = lseek(self->fd,0,SEEK_END)) == -1 || lseek(self->fd,0,SEEK_SET) == -1) {
+            close(self->fd);
+            goto io_error;
+        }
+        self->len = (size_t)slen;
+        
+        if((mem = mmap(0,self->len,PROT_READ|PROT_EXEC,MAP_PRIVATE,self->fd,0)) == MAP_FAILED) {
+            close(self->fd);
+            PyErr_SetFromErrno(PyExc_OSError);
+            goto error;
+        }
+        self->entry = (PyObject *(*)(PyFrameObject *))mem;
+
+#else
+        /* just load the file contents into memory */
+
+        if((f = fopen(filename_s,"rb")) == NULL) goto io_error;
+        
+        /* get the file length */
+        if(fseek(f,0,SEEK_END) || (len = ftell(f)) == -1 || fseek(f,0,SEEK_SET)) {
+            fclose(f);
+            goto io_error;
+        }
+        
+        if((self->entry = (PyObject *(*)(void))PyMem_Malloc(len)) == NULL) {
+            fclose(f);
+            goto error;
+        }
+        
+        read = fread(self->entry,1,len,f);
+        fclose(f);
+        if(read < len) goto io_error;
+
+#endif
+        goto end; /* skip over the error handling code */
+        
+    io_error:
+        PyErr_SetFromErrnoWithFilename(PyExc_IOError,filename_s);
+    error:
+        Py_DECREF(self);
+        self = NULL;
+    }
+end:
+    
+    Py_DECREF(filename_o);
+    
+    return (PyObject*)self;
+}
 
 
 
@@ -406,6 +435,19 @@ fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
     PyObject *centry;
     int nd = 0;
 
+    centry = PyObject_GetAttr(func,mcode_index);
+    if(centry) {
+        int isin = PyObject_IsInstance(centry,(PyObject*)&CompiledEntryPointType);
+        if(isin<0) return NULL;
+        if(!isin) {
+            Py_DECREF(centry);
+            centry = NULL;
+        }
+    } else {
+        if(!PyErr_ExceptionMatches(PyExc_AttributeError)) return NULL;
+        PyErr_Clear();
+    }
+
     if (argdefs == NULL && co->co_argcount == n &&
         co->co_kwonlyargcount == 0 && nk==0 &&
         co->co_flags == (CO_OPTIMIZED | CO_NEWLOCALS | CO_NOFREE)) {
@@ -428,7 +470,12 @@ fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
             Py_INCREF(*stack);
             fastlocals[i] = *stack--;
         }
-        retval = PyEval_EvalFrameEx(f,0);
+        if(centry) {
+            retval = (((CompiledEntryPoint*)centry)->compiled_code->entry +
+                ((CompiledEntryPoint*)centry)->offset)(f);
+            Py_DECREF(centry);
+        }
+        else retval = PyEval_EvalFrameEx(f,0);
         ++tstate->recursion_depth;
         Py_DECREF(f);
         --tstate->recursion_depth;
@@ -439,22 +486,14 @@ fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
         nd = Py_SIZE(argdefs);
     }
 
-    centry = PyObject_GetAttr(func,mcode_index);
+
     if(centry) {
-        int isin = PyObject_IsInstance(centry,(PyObject*)&CompiledEntryPointType);
-        if(isin<0) return NULL;
-        if(isin) {
-            PyObject *r = _cc_EvalCodeEx(centry, globals,
-                             (PyObject *)NULL, (*pp_stack)+n-1, na,
-                             (*pp_stack)+2*nk-1, nk, d, nd, kwdefs,
-                             PyFunction_GET_CLOSURE(func));
-            Py_DECREF(centry);
-            return r;
-        }
+        PyObject *r = _cc_EvalCodeEx(centry, globals,
+                                     (PyObject *)NULL, (*pp_stack)+n-1, na,
+                                     (*pp_stack)+2*nk-1, nk, d, nd, kwdefs,
+                                     PyFunction_GET_CLOSURE(func));
         Py_DECREF(centry);
-    } else {
-        if(!PyErr_ExceptionMatches(PyExc_AttributeError)) return NULL;
-        PyErr_Clear();
+        return r;
     }
 
     return PyEval_EvalCodeEx((PyObject*)co, globals,
@@ -806,7 +845,7 @@ _cc_EvalCodeEx(PyObject *_entrypoint, PyObject *globals, PyObject *locals,
         return PyGen_New(f);
     }
 
-    retval = (((CompiledCode*)(entrypoint->compiled_code))->entry + entrypoint->entry_offset)(f);
+    retval = (entrypoint->compiled_code->entry + entrypoint->offset)(f);
 
 fail:
 
@@ -815,6 +854,137 @@ fail:
     Py_DECREF(f);
     --tstate->recursion_depth;
     return retval;
+}
+
+
+
+#define POP() va_arg(items,PyObject*)
+
+static PyObject *_make_function(int makeclosure,unsigned int arg,...) {
+    va_list items;
+    PyObject *val;
+    PyObject *key;
+    PyObject *func;
+    int r;
+    int posdefaults = arg & 0xff;
+    int kwdefaults = (arg>>8) & 0xff;
+    int num_annotations = (arg >> 16) & 0x7fff;
+
+    va_start(items,arg);
+
+    val = POP();
+    func = PyFunction_New(((CompiledEntryPoint*)val)->code_object, PyEval_GetGlobals());
+
+    if(!func) {
+        Py_DECREF(val);
+        goto fail_closure;
+    }
+
+    r = PyObject_SetAttr(func,mcode_index,val);
+    Py_DECREF(val);
+
+    /* although the program will still run if the above SetAttr call fails, such
+       a simple operation will probably only fail when there is a major
+       problem */
+    if(r) goto fail_closure;
+
+    if(makeclosure) {
+        val = POP();
+        r = PyFunction_SetClosure(func, val);
+        Py_DECREF(val);
+        if(r) goto fail_before_annot;
+    }
+
+    if(num_annotations > 0) {
+        PyObject *names = POP();
+        PyObject *annot = PyDict_New();
+        if(!annot) {
+            Py_DECREF(names);
+            goto fail_in_annot;
+        }
+
+        while(--num_annotations >= 0) {
+            val = POP();
+            r = PyDict_SetItem(annot, PyTuple_GET_ITEM(names, num_annotations), val);
+            Py_DECREF(val);
+
+            if(r) {
+                Py_DECREF(annot);
+                Py_DECREF(names);
+                goto fail_in_annot;
+            }
+        }
+
+        r = PyFunction_SetAnnotations(func, annot);
+        Py_DECREF(annot);
+        Py_DECREF(names);
+        if(r) goto fail_posdef;
+    }
+
+    if(posdefaults > 0) {
+        PyObject *defs = PyTuple_New(posdefaults);
+        if(!defs) goto fail_posdef;
+        while(--posdefaults >= 0) {
+            val = POP();
+            PyTuple_SET_ITEM(defs, posdefaults, val);
+        }
+        r = PyFunction_SetDefaults(func, defs);
+        Py_DECREF(defs);
+        if(r) goto fail_kwdef;
+    }
+    if(kwdefaults > 0) {
+        PyObject *defs = PyDict_New();
+        if(!defs) goto fail_kwdef;
+        while(--kwdefaults >= 0) {
+            val = POP();
+            key = POP();
+            r = PyDict_SetItem(defs, key, val);
+            Py_DECREF(val);
+            Py_DECREF(key);
+
+            if(r) {
+                Py_DECREF(defs);
+                goto fail_kwdef;
+            }
+        }
+        r = PyFunction_SetKwDefaults(func, defs);
+        Py_DECREF(defs);
+        if(r) goto fail_end;
+    }
+
+    return func;
+
+fail_closure:
+    if(makeclosure) {
+        val = POP();
+        Py_DECREF(val);
+    }
+fail_before_annot:
+    if(num_annotations) {
+        val = POP();
+        Py_DECREF(val);
+    fail_in_annot:
+        while(--num_annotations >= 0) {
+            val = POP();
+            Py_DECREF(val);
+        }
+    }
+fail_posdef:
+    while(--posdefaults >= 0) {
+        val = POP();
+        Py_DECREF(val);
+    }
+fail_kwdef:
+    while(--kwdefaults >= 0) {
+        val = POP();
+        Py_DECREF(val);
+        val = POP();
+        Py_DECREF(val);
+    }
+fail_end:
+    Py_XDECREF(func);
+    va_end(items);
+    return NULL;
 }
 
 
@@ -873,6 +1043,7 @@ PyInit_pyinternals(void) {
     if(PyModule_AddIntConstant(m,"frame_builtins_offset",offsetof(PyFrameObject,f_builtins)) == -1) return NULL;
     if(PyModule_AddIntConstant(m,"frame_globals_offset",offsetof(PyFrameObject,f_globals)) == -1) return NULL;
     if(PyModule_AddIntConstant(m,"frame_locals_offset",offsetof(PyFrameObject,f_locals)) == -1) return NULL;
+    if(PyModule_AddIntConstant(m,"frame_localsplus_offset",offsetof(PyFrameObject,f_localsplus)) == -1) return NULL;
     if(PyModule_AddIntConstant(m,"threadstate_frame_offset",offsetof(PyThreadState,frame)) == -1) return NULL;
     if(PyModule_AddStringConstant(m,"architecture",ARCHITECTURE) == -1) return NULL;
     if(PyModule_AddObject(m,"ref_debug",PyBool_FromLong(REF_DEBUG_VAL)) == -1) return NULL;
@@ -931,11 +1102,13 @@ PyInit_pyinternals(void) {
     ADD_ADDR(call_function)
     ADD_ADDR(format_exc_check_arg)
     ADD_ADDR(_cc_EvalCodeEx)
+    ADD_ADDR(_make_function)
     
     ADD_ADDR_NAME(&PyDict_Type,"PyDict_Type")
     ADD_ADDR(PyExc_KeyError)
     ADD_ADDR(PyExc_NameError)
     ADD_ADDR(PyExc_StopIteration)
+    ADD_ADDR(PyExc_UnboundLocalError)
     ADD_ADDR_NAME(&_PyThreadState_Current,"_PyThreadState_Current")
     ADD_ADDR(NAME_ERROR_MSG)
     ADD_ADDR(GLOBAL_NAME_ERROR_MSG)

@@ -2,6 +2,7 @@
 import dis
 import weakref
 import operator
+import types
 from functools import partial, reduce
 
 from . import x86_ops as ops
@@ -10,6 +11,7 @@ from . import pyinternals
 
 STACK_ITEM_SIZE = 4
 BUILD_SEQ_LOOP_THRESHHOLD = 5
+CALL_ALIGN_MASK = 0xf
 
 
 
@@ -51,46 +53,65 @@ class StackManager:
         return r
 
 
-# displacement is deliberately not set so it cannot be used until it is first
-# encountered in the resolve_jumps loop
+
 class JumpTarget:
-    def displace(self,amount):
-        self.displacement += amount
-    
-    def resolve(self):
-        return ops.Displacement(self.displacement)
+    used = False
+    displacement = None
 
 
 class JumpSource:
     def __init__(self,op,target):
         self.op = op
         self.target = target
+        target.used = True
     
+    def compile(self,displacement):
+        dis = displacement - self.target.displacement
+        return self.op(ops.Displacement(dis)) if dis else b'' #optimize away useless jumps
+
+
+class DelayedCompile:
+    pass
+
+
+class InnerCall(DelayedCompile):
+    """A function call with a relative target
+
+    This is just like JumpSource, except the target is a different function and
+    the exact offset depends on how much padding is needed between this source's
+    function and the target function, which cannot be determined until the
+    length of the entire source function is determined.
+
+    """
+    def __init__(self,opset,target):
+        self.opset = opset
+        self.target = target
+        target.used = True
+        self.displacement = None
+
     def compile(self):
-        dis = self.target.resolve()
-        return self.op(dis) if dis.val else b'' #optimize away useless jumps
+        return self.opset.call(ops.Displacement(self.displacement - self.target.displacement))
+
+    def __len__(self):
+        return ops.CALL_DISP_LEN
 
 
-class JumpRSource:
+class JumpRSource(DelayedCompile):
     def __init__(self,op,size,target):
         self.op = op
         self.size = size
-        target.sources.append(self)
-
-    def displace(self,amount):
-        self.displacement += amount
+        self.target = target
+        target.used = True
+        self.displacement = None
 
     def compile(self):
-        c = self.op(ops.Displacement(-self.displacement,True))
+        c = self.op(ops.Displacement(self.displacement - self.target.displacement,True))
         assert len(c) == self.size
         return c
 
     def __len__(self):
         return self.size
 
-class JumpRTarget:
-    def __init__(self):
-        self.sources = []
 
 
 #def disassemble(co):
@@ -173,22 +194,24 @@ def get_handler(op):
     return h
 
 
-GLOBALS = ops.Address(-4,ops.ebp)
-BUILTINS = ops.Address(-8,ops.ebp)
-LOCALS = ops.Address(-12,ops.ebp)
+GLOBALS = ops.Address(-STACK_ITEM_SIZE,ops.ebp)
+BUILTINS = ops.Address(STACK_ITEM_SIZE * -2,ops.ebp)
+LOCALS = ops.Address(STACK_ITEM_SIZE * -3,ops.ebp)
+FAST_LOCALS = ops.Address(STACK_ITEM_SIZE * -4,ops.ebp)
 
 
 class Frame:
-    def __init__(self,code,op,tuning):
+    def __init__(self,code,op,tuning,local_name,entry_points):
         self.code = code
         self.op = op
         self.tuning = tuning
         self.stack = StackManager(op)
         self.end = JumpTarget()
-        self._local_name = None
+        self.local_name = local_name
         self.blockends = []
         self.byte_offset = None
         self.forward_targets = []
+        self.entry_points = entry_points
 
         # Although JUMP_ABSOLUTE could jump to any instruction, we assume
         # compiled Python code only uses it in certain cases. Thus, we can make
@@ -200,11 +223,6 @@ class Frame:
         return [
             self.op.test(ops.eax,ops.eax),
             JumpSource(self.op.jnz if inverted else self.op.jz,self.end)]
-    
-    def local_name(self):
-        if self._local_name is None:
-            self._local_name = JumpTarget()
-        return self._local_name
     
     def call(self,func):
         return [
@@ -300,7 +318,7 @@ class Frame:
         ]
 
     def rtarget(self):
-        t = JumpRTarget()
+        t = JumpTarget()
         self.rtargets[self.byte_offset] = t
         return t
 
@@ -564,7 +582,7 @@ def _op_LOAD_NAME(f,name):
     return (f()
         .push_tos(True)
         .push(address_of(name))
-        (JumpSource(f.op.call,f.local_name()))
+        (InnerCall(f.op,f.local_name))
         .test(ops.eax,ops.eax)
         (JumpSource(f.op.jz,f.end))
         .incref()
@@ -622,6 +640,9 @@ def _op_STORE_GLOBAL(f,name):
 
 @hasconst
 def _op_LOAD_CONST(f,const):
+    if isinstance(const,types.CodeType):
+        const = f.entry_points[id(const)][0]
+
     return (f()
         .push_tos(True)
         .mov(address_of(const),ops.eax)
@@ -805,41 +826,101 @@ def _op_STORE_SUBSCR(f):
         .decref()
     )
 
+def _op_make_callable(f,arg,closure):
+    annotations = (arg >> 16) & 0x7fff
+
+    # +3 for the code object, arg and closure
+    sitems = (arg & 0xff) + ((arg >> 8) & 0xff) * 2 + annotations + 3
+
+    if closure: sitems += 1
+    if annotations: sitems += 1
+
+    return (f()
+        .push_tos(True)
+        .counted_push(arg)
+        .counted_push(int(bool(closure)))
+        .call('_make_function')
+        .counted_discard_stack_items(sitems)
+        .check_err()
+    )
+
+@handler
+def _op_MAKE_FUNCTION(f,arg):
+    return _op_make_callable(f,arg,False)
+
+@handler
+def _op_MAKE_CLOSURE(f,arg):
+    return _op_make_callable(f,arg,True)
+
+@handler
+def _op_LOAD_FAST(f,arg):
+    return (f()
+        .push_tos(True)
+        .mov(FAST_LOCALS,ops.ecx)
+        .mov(ops.Address(STACK_ITEM_SIZE*arg,ops.ecx),ops.eax)
+        .if_eax_is_zero(f()
+            .invoke('format_exc_check_arg',
+                pyinternals.raw_addresses['PyExc_UnboundLocalError'],
+                pyinternals.raw_addresses['UNBOUNDLOCAL_ERROR_MSG'],
+                address_of(f.code.co_varnames[arg]))
+            .goto(f.end)
+        )
+        .incref()
+    )
+
+@handler
+def _op_STORE_FAST(f,arg):
+    r = f()
+    if not f.stack.use_tos():
+        r.counted_pop(ops.eax)
+
+    item = ops.Address(STACK_ITEM_SIZE*arg,ops.ecx)
+    decref = join(f.decref(ops.edx))
+    return (r
+        .mov(FAST_LOCALS,ops.ecx)
+        .mov(item,ops.edx)
+        .mov(ops.eax,item)
+        .test(ops.edx,ops.edx)
+        .jz(ops.Displacement(len(decref)))
+        (decref)
+    )
 
 
 
 def join(x):
     return b''.join(x) if isinstance(x[0],bytes) else reduce(operator.add,x)
 
-def resolve_jumps(chunks):
-    targets = weakref.WeakSet()
-    rsources = set()
+def resolve_jumps(op,chunks,end_targets=()):
+    displacement = 0
     
     for i in range(len(chunks)-1,-1,-1):
         if isinstance(chunks[i],JumpTarget):
-            chunks[i].displacement = 0
-            targets.add(chunks[i])
-            del chunks[i]
-        elif isinstance(chunks[i],JumpRTarget):
-            rsources.difference_update(chunks[i].sources)
+            chunks[i].displacement = displacement
             del chunks[i]
         else:
             if isinstance(chunks[i],JumpSource):
-                chunks[i] = chunks[i].compile()
+                chunks[i] = chunks[i].compile(displacement)
                 if not chunks[i]:
                     del chunks[i]
                     continue
-            elif isinstance(chunks[i],JumpRSource):
-                chunks[i].displacement = 0
-                rsources.add(chunks[i])
+            elif isinstance(chunks[i],DelayedCompile):
+                chunks[i].displacement = displacement
             
-            l = len(chunks[i])
-            for t in targets:
-                t.displace(l)
-            for s in rsources:
-                s.displace(l)
+            displacement += len(chunks[i])
+
+    # add padding so that the total length is a multiple of CALL_ALIGN_MASK + 1
+    if CALL_ALIGN_MASK:
+        pad_size = ((displacement + CALL_ALIGN_MASK) & ~CALL_ALIGN_MASK) - displacement
+        chunks += [op.nop()] * pad_size
+        for et in end_targets:
+            et.displacement -= pad_size
     
-    return join([(c.compile() if isinstance(c,JumpRSource) else c) for c in chunks])
+    code = join([(c.compile() if isinstance(c,DelayedCompile) else c) for c in chunks])
+
+    for et in end_targets:
+        et.displacement -= displacement
+
+    return code
 
 
 def local_name_func(f):
@@ -893,8 +974,9 @@ def local_name_func(f):
 
 
 
-def _compile_eval(f):
+def compile_eval(f):
     """Generate a function equivalent to PyEval_EvalFrame, called with f.code"""
+
     opcodes = (f()
         .push(0)
         .push(ops.esp)
@@ -907,14 +989,17 @@ def _compile_eval(f):
         .counted_push(ops.ebx)
         .mov(ops.esp,ops.ebp)
         .mov(ops.Address(STACK_ITEM_SIZE*3,ops.esp),ops.eax)
-        .counted_push(ops.Address(pyinternals.frame_globals_offset,ops.eax))
-        .counted_push(ops.Address(pyinternals.frame_builtins_offset,ops.eax))
-        .counted_push(ops.Address(pyinternals.frame_locals_offset,ops.eax))
+        .lea(ops.Address(pyinternals.frame_localsplus_offset,ops.eax),ops.edx)
 
         # as far as I can tell, after expanding the macros and removing the
         # "dynamic annotations" (see dynamic_annotations.h in the CPython
         # headers), this is all that PyThreadState_GET boils down to:
         .mov(ops.Address(pyinternals.raw_addresses['_PyThreadState_Current']),ops.ecx)
+
+        .counted_push(ops.Address(pyinternals.frame_globals_offset,ops.eax))
+        .counted_push(ops.Address(pyinternals.frame_builtins_offset,ops.eax))
+        .counted_push(ops.Address(pyinternals.frame_locals_offset,ops.eax))
+        .counted_push(ops.edx)
 
         .mov(ops.eax,ops.Address(pyinternals.threadstate_frame_offset,ops.ecx))
     )
@@ -972,15 +1057,51 @@ def _compile_eval(f):
     return opcodes
 
 
-def compile_raw(code,binary = True,tuning=Tuning()):
-    f = Frame(code,(ops if binary else ops.Assembly()),tuning)
+def compile_raw(_code,binary = True,tuning=Tuning()):
+    local_name = JumpTarget()
+    entry_points = {}
+    op = ops if binary else ops.Assembly()
+
+    F = partial(Frame,
+        op=op,
+        tuning=tuning,
+        local_name=local_name,
+        entry_points=entry_points)
+
+    def compile_code_constants(code):
+        for c in code.co_consts:
+            if isinstance(c,types.CodeType) and id(c) not in entry_points:
+                compile_code_constants(c)
+                entry_points[id(c)] = (
+                    pyinternals.CompiledEntryPoint(c),
+                    compile_eval(F(c)))
     
-    opcodes = _compile_eval(f)
+    compile_code_constants(_code)
+    main_entry = compile_eval(F(_code))
+
+    functions = []
+    end_targets = []
     
-    if f._local_name:
-        opcodes(f._local_name)
-        opcodes += local_name_func(f)
+    if local_name.used:
+        local_name.displacement = 0
+        end_targets.append(local_name)
+        functions.append(resolve_jumps(op,local_name_func(F(None)).code))
+
+    entry_points = list(entry_points.values())
+    for ep,func in reversed(entry_points):
+        functions.insert(0,resolve_jumps(op,func.code,end_targets))
+
+    main_entry = resolve_jumps(op,main_entry.code,end_targets)
+    offset = len(main_entry)
+    for epf,func in zip(entry_points,functions):
+        epf[0].offset = offset
+        offset += len(func)
+
+    functions.insert(0,main_entry)
+
+    if not binary:
+        functions = join(functions)
     
-    return resolve_jumps(opcodes.code)
+    return functions,[ep for ep,func in entry_points]
 
 
