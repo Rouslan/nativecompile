@@ -359,7 +359,7 @@ end:
 
 
 
-/* The following 8 are modified versions of functions in Python/ceval.c.
+/* The following 9 are modified versions of functions in Python/ceval.c.
  * Profiling and statistics code has been removed because it uses global
  * variables not accessable to this module. */
 
@@ -988,6 +988,77 @@ fail_end:
 }
 
 
+static int
+_unpack_iterable(PyObject *v, int argcnt, int argcntafter, PyObject **sp)
+{
+    int i = 0, j = 0;
+    Py_ssize_t ll = 0;
+    PyObject *it;
+    PyObject *w;
+    PyObject *l = NULL;
+
+    assert(v != NULL);
+
+    it = PyObject_GetIter(v);
+    if (it == NULL)
+        goto Error;
+
+    for (; i < argcnt; i++) {
+        w = PyIter_Next(it);
+        if (w == NULL) {
+            if (!PyErr_Occurred()) {
+                PyErr_Format(PyExc_ValueError,
+                    "need more than %d value%s to unpack",
+                    i, i == 1 ? "" : "s");
+            }
+            goto Error;
+        }
+        *sp++ = w;
+    }
+
+    if (argcntafter == -1) {
+        w = PyIter_Next(it);
+        if (w == NULL) {
+            if (PyErr_Occurred())
+                goto Error;
+            Py_DECREF(it);
+            return 1;
+        }
+        Py_DECREF(w);
+        PyErr_Format(PyExc_ValueError, "too many values to unpack "
+                     "(expected %d)", argcnt);
+        goto Error;
+    }
+
+    l = PySequence_List(it);
+    if (l == NULL)
+        goto Error;
+    *sp++ = l;
+    i++;
+
+    ll = PyList_GET_SIZE(l);
+    if (ll < argcntafter) {
+        PyErr_Format(PyExc_ValueError, "need more than %zd values to unpack",
+                     argcnt + ll);
+        goto Error;
+    }
+
+    for (j = argcntafter; j > 0; j--, i++) {
+        *sp++ = PyList_GET_ITEM(l, ll - j);
+    }
+
+    Py_SIZE(l) = ll - argcntafter;
+    Py_DECREF(it);
+    return 1;
+
+Error:
+    for (sp--; i > 0; i--, sp--)
+        Py_DECREF(*sp);
+    Py_XDECREF(it);
+    return 0;
+}
+
+
 
 /* Py_EnterRecursiveCall and Py_LeaveRecursiveCall are somewhat complicated
  * macros so they are wrapped in the following two functions */
@@ -1021,6 +1092,8 @@ static struct PyModuleDef this_module = {
 
 #define ADD_ADDR(item) ADD_ADDR_NAME(item,#item)
 
+#define ADD_INT_OFFSET(name,type,member) \
+    if(PyModule_AddIntConstant(m,name,offsetof(type,member)) == -1) return NULL
 
 PyMODINIT_FUNC
 PyInit_pyinternals(void) {
@@ -1034,17 +1107,18 @@ PyInit_pyinternals(void) {
     if(PyType_Ready(&CompiledEntryPointType) < 0) return NULL;
 
     m = PyModule_Create(&this_module);
-    if(PyModule_AddIntConstant(m,"refcnt_offset",offsetof(PyObject,ob_refcnt)) == -1) return NULL;
-    if(PyModule_AddIntConstant(m,"type_offset",offsetof(PyObject,ob_type)) == -1) return NULL;
-    if(PyModule_AddIntConstant(m,"type_dealloc_offset",offsetof(PyTypeObject,tp_dealloc)) == -1) return NULL;
-    if(PyModule_AddIntConstant(m,"type_iternext_offset",offsetof(PyTypeObject,tp_iternext)) == -1) return NULL;
-    if(PyModule_AddIntConstant(m,"list_item_offset",offsetof(PyListObject,ob_item)) == -1) return NULL;
-    if(PyModule_AddIntConstant(m,"tuple_item_offset",offsetof(PyTupleObject,ob_item)) == -1) return NULL;
-    if(PyModule_AddIntConstant(m,"frame_builtins_offset",offsetof(PyFrameObject,f_builtins)) == -1) return NULL;
-    if(PyModule_AddIntConstant(m,"frame_globals_offset",offsetof(PyFrameObject,f_globals)) == -1) return NULL;
-    if(PyModule_AddIntConstant(m,"frame_locals_offset",offsetof(PyFrameObject,f_locals)) == -1) return NULL;
-    if(PyModule_AddIntConstant(m,"frame_localsplus_offset",offsetof(PyFrameObject,f_localsplus)) == -1) return NULL;
-    if(PyModule_AddIntConstant(m,"threadstate_frame_offset",offsetof(PyThreadState,frame)) == -1) return NULL;
+    ADD_INT_OFFSET("refcnt_offset",PyObject,ob_refcnt);
+    ADD_INT_OFFSET("type_offset",PyObject,ob_type);
+    ADD_INT_OFFSET("var_size_offset",PyVarObject,ob_size);
+    ADD_INT_OFFSET("type_dealloc_offset",PyTypeObject,tp_dealloc);
+    ADD_INT_OFFSET("type_iternext_offset",PyTypeObject,tp_iternext);
+    ADD_INT_OFFSET("list_item_offset",PyListObject,ob_item);
+    ADD_INT_OFFSET("tuple_item_offset",PyTupleObject,ob_item);
+    ADD_INT_OFFSET("frame_builtins_offset",PyFrameObject,f_builtins);
+    ADD_INT_OFFSET("frame_globals_offset",PyFrameObject,f_globals);
+    ADD_INT_OFFSET("frame_locals_offset",PyFrameObject,f_locals);
+    ADD_INT_OFFSET("frame_localsplus_offset",PyFrameObject,f_localsplus);
+    ADD_INT_OFFSET("threadstate_frame_offset",PyThreadState,frame);
     if(PyModule_AddStringConstant(m,"architecture",ARCHITECTURE) == -1) return NULL;
     if(PyModule_AddObject(m,"ref_debug",PyBool_FromLong(REF_DEBUG_VAL)) == -1) return NULL;
     if(PyModule_AddObject(m,"count_allocs",PyBool_FromLong(COUNT_ALLOCS_VAL)) == -1) return NULL;
@@ -1103,8 +1177,11 @@ PyInit_pyinternals(void) {
     ADD_ADDR(format_exc_check_arg)
     ADD_ADDR(_cc_EvalCodeEx)
     ADD_ADDR(_make_function)
+    ADD_ADDR(_unpack_iterable)
     
     ADD_ADDR_NAME(&PyDict_Type,"PyDict_Type")
+    ADD_ADDR_NAME(&PyList_Type,"PyList_Type")
+    ADD_ADDR_NAME(&PyTuple_Type,"PyTuple_Type")
     ADD_ADDR(PyExc_KeyError)
     ADD_ADDR(PyExc_NameError)
     ADD_ADDR(PyExc_StopIteration)

@@ -50,6 +50,8 @@ MAKE_FUNCTION
 MAKE_CLOSURE
 LOAD_FAST
 STORE_FAST
+UNPACK_SEQUENCE
+UNPACK_EX
 
 BINARY_ADD and INPLACE_ADD are also implemented but currently lack an
 optimization on strings that CPython normally does.

@@ -10,7 +10,6 @@ from . import pyinternals
 
 
 STACK_ITEM_SIZE = 4
-BUILD_SEQ_LOOP_THRESHHOLD = 5
 CALL_ALIGN_MASK = 0xf
 
 
@@ -154,8 +153,46 @@ class JumpRSource(DelayedCompile):
 address_of = id
 
 
+def interleave_ops(regs,steps):
+    """Take the operations from 'steps', give each one a different register than
+    before, and interleave their instructions
+
+    This is to take maximum advantage of the CPU's instruction pipeline. The
+    operations are only interleaved when pyinternals.ref_debug is false.
+    Otherwise the operations are arranged sequentially.  This is to allow the
+    use of the code from Frame.incref, which cannot be interleaved when
+    ref_debug is true.
+
+    """
+    items = []
+    pending = []
+
+    try:
+        if pyinternals.ref_debug:
+            while True:
+                items.extend(steps(regs[0]))
+
+        while True:
+            for reg in regs:
+                s = steps(reg)
+                for i in range(len(s)):
+                    if i == len(pending):
+                        pending.append([])
+                    pending[i].append(s[i])
+            for p in pending:
+                items.extend(p)
+            pending = []
+    except StopIteration:
+        for p in pending:
+            items.extend(p)
+        return items
+        
+
+
 class Tuning:
     prefer_addsub_over_incdec = True
+    build_seq_loop_threshhold = 5
+    unpack_seq_loop_threshhold = 5
 
 
 handlers = [None] * 0xFF
@@ -773,7 +810,7 @@ def _op_BUILD_(f,items,new,item_offset,deref):
     if items:
         f.stack.offset -= STACK_ITEM_SIZE * items
 
-        if items >= BUILD_SEQ_LOOP_THRESHHOLD:
+        if items >= f.tuning.build_seq_loop_threshhold:
             if deref:
                 r.mov(ops.Address(item_offset,ops.eax),ops.ebx)
 
@@ -883,6 +920,112 @@ def _op_STORE_FAST(f,arg):
         .test(ops.edx,ops.edx)
         .jz(ops.Displacement(len(decref)))
         (decref)
+    )
+
+@handler
+def _op_UNPACK_SEQUENCE(f,arg):
+    assert arg > 0
+
+    f.stack.offset += STACK_ITEM_SIZE * arg
+    r = f()
+    if f.stack.use_tos():
+        r.mov(ops.eax,ops.ebx)
+    else:
+        r.counted_pop(ops.ebx)
+
+    check_list = JumpTarget()
+    else_ = JumpTarget()
+    done = JumpTarget()
+
+    (r
+        .mov(ops.Address(pyinternals.type_offset,ops.ebx),ops.edx)
+        .cmp(pyinternals.raw_addresses['PyTuple_Type'],ops.edx)
+        (JumpSource(f.op.jne,check_list))
+            .cmpl(arg,ops.Address(pyinternals.var_size_offset,ops.ebx))
+            (JumpSource(f.op.jne,else_)))
+
+    if arg >= f.tuning.unpack_seq_loop_threshhold:
+        body = join(f()
+            .mov(ops.Address(pyinternals.tuple_item_offset-STACK_ITEM_SIZE,ops.ebx,ops.exc,STACK_ITEM_SIZE),ops.edx)
+            .incref(ops.edx)
+            .push(ops.edx).code)
+        (r
+            .mov(arg,ops.ecx)
+            (body)
+            .loop(ops.Displacement(-(len(body) + ops.LOOP_LEN))))
+    else:
+        itr = iter(reversed(range(arg)))
+        def unpack_one(reg):
+            i = next(itr)
+            return (f()
+                .mov(ops.Address(pyinternals.tuple_item_offset + STACK_ITEM_SIZE * i,ops.ebx),reg)
+                .incref(reg)
+                .push(reg)).code
+
+        r += interleave_ops([ops.eax,ops.ecx,ops.edx],unpack_one)
+        r.goto(done)
+
+    (r
+        (check_list)
+        .cmp(pyinternals.raw_addresses['PyList_Type'],ops.edx)
+        (JumpSource(f.op.jne,else_))
+            .cmpl(arg,ops.Address(pyinternals.var_size_offset,ops.ebx))
+            (JumpSource(f.op.jne,else_))
+                .mov(ops.Address(pyinternals.list_item_offset,ops.ebx),ops.edx))
+    
+    if arg >= f.tuning.unpack_seq_loop_threshhold:
+        body = join(f()
+            .mov(ops.Address(-STACK_ITEM_SIZE,ops.edx,ops.exc,STACK_ITEM_SIZE),ops.eax)
+            .incref(ops.eax)
+            .push(ops.eax).code)
+        (r
+            .mov(arg,ops.ecx)
+            (body)
+            .loop(ops.Displacement(-(len(body) + ops.LOOP_LEN))))
+    else:
+        itr = iter(reversed(range(arg)))
+        def unpack_one(reg):
+            i = next(itr)
+            return (f()
+                .mov(ops.Address(STACK_ITEM_SIZE * i,ops.edx),reg)
+                .incref(reg)
+                .push(reg)).code
+
+        r += interleave_ops([ops.eax,ops.ecx],unpack_one)
+        r.goto(done)
+
+    return (r
+        (else_)
+            .sub(arg * STACK_ITEM_SIZE,ops.esp)
+            .invoke('_unpack_iterable',ops.ebx,arg,-1,ops.esp)
+            .if_eax_is_zero(f()
+                .add(arg * STACK_ITEM_SIZE,ops.esp)
+                .decref(ops.ebx)
+                .goto(f.end)
+            )
+        (done)
+        .decref(ops.ebx))
+
+@handler
+def _op_UNPACK_EX(f,arg):
+    totalargs = 1 + (arg & 0xff) + (arg >> 8)
+
+    r = f()
+    if f.stack.use_tos():
+        r.mov(ops.eax,ops.ebx)
+    else:
+        r.pop(ops.ebx)
+
+    f.stack.offset += totalargs * STACK_ITEM_SIZE
+
+    return (r
+        .sub(totalargs * STACK_ITEM_SIZE,ops.esp)
+        .invoke('_unpack_iterable',ops.ebx,arg & 0xff,arg >> 8,ops.esp)
+        .decref(ops.ebx,True)
+        .if_eax_is_zero(f()
+            .add(arg * STACK_ITEM_SIZE,ops.esp)
+            .goto(f.end)
+        )
     )
 
 
