@@ -49,6 +49,8 @@
 #define UNBOUNDFREE_ERROR_MSG \
     "free variable '%.200s' referenced before assignment" \
     " in enclosing scope"
+#define CANNOT_CATCH_MSG "catching classes that do not inherit from "\
+                         "BaseException is not allowed"
 
 
 static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kwds);
@@ -1060,6 +1062,35 @@ Error:
 
 
 
+PyObject *_exception_cmp(PyObject *exc,PyObject *type) {
+    PyObject *ret;
+
+    if (PyTuple_Check(type)) {
+        Py_ssize_t i, length;
+        length = PyTuple_Size(type);
+        for (i = 0; i < length; i += 1) {
+            PyObject *exc = PyTuple_GET_ITEM(type, i);
+            if (!PyExceptionClass_Check(exc)) {
+                PyErr_SetString(PyExc_TypeError,
+                                CANNOT_CATCH_MSG);
+                return NULL;
+            }
+        }
+    }
+    else {
+        if (!PyExceptionClass_Check(type)) {
+            PyErr_SetString(PyExc_TypeError,
+                            CANNOT_CATCH_MSG);
+            return NULL;
+        }
+    }
+    ret = PyErr_GivenExceptionMatches(exc, type) ? Py_True : Py_False;
+    Py_INCREF(ret);
+    return ret;
+}
+
+
+
 /* Py_EnterRecursiveCall and Py_LeaveRecursiveCall are somewhat complicated
  * macros so they are wrapped in the following two functions */
 
@@ -1112,6 +1143,7 @@ PyInit_pyinternals(void) {
     ADD_INT_OFFSET("var_size_offset",PyVarObject,ob_size);
     ADD_INT_OFFSET("type_dealloc_offset",PyTypeObject,tp_dealloc);
     ADD_INT_OFFSET("type_iternext_offset",PyTypeObject,tp_iternext);
+    ADD_INT_OFFSET("type_flags_offset",PyTypeObject,tp_flags);
     ADD_INT_OFFSET("list_item_offset",PyListObject,ob_item);
     ADD_INT_OFFSET("tuple_item_offset",PyTupleObject,ob_item);
     ADD_INT_OFFSET("frame_builtins_offset",PyFrameObject,f_builtins);
@@ -1141,6 +1173,7 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyObject_GetIter)
     ADD_ADDR(PyObject_GetAttr)
     ADD_ADDR(PyObject_IsTrue)
+    ADD_ADDR(PyObject_RichCompare)
     ADD_ADDR(PyEval_GetGlobals)
     ADD_ADDR(PyEval_GetBuiltins)
     ADD_ADDR(PyEval_GetLocals)
@@ -1171,6 +1204,7 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyNumber_InPlaceOr)
     ADD_ADDR(PyList_New)
     ADD_ADDR(PyTuple_New)
+    ADD_ADDR(PySequence_Contains)
     ADD_ADDR(_EnterRecursiveCall)
     ADD_ADDR(_LeaveRecursiveCall)
     ADD_ADDR(call_function)
@@ -1178,7 +1212,10 @@ PyInit_pyinternals(void) {
     ADD_ADDR(_cc_EvalCodeEx)
     ADD_ADDR(_make_function)
     ADD_ADDR(_unpack_iterable)
+    ADD_ADDR(_exception_cmp)
     
+    ADD_ADDR(Py_True)
+    ADD_ADDR(Py_False)
     ADD_ADDR_NAME(&PyDict_Type,"PyDict_Type")
     ADD_ADDR_NAME(&PyList_Type,"PyList_Type")
     ADD_ADDR_NAME(&PyTuple_Type,"PyTuple_Type")

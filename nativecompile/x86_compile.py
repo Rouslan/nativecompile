@@ -1,4 +1,5 @@
 
+import sys
 import dis
 import weakref
 import operator
@@ -9,17 +10,40 @@ from . import x86_ops as ops
 from . import pyinternals
 
 
+PRINT_STACK_OFFSET = False
+
+
 STACK_ITEM_SIZE = 4
 CALL_ALIGN_MASK = 0xf
 
+
+TPFLAGS_INT_SUBCLASS = 1<<23
+TPFLAGS_LONG_SUBCLASS = 1<<24
+TPFLAGS_LIST_SUBCLASS = 1<<25
+TPFLAGS_TUPLE_SUBCLASS = 1<<26
+TPFLAGS_BYTES_SUBCLASS = 1<<27
+TPFLAGS_UNICODE_SUBCLASS = 1<<28
+TPFLAGS_DICT_SUBCLASS = 1<<29
+TPFLAGS_BASE_EXC_SUBCLASS = 1<<30
+TPFLAGS_TYPE_SUBCLASS = 1<<31
 
 
 
 class StackManager:
     def __init__(self,op):
         self.op = op
-        self.offset = 0 # the number of bytes the stack has moved
-        self.tos_in_eax = False # if True, the TOS item is in %eax and has not actually been pushed onto the stack
+
+        # The number of bytes the stack has moved. When this is None, we don't
+        # know what the offset is because the previous opcode is a jump past the
+        # current opcode. 'resets' is expected to indicate what the offset
+        # should be now.
+        self.offset = 0
+
+         # if True, the TOS item is in %eax and has not actually been pushed
+         # onto the stack
+        self.tos_in_eax = False
+
+        self.resets = []
     
     def push(self,x):
         self.offset += STACK_ITEM_SIZE
@@ -46,10 +70,39 @@ class StackManager:
         self.tos_in_eax = set_again
         return r
     
-    def use_tos(self):
+    def use_tos(self,set_again = False):
         r = self.tos_in_eax
-        self.tos_in_eax = False
+        self.tos_in_eax = set_again
         return r
+
+    def conditional_jump(self,target):
+        # I'm not sure if a new reset will ever need to be added anywhere except
+        # the front
+        for i,r in enumerate(self.resets):
+            if target == r[0]:
+                assert self.offset == r[1]
+                return
+            if target < r[0]:
+                self.resets.insert(i,(target,self.offset))
+                return
+
+        self.resets.append((target,self.offset))
+
+    def unconditional_jump(self,target):
+        self.conditional_jump(target)
+        self.offset = None
+
+    def current_pos(self,pos):
+        if self.resets:
+            assert pos <= self.resets[0][0]
+            if pos == self.resets[0][0]:
+                off = self.resets.pop(0)[1]
+
+                assert self.offset is None or off == self.offset
+                assert not self.tos_in_eax
+
+                if self.offset is None:
+                    self.offset = off
 
 
 
@@ -208,6 +261,14 @@ def handler(func,name = None):
             assert ft[0] == f.byte_offset
             r.push_tos()(ft[1])
 
+        f.stack.current_pos(f.byte_offset)
+
+        if PRINT_STACK_OFFSET:
+            print('stack: {}  stack items: {}  opcode: {}'.format(
+                f.stack.offset,
+                f.stack.offset//STACK_ITEM_SIZE + f.stack.tos_in_eax,
+                opname),file=sys.stderr)
+
         return r + func(f,*extra)
 
     handlers[dis.opmap[opname]] = inner
@@ -247,6 +308,7 @@ class Frame:
         self.local_name = local_name
         self.blockends = []
         self.byte_offset = None
+        self.next_byte_offset = None
         self.forward_targets = []
         self.entry_points = entry_points
 
@@ -388,6 +450,25 @@ class Frame:
         return Stitch(self)
 
 
+def arg1_as_subscr(func):
+    """Some syntax sugar that allows calling a method as:
+    object.method[arg1](arg2,...)
+
+    arg1 refers to the first argument *after* self.
+
+    """
+    class inner:
+        def __init__(self,inst):
+            self.inst = inst
+        def __getitem__(self,arg1):
+            return partial(func,self.inst,arg1)
+
+    return property(inner)
+
+
+def destitch(x):
+    return x.code if isinstance(x,Stitch) else x
+
 class Stitch:
     def __init__(self,frame,code=None):
         self.f = frame
@@ -449,11 +530,27 @@ class Stitch:
         return self
 
     def if_eax_is_zero(self,opcodes):
-        self.code += self.f.if_eax_is_zero(opcodes.code if isinstance(opcodes,Stitch) else opcodes)
+        self.code += self.f.if_eax_is_zero(destitch(opcodes))
         return self
 
     def if_eax_is_not_zero(self,opcodes):
-        self.code += self.f.if_eax_is_not_zero(opcodes.code if isinstance(opcodes,Stitch) else opcodes)
+        self.code += self.f.if_eax_is_not_zero(destitch(opcodes))
+        return self
+
+    @arg1_as_subscr
+    def if_cond(self,test,opcodes):
+        if isinstance(opcodes,(bytes,ops.AsmSequence)):
+            self.code += [
+                self.f.op.jcc(~test,ops.Displacement(len(opcodes))),
+                opcodes]
+        else:
+            after = JumpTarget()
+            self.code += [
+                JumpSource(partial(self.f.op.jcc,~test),after)
+            ] + destitch(opcodes) + [
+                after
+            ]
+
         return self
 
     def __add__(self,b):
@@ -779,7 +876,7 @@ def _op_LOAD_ATTR(f,name):
 def _op_pop_jump_if_(f,to,state):
     dont_jump = JumpTarget()
     jop1,jop2 = (f.op.jz,f.op.jg) if state else (f.op.jg,f.op.jz)
-    return (f()
+    r = (f()
         .push_tos(extra_push=True)
         .call('PyObject_IsTrue')
         .discard_stack_items(1)
@@ -792,6 +889,11 @@ def _op_pop_jump_if_(f,to,state):
         .goto(f.end)
         (dont_jump)
     )
+
+    if to > f.byte_offset:
+        f.stack.conditional_jump(to)
+
+    return r
 
 @handler
 def _op_POP_JUMP_IF_FALSE(f,to):
@@ -1028,6 +1130,94 @@ def _op_UNPACK_EX(f,arg):
         )
     )
 
+def false_true_addr(swap):
+    return map(
+        pyinternals.raw_addresses.__getitem__,
+        ('Py_True','Py_False') if swap else ('Py_False','Py_True'))
+
+@handler
+def _op_COMPARE_OP(f,arg):
+    op = dis.cmp_op[arg]
+
+    def pop_args():
+        return (f()
+            .counted_pop(ops.edx)
+            .decref(ops.edx,True)
+            .counted_pop(ops.edx)
+            .decref(ops.edx,True)
+        )
+
+    if op == 'is' or op == 'is not':
+        outcome_a,outcome_b = false_true_addr(op == 'is not')
+
+        r = f()
+        if f.stack.use_tos(True):
+            r.mov(ops.eax,ops.edx)
+        else:
+            r.counted_pop(ops.edx)
+
+        return (r
+            .cmp(ops.edx,ops.Address(base=ops.esp))
+            .mov(outcome_a,ops.eax)
+            .if_cond[ops.test_E](
+                f.op.mov(outcome_b,ops.eax)
+            )
+            .decref(ops.edx,True)
+            .counted_pop(ops.edx)
+            .decref(ops.edx,True)
+            .incref()
+        )
+
+    if op == 'in' or op == 'not in':
+        outcome_a,outcome_b = false_true_addr(op == 'not in')
+
+        return (f()
+            .push_tos(True)
+            .push(ops.Address(STACK_ITEM_SIZE,ops.esp))
+            .push(ops.Address(STACK_ITEM_SIZE,ops.esp))
+            .call('PySequence_Contains')
+            .discard_stack_items(2)
+            .test(ops.eax,ops.eax)
+            .if_cond[ops.test_L](f()
+                .xor(ops.eax,ops.eax)
+                .goto(f.end)
+            )
+            .mov(outcome_a,ops.eax)
+            .if_cond[ops.test_NZ](
+                f.op.mov(outcome_b,ops.eax)
+            )
+            .incref()
+        ) + pop_args()
+
+    if op == 'exception match':
+        return (f()
+            .push_tos(True,True)
+            .push(ops.Address(STACK_ITEM_SIZE*2,ops.esp))
+            .call('_exception_cmp')
+            .discard_stack_items(2)
+            .check_err()
+        ) + pop_args()
+
+    return (f()
+        .push_tos(True)
+        .push(arg)
+        .push(ops.Address(STACK_ITEM_SIZE,ops.esp))
+        .push(ops.Address(STACK_ITEM_SIZE*3,ops.esp))
+        .call('PyObject_RichCompare')
+        .discard_stack_items(3)
+        .check_err()
+    ) + pop_args()
+
+@handler
+def _op_JUMP_FORWARD(f,arg):
+    to = f.next_byte_offset + arg
+    r = (f()
+        .push_tos()
+        .goto(f.forward_target(to))
+    )
+    f.stack.unconditional_jump(to)
+    return r
+
 
 
 def join(x):
@@ -1165,9 +1355,11 @@ def compile_eval(f):
             else:
                 extended_arg = 0
                 
+                f.next_byte_offset = i
                 opcodes += get_handler(bop)(f,boparg)
                 f.byte_offset = i
         else:
+            f.next_byte_offset = i
             opcodes += get_handler(bop)(f)
             f.byte_offset = i
     
