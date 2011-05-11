@@ -58,9 +58,10 @@ static PyObject *load_args(PyObject ***pp_stack, int na);
 static void err_args(PyObject *func, int flags, int nargs);
 static PyObject *fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk);
 static PyObject *do_call(PyObject *func, PyObject ***pp_stack, int na, int nk);
-static PyObject *_cc_EvalCodeEx(PyObject *_entrypoint, PyObject *globals, PyObject *locals,
-    PyObject **args, int argcount, PyObject **kws, int kwcount,
-    PyObject **defs, int defcount, PyObject *kwdefs, PyObject *closure);
+static PyObject *_cc_EvalCodeEx(PyObject *_entrypoint,PyObject *_co,
+    PyObject *globals, PyObject *locals, PyObject **args, int argcount,
+    PyObject **kws, int kwcount, PyObject **defs, int defcount,
+    PyObject *kwdefs, PyObject *closure);
 
 #define EXT_POP(STACK_POINTER) (*(STACK_POINTER)++)
 
@@ -361,7 +362,7 @@ end:
 
 
 
-/* The following 9 are modified versions of functions in Python/ceval.c.
+/* The following are modified versions of functions in Python/ceval.c.
  * Profiling and statistics code has been removed because it uses global
  * variables not accessable to this module. */
 
@@ -437,8 +438,9 @@ fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
     PyObject *centry;
     int nd = 0;
 
-    centry = PyObject_GetAttr(func,mcode_index);
-    if(centry) {
+    /*centry = PyObject_GetAttr(func,mcode_index);*/
+    centry = NULL;
+    /*if(centry) {
         int isin = PyObject_IsInstance(centry,(PyObject*)&CompiledEntryPointType);
         if(isin<0) return NULL;
         if(!isin) {
@@ -448,7 +450,7 @@ fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
     } else {
         if(!PyErr_ExceptionMatches(PyExc_AttributeError)) return NULL;
         PyErr_Clear();
-    }
+    }*/
 
     if (argdefs == NULL && co->co_argcount == n &&
         co->co_kwonlyargcount == 0 && nk==0 &&
@@ -489,19 +491,12 @@ fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
     }
 
 
-    if(centry) {
-        PyObject *r = _cc_EvalCodeEx(centry, globals,
-                                     (PyObject *)NULL, (*pp_stack)+n-1, na,
-                                     (*pp_stack)+2*nk-1, nk, d, nd, kwdefs,
-                                     PyFunction_GET_CLOSURE(func));
-        Py_DECREF(centry);
-        return r;
-    }
-
-    return PyEval_EvalCodeEx((PyObject*)co, globals,
-                             (PyObject *)NULL, (*pp_stack)+n-1, na,
-                             (*pp_stack)+2*nk-1, nk, d, nd, kwdefs,
-                             PyFunction_GET_CLOSURE(func));
+    PyObject *r = _cc_EvalCodeEx(centry, (PyObject*)co, globals,
+                                 (PyObject *)NULL, (*pp_stack)+n-1, na,
+                                 (*pp_stack)+2*nk-1, nk, d, nd, kwdefs,
+                                 PyFunction_GET_CLOSURE(func));
+    Py_XDECREF(centry);
+    return r;
 }
 
 static PyObject *
@@ -616,12 +611,12 @@ format_exc_check_arg(PyObject *exc, const char *format_str, PyObject *obj)
 }
 
 static PyObject *
-_cc_EvalCodeEx(PyObject *_entrypoint, PyObject *globals, PyObject *locals,
+_cc_EvalCodeEx(PyObject *_entrypoint, PyObject *_co, PyObject *globals, PyObject *locals,
            PyObject **args, int argcount, PyObject **kws, int kwcount,
            PyObject **defs, int defcount, PyObject *kwdefs, PyObject *closure)
 {
     CompiledEntryPoint *entrypoint = (CompiledEntryPoint*)_entrypoint;
-    PyCodeObject* co = (PyCodeObject*)(entrypoint->code_object);
+    PyCodeObject* co = (PyCodeObject*)_co;
     register PyFrameObject *f;
     register PyObject *retval = NULL;
     register PyObject **fastlocals, **freevars;
@@ -672,7 +667,7 @@ _cc_EvalCodeEx(PyObject *_entrypoint, PyObject *globals, PyObject *locals,
             n = co->co_argcount;
         }
         for (i = 0; i < n; i++) {
-            x = args[i];
+            x = args[-i];
             Py_INCREF(x);
             SETLOCAL(i, x);
         }
@@ -682,15 +677,15 @@ _cc_EvalCodeEx(PyObject *_entrypoint, PyObject *globals, PyObject *locals,
                 goto fail;
             SETLOCAL(total_args, u);
             for (i = n; i < argcount; i++) {
-                x = args[i];
+                x = args[-i];
                 Py_INCREF(x);
                 PyTuple_SET_ITEM(u, i-n, x);
             }
         }
         for (i = 0; i < kwcount; i++) {
             PyObject **co_varnames;
-            PyObject *keyword = kws[2*i];
-            PyObject *value = kws[2*i + 1];
+            PyObject *keyword = kws[-2*i];
+            PyObject *value = kws[-2*i - 1];
             int j;
             if (keyword == NULL || !PyUnicode_Check(keyword)) {
                 PyErr_Format(PyExc_TypeError,
@@ -847,7 +842,8 @@ _cc_EvalCodeEx(PyObject *_entrypoint, PyObject *globals, PyObject *locals,
         return PyGen_New(f);
     }
 
-    retval = (entrypoint->compiled_code->entry + entrypoint->offset)(f);
+    if(entrypoint) retval = (entrypoint->compiled_code->entry + entrypoint->offset)(f);
+    else retval = PyEval_EvalFrameEx(f,0);
 
 fail:
 
@@ -1062,7 +1058,7 @@ Error:
 
 
 
-PyObject *_exception_cmp(PyObject *exc,PyObject *type) {
+static PyObject *_exception_cmp(PyObject *exc,PyObject *type) {
     PyObject *ret;
 
     if (PyTuple_Check(type)) {
@@ -1087,6 +1083,80 @@ PyObject *_exception_cmp(PyObject *exc,PyObject *type) {
     ret = PyErr_GivenExceptionMatches(exc, type) ? Py_True : Py_False;
     Py_INCREF(ret);
     return ret;
+}
+
+
+static PyObject*
+_do_raise(PyObject *exc, PyObject *cause)
+{
+    PyObject *type = NULL, *value = NULL;
+
+    if (exc == NULL) {
+        PyThreadState *tstate = PyThreadState_GET();
+        PyObject *tb;
+        type = tstate->exc_type;
+        value = tstate->exc_value;
+        tb = tstate->exc_traceback;
+        if (type == Py_None) {
+            PyErr_SetString(PyExc_RuntimeError,
+                            "No active exception to reraise");
+            return NULL;
+            }
+        Py_XINCREF(type);
+        Py_XINCREF(value);
+        Py_XINCREF(tb);
+        PyErr_Restore(type, value, tb);
+        return NULL;
+    }
+
+    if (PyExceptionClass_Check(exc)) {
+        type = exc;
+        value = PyObject_CallObject(exc, NULL);
+        if (value == NULL)
+            goto raise_error;
+    }
+    else if (PyExceptionInstance_Check(exc)) {
+        value = exc;
+        type = PyExceptionInstance_Class(exc);
+        Py_INCREF(type);
+    }
+    else {
+        Py_DECREF(exc);
+        PyErr_SetString(PyExc_TypeError,
+                        "exceptions must derive from BaseException");
+        goto raise_error;
+    }
+
+    if (cause) {
+        PyObject *fixed_cause;
+        if (PyExceptionClass_Check(cause)) {
+            fixed_cause = PyObject_CallObject(cause, NULL);
+            if (fixed_cause == NULL)
+                goto raise_error;
+            Py_DECREF(cause);
+        }
+        else if (PyExceptionInstance_Check(cause)) {
+            fixed_cause = cause;
+        }
+        else {
+            PyErr_SetString(PyExc_TypeError,
+                            "exception causes must derive from "
+                            "BaseException");
+            goto raise_error;
+        }
+        PyException_SetCause(value, fixed_cause);
+    }
+
+    PyErr_SetObject(type, value);
+    Py_XDECREF(value);
+    Py_XDECREF(type);
+    return NULL;
+
+raise_error:
+    Py_XDECREF(value);
+    Py_XDECREF(type);
+    Py_XDECREF(cause);
+    return NULL;
 }
 
 
@@ -1213,6 +1283,7 @@ PyInit_pyinternals(void) {
     ADD_ADDR(_make_function)
     ADD_ADDR(_unpack_iterable)
     ADD_ADDR(_exception_cmp)
+    ADD_ADDR(_do_raise)
     
     ADD_ADDR(Py_True)
     ADD_ADDR(Py_False)

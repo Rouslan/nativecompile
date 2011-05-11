@@ -1218,6 +1218,42 @@ def _op_JUMP_FORWARD(f,arg):
     f.stack.unconditional_jump(to)
     return r
 
+@handler
+def _op_RAISE_VARARGS(f,arg):
+    r = f()
+    
+    if arg == 2:
+        if not f.stack.use_tos():
+            r.counted_pop(ops.eax)
+        (r
+            .counted_pop(ops.ecx)
+            .push(ops.eax)
+            .push(ops.ecx)
+        )
+    elif arg == 1:
+        if not f.stack.use_tos():
+            r.counted_pop(ops.eax)
+        (r
+            .push(0)
+            .push(ops.eax)
+        )
+    elif arg == 0:
+        (r
+            .push_tos()
+            .push(0)
+            .push(0)
+        )
+    else:
+        raise SystemError("bad RAISE_VARARGS oparg")
+
+    # We don't have to worry about decrementing the reference counts. _do_raise
+    # does that for us.
+    return (r
+        .call('_do_raise')
+        .discard_stack_items(2)
+        .goto(f.end)
+    )
+
 
 
 def join(x):
