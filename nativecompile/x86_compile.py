@@ -1416,10 +1416,14 @@ def compile_eval(f):
         .jmp(ops.Displacement(len(dr)))
         (dr)
         (cmpjl)
+        .mov(ops.Address(pyinternals.raw_addresses['_PyThreadState_Current']),ops.ecx)
         .add(stack_prolog - STACK_ITEM_SIZE*2,ops.esp)
         .pop(ops.ebx)
+        .mov(ops.Address(STACK_ITEM_SIZE*2,ops.esp),ops.edx)
         .pop(ops.ebp)
+        .mov(ops.Address(pyinternals.frame_back_offset,ops.edx),ops.edx)
         .push(ops.eax)
+        .mov(ops.edx,ops.Address(pyinternals.threadstate_frame_offset,ops.ecx))
         .call('_LeaveRecursiveCall')
         .pop(ops.eax)
         .ret()
@@ -1444,7 +1448,7 @@ def compile_raw(_code,binary = True,tuning=Tuning()):
             if isinstance(c,types.CodeType) and id(c) not in entry_points:
                 compile_code_constants(c)
                 entry_points[id(c)] = (
-                    pyinternals.CompiledEntryPoint(c),
+                    pyinternals.create_compiled_entry_point(c),
                     compile_eval(F(c)))
     
     compile_code_constants(_code)
@@ -1465,7 +1469,7 @@ def compile_raw(_code,binary = True,tuning=Tuning()):
     main_entry = resolve_jumps(op,main_entry.code,end_targets)
     offset = len(main_entry)
     for epf,func in zip(entry_points,functions):
-        epf[0].offset = offset
+        pyinternals.cep_set_offset(epf[0],offset)
         offset += len(func)
 
     functions.insert(0,main_entry)

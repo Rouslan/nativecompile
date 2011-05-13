@@ -58,10 +58,10 @@ static PyObject *load_args(PyObject ***pp_stack, int na);
 static void err_args(PyObject *func, int flags, int nargs);
 static PyObject *fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk);
 static PyObject *do_call(PyObject *func, PyObject ***pp_stack, int na, int nk);
-static PyObject *_cc_EvalCodeEx(PyObject *_entrypoint,PyObject *_co,
-    PyObject *globals, PyObject *locals, PyObject **args, int argcount,
-    PyObject **kws, int kwcount, PyObject **defs, int defcount,
-    PyObject *kwdefs, PyObject *closure);
+static PyObject *_cc_EvalCodeEx(PyObject *_co, PyObject *globals,
+    PyObject *locals, PyObject **args, int argcount, PyObject **kws,
+    int kwcount, PyObject **defs, int defcount, PyObject *kwdefs,
+    PyObject *closure);
 
 #define EXT_POP(STACK_POINTER) (*(STACK_POINTER)++)
 
@@ -72,9 +72,6 @@ static PyObject *_cc_EvalCodeEx(PyObject *_entrypoint,PyObject *_co,
 
 
 
-PyObject *mcode_index;
-
-
 
 typedef struct {
     PyObject_HEAD
@@ -82,7 +79,7 @@ typedef struct {
     PyObject *code;
     PyObject *(*entry)(PyFrameObject *);
 
-    /* a tuple of CompiledEntryPoint objects, held here to prevent from being
+    /* a tuple of CodeWithCompiledCode objects, held here to prevent from being
        garbage-collected */
     PyObject *sub_entry_points;
 
@@ -168,87 +165,134 @@ static PyTypeObject CompiledCodeType = {
 
 
 
+
+#define CO_COMPILED (1 << 31)
+
+/* Since PyCodeObject cannot be subclassed, to support extra fields, we copy a
+ * PyCodeObject to this surrogate and identify it using a bit in co_flags not
+ * used by CPython */
 typedef struct {
     PyObject_HEAD
+    int co_argcount;
+    int co_kwonlyargcount;
+    int co_nlocals;
+    int co_stacksize;
+    int co_flags;
+    PyObject *co_code;
+    PyObject *co_consts;
+    PyObject *co_names;
+    PyObject *co_varnames;
+    PyObject *co_freevars;
+    PyObject *co_cellvars;
+    PyObject *co_filename;
+    PyObject *co_name;
+    int co_firstlineno;
+    PyObject *co_lnotab;
+    void *co_zombieframe;
+    PyObject *co_weakreflist;
 
     /* compiled_code is not set until this object is added to a CompiledCode
-       object. Once added, it cannot be removed, so its reference count is never
-       incremented to avoid an unnecessary cyclic reference. */
+       object. Once added, it cannot be removed, so its reference count doesn't
+       need to be incremented or decremented here. */
     CompiledCode *compiled_code;
 
-    PyObject *code_object;
     unsigned int offset;
-} CompiledEntryPoint;
+} CodeObjectWithCCode;
 
-static void CompiledEntryPoint_dealloc(CompiledEntryPoint *self) {
-    Py_DECREF(self->code_object);
-}
 
-static PyObject *CompiledEntryPoint_new(PyTypeObject *type,PyObject *args,PyObject *kwds) {
-    PyObject *code_object;
-    static char *kwlist[] = {"code",0};
+static PyObject *create_compiled_entry_point(PyObject *self,PyObject *_arg) {
+    CodeObjectWithCCode *ep;
+    PyCodeObject *arg = (PyCodeObject*)_arg;
 
-    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O!",kwlist,
-        &PyCode_Type,&code_object)) return NULL;
-	
-    CompiledEntryPoint *self = (CompiledEntryPoint*)type->tp_alloc(type,0);
-
-    if(self) {
-	self->compiled_code = NULL;
-        self->code_object = code_object;
-        Py_INCREF(code_object);
-	self->offset = 0;
+    if(!PyCode_Check(_arg)) {
+        PyErr_SetString(PyExc_TypeError,"argument must be a code object");
+        return NULL;
     }
 
-    return (PyObject*)self;
+    if(arg->co_flags & CO_COMPILED) {
+        PyErr_SetString(PyExc_TypeError,"argument is already a compiled entry point");
+        return NULL;
+    }
+
+    ep = PyMem_Malloc(sizeof(CodeObjectWithCCode));
+    if(ep) {
+        PyObject_Init((PyObject*)ep,&PyCode_Type);
+        ep->co_argcount = arg->co_argcount;
+        ep->co_kwonlyargcount = arg->co_kwonlyargcount;
+        ep->co_nlocals = arg->co_nlocals;
+        ep->co_stacksize = arg->co_stacksize;
+        ep->co_flags = arg->co_flags | CO_COMPILED;
+        ep->co_code = arg->co_code;
+        Py_XINCREF(ep->co_code);
+        ep->co_consts = arg->co_consts;
+        Py_XINCREF(ep->co_consts);
+        ep->co_names = arg->co_names;
+        Py_XINCREF(ep->co_names);
+        ep->co_varnames = arg->co_varnames;
+        Py_XINCREF(ep->co_varnames);
+        ep->co_freevars = arg->co_freevars;
+        Py_XINCREF(ep->co_freevars);
+        ep->co_cellvars = arg->co_cellvars;
+        Py_XINCREF(ep->co_cellvars);
+        ep->co_filename = arg->co_filename;
+        Py_XINCREF(ep->co_filename);
+        ep->co_name = arg->co_name;
+        Py_XINCREF(ep->co_name);
+        ep->co_firstlineno = arg->co_firstlineno;
+        ep->co_lnotab = arg->co_lnotab;
+        Py_XINCREF(ep->co_lnotab);
+        ep->co_zombieframe = NULL;
+        ep->co_weakreflist = NULL;
+
+        ep->compiled_code = NULL;
+        ep->offset = 0;
+    }
+
+    return (PyObject*)ep;
 }
 
-static PyMemberDef CompiledEntryPoint_members[] = {
-    {"offset",T_UINT,offsetof(CompiledEntryPoint,offset),0,NULL},
-    {"code_object",T_OBJECT,offsetof(CompiledEntryPoint,code_object),READONLY,NULL},
-    {NULL}
-};
+static PyObject *cep_get_compiled_code(PyObject *self,PyObject *_arg) {
+    PyObject *ret;
+    CodeObjectWithCCode *arg = (CodeObjectWithCCode*)_arg;
 
-static PyTypeObject CompiledEntryPointType = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    "nativecompile.pyinternals.CompiledEntryPoint", /* tp_name */
-    sizeof(CompiledEntryPoint),      /* tp_basicsize */
-    0,                         /* tp_itemsize */
-    (destructor)CompiledEntryPoint_dealloc, /* tp_dealloc */
-    0,                         /* tp_print */
-    0,                         /* tp_getattr */
-    0,                         /* tp_setattr */
-    0,                         /* tp_reserved */
-    0,                         /* tp_repr */
-    0,                         /* tp_as_number */
-    0,                         /* tp_as_sequence */
-    0,                         /* tp_as_mapping */
-    0,                         /* tp_hash  */
-    0,                         /* tp_call */
-    0,                         /* tp_str */
-    0,                         /* tp_getattro */
-    0,                         /* tp_setattro */
-    0,                         /* tp_as_buffer */
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, /* tp_flags */
-    "Executable machine code", /* tp_doc */
-    0,	                       /* tp_traverse */
-    0,	                       /* tp_clear */
-    0,	                       /* tp_richcompare */
-    0,	                       /* tp_weaklistoffset */
-    0,	                       /* tp_iter */
-    0,	                       /* tp_iternext */
-    0,                         /* tp_methods */
-    CompiledEntryPoint_members, /* tp_members */
-    0,                         /* tp_getset */
-    0,                         /* tp_base */
-    0,                         /* tp_dict */
-    0,                         /* tp_descr_get */
-    0,                         /* tp_descr_set */
-    0,                         /* tp_dictoffset */
-    0,                         /* tp_init */
-    0,                         /* tp_alloc */
-    CompiledEntryPoint_new,    /* tp_new */
-};
+    if(!(PyCode_Check(_arg) && arg->co_flags & CO_COMPILED)) {
+        PyErr_SetString(PyExc_TypeError,"argument must be a compiled entry point");
+        return NULL;
+    }
+
+    ret = arg->compiled_code ? (PyObject*)arg->compiled_code : Py_None;
+    Py_INCREF(ret);
+    return ret;
+}
+
+static PyObject *cep_get_offset(PyObject *self,PyObject *_arg) {
+    CodeObjectWithCCode *arg = (CodeObjectWithCCode*)_arg;
+
+    if(!(PyCode_Check(_arg) && arg->co_flags & CO_COMPILED)) {
+        PyErr_SetString(PyExc_TypeError,"argument must be a compiled entry point");
+        return NULL;
+    }
+
+    return PyLong_FromUnsignedLong(arg->offset);
+}
+
+static PyObject *cep_set_offset(PyObject *self,PyObject *args) {
+    PyObject *cep;
+    unsigned int offset;
+
+    if(!PyArg_ParseTuple(args,"OI",&cep,&offset)) return NULL;
+
+    if(!(PyCode_Check(cep) && ((PyCodeObject*)cep)->co_flags & CO_COMPILED)) {
+        PyErr_SetString(PyExc_TypeError,"the first argument must be a compiled entry point");
+        return NULL;
+    }
+
+    ((CodeObjectWithCCode*)cep)->offset = offset;
+
+    Py_RETURN_NONE;
+}
+
+
 
 
 static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kwds) {
@@ -294,11 +338,15 @@ static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kw
 
         while(--i >= 0) {
             item = PyTuple_GET_ITEM(self->sub_entry_points,i);
-            if(!PyObject_IsInstance(item,(PyObject*)&CompiledEntryPointType)) goto error;
+
+            if(!(PyCode_Check(item) && ((PyCodeObject*)item)->co_flags & CO_COMPILED)) {
+                PyErr_SetString(PyExc_TypeError,"an item in entry_points is not a compiled entry point");
+                goto error;
+            }
 
             /* the reference count is deliberately not increased (see
-               CompiledEntryPoint) */
-            ((CompiledEntryPoint*)item)->compiled_code = self;
+               CodeObjectWithCCode) */
+            ((CodeObjectWithCCode*)item)->compiled_code = self;
         }
         
 #ifdef USE_MMAP
@@ -435,22 +483,7 @@ fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
     PyObject *argdefs = PyFunction_GET_DEFAULTS(func);
     PyObject *kwdefs = PyFunction_GET_KW_DEFAULTS(func);
     PyObject **d = NULL;
-    PyObject *centry;
     int nd = 0;
-
-    /*centry = PyObject_GetAttr(func,mcode_index);*/
-    centry = NULL;
-    /*if(centry) {
-        int isin = PyObject_IsInstance(centry,(PyObject*)&CompiledEntryPointType);
-        if(isin<0) return NULL;
-        if(!isin) {
-            Py_DECREF(centry);
-            centry = NULL;
-        }
-    } else {
-        if(!PyErr_ExceptionMatches(PyExc_AttributeError)) return NULL;
-        PyErr_Clear();
-    }*/
 
     if (argdefs == NULL && co->co_argcount == n &&
         co->co_kwonlyargcount == 0 && nk==0 &&
@@ -474,10 +507,9 @@ fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
             Py_INCREF(*stack);
             fastlocals[i] = *stack--;
         }
-        if(centry) {
-            retval = (((CompiledEntryPoint*)centry)->compiled_code->entry +
-                ((CompiledEntryPoint*)centry)->offset)(f);
-            Py_DECREF(centry);
+        if(co->co_flags & CO_COMPILED) {
+            CodeObjectWithCCode *ep = (CodeObjectWithCCode*)co;
+            retval = (ep->compiled_code->entry + ep->offset)(f);
         }
         else retval = PyEval_EvalFrameEx(f,0);
         ++tstate->recursion_depth;
@@ -491,12 +523,10 @@ fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
     }
 
 
-    PyObject *r = _cc_EvalCodeEx(centry, (PyObject*)co, globals,
-                                 (PyObject *)NULL, (*pp_stack)+n-1, na,
-                                 (*pp_stack)+2*nk-1, nk, d, nd, kwdefs,
-                                 PyFunction_GET_CLOSURE(func));
-    Py_XDECREF(centry);
-    return r;
+    return _cc_EvalCodeEx((PyObject*)co, globals,
+                          (PyObject *)NULL, (*pp_stack)+n-1, na,
+                          (*pp_stack)+2*nk-1, nk, d, nd, kwdefs,
+                          PyFunction_GET_CLOSURE(func));
 }
 
 static PyObject *
@@ -611,11 +641,10 @@ format_exc_check_arg(PyObject *exc, const char *format_str, PyObject *obj)
 }
 
 static PyObject *
-_cc_EvalCodeEx(PyObject *_entrypoint, PyObject *_co, PyObject *globals, PyObject *locals,
+_cc_EvalCodeEx(PyObject *_co, PyObject *globals, PyObject *locals,
            PyObject **args, int argcount, PyObject **kws, int kwcount,
            PyObject **defs, int defcount, PyObject *kwdefs, PyObject *closure)
 {
-    CompiledEntryPoint *entrypoint = (CompiledEntryPoint*)_entrypoint;
     PyCodeObject* co = (PyCodeObject*)_co;
     register PyFrameObject *f;
     register PyObject *retval = NULL;
@@ -842,7 +871,10 @@ _cc_EvalCodeEx(PyObject *_entrypoint, PyObject *_co, PyObject *globals, PyObject
         return PyGen_New(f);
     }
 
-    if(entrypoint) retval = (entrypoint->compiled_code->entry + entrypoint->offset)(f);
+    if(co->co_flags & CO_COMPILED) {
+        CodeObjectWithCCode *ep = (CodeObjectWithCCode*)co;
+        retval = (ep->compiled_code->entry + ep->offset)(f);
+    }
     else retval = PyEval_EvalFrameEx(f,0);
 
 fail:
@@ -871,20 +903,12 @@ static PyObject *_make_function(int makeclosure,unsigned int arg,...) {
     va_start(items,arg);
 
     val = POP();
-    func = PyFunction_New(((CompiledEntryPoint*)val)->code_object, PyEval_GetGlobals());
-
-    if(!func) {
-        Py_DECREF(val);
-        goto fail_closure;
-    }
-
-    r = PyObject_SetAttr(func,mcode_index,val);
+    func = PyFunction_New(val, PyEval_GetGlobals());
     Py_DECREF(val);
 
-    /* although the program will still run if the above SetAttr call fails, such
-       a simple operation will probably only fail when there is a major
-       problem */
-    if(r) goto fail_closure;
+    if(!func) goto fail_closure;
+
+
 
     if(makeclosure) {
         val = POP();
@@ -1173,12 +1197,19 @@ static void _LeaveRecursiveCall(void) {
 }
 
 
+static PyMethodDef functions[] = {
+    {"create_compiled_entry_point",create_compiled_entry_point,METH_O,NULL},
+    {"cep_get_compiled_code",cep_get_compiled_code,METH_O,NULL},
+    {"cep_get_offset",cep_get_offset,METH_O,NULL},
+    {"cep_set_offset",cep_set_offset,METH_VARARGS,NULL}
+};
+
 static struct PyModuleDef this_module = {
     PyModuleDef_HEAD_INIT,
     "pyinternals",
     NULL,
     -1,
-    NULL,
+    functions,
     NULL,
     NULL,
     NULL,
@@ -1202,10 +1233,8 @@ PyInit_pyinternals(void) {
     PyObject *addrs;
     PyObject *tmp;
     int ret;
-    /*PyObject *(*fptr)(void);*/
     
     if(PyType_Ready(&CompiledCodeType) < 0) return NULL;
-    if(PyType_Ready(&CompiledEntryPointType) < 0) return NULL;
 
     m = PyModule_Create(&this_module);
     ADD_INT_OFFSET("refcnt_offset",PyObject,ob_refcnt);
@@ -1216,6 +1245,7 @@ PyInit_pyinternals(void) {
     ADD_INT_OFFSET("type_flags_offset",PyTypeObject,tp_flags);
     ADD_INT_OFFSET("list_item_offset",PyListObject,ob_item);
     ADD_INT_OFFSET("tuple_item_offset",PyTupleObject,ob_item);
+    ADD_INT_OFFSET("frame_back_offset",PyFrameObject,f_back);
     ADD_INT_OFFSET("frame_builtins_offset",PyFrameObject,f_builtins);
     ADD_INT_OFFSET("frame_globals_offset",PyFrameObject,f_globals);
     ADD_INT_OFFSET("frame_locals_offset",PyFrameObject,f_locals);
@@ -1225,9 +1255,6 @@ PyInit_pyinternals(void) {
     if(PyModule_AddObject(m,"ref_debug",PyBool_FromLong(REF_DEBUG_VAL)) == -1) return NULL;
     if(PyModule_AddObject(m,"count_allocs",PyBool_FromLong(COUNT_ALLOCS_VAL)) == -1) return NULL;
 
-    mcode_index = PyUnicode_InternFromString("__compiled_entry_point__");
-    if(!mcode_index) return NULL;
-    if(PyModule_AddObject(m,"mcode_index",mcode_index) == -1) return NULL;
     
     addrs = PyDict_New();
     if(!addrs) return NULL;
@@ -1302,9 +1329,6 @@ PyInit_pyinternals(void) {
     
     Py_INCREF(&CompiledCodeType);
     if(PyModule_AddObject(m,"CompiledCode",(PyObject*)&CompiledCodeType) == -1) return NULL;
-
-    Py_INCREF(&CompiledEntryPointType);
-    if(PyModule_AddObject(m,"CompiledEntryPoint",(PyObject*)&CompiledEntryPointType) == -1) return NULL;
     
     return m;
 }
