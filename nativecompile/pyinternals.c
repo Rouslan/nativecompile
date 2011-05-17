@@ -214,7 +214,7 @@ static PyObject *create_compiled_entry_point(PyObject *self,PyObject *_arg) {
         return NULL;
     }
 
-    ep = PyMem_Malloc(sizeof(CodeObjectWithCCode));
+    ep = PyObject_MALLOC(sizeof(CodeObjectWithCCode));
     if(ep) {
         PyObject_Init((PyObject*)ep,&PyCode_Type);
         ep->co_argcount = arg->co_argcount;
@@ -468,7 +468,7 @@ call_function(PyObject **pp_stack, int oparg)
         Py_DECREF(func);
     }
 
-    while (pp_stack > pfunc) {
+    while (pp_stack <= pfunc) {
         w = EXT_POP(pp_stack);
         Py_DECREF(w);
     }
