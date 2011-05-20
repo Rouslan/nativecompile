@@ -728,17 +728,50 @@ def _op_STORE_NAME(f,name):
     return (f()
         .push_tos(extra_push=True)
         .push(address_of(name))
-        .mov(pyinternals.raw_addresses['PyObject_SetItem'],ops.ecx)
         .mov(LOCALS,ops.eax)
-        .push(ops.eax)
+        .if_eax_is_zero(f()
+            .push(pyinternals.raw_addresses['NO_LOCALS_STORE_MSG'])
+            .push(pyinternals.raw_addresses['PyExc_SystemError'])
+            .call('PyErr_Format')
+            .discard_stack_items(4)
+            .goto(f.end)
+        )
+        .mov(pyinternals.raw_addresses['PyObject_SetItem'],ops.ecx)
         .cmpl(pyinternals.raw_addresses['PyDict_Type'],ops.Address(pyinternals.type_offset,ops.eax))
-        .jne(ops.Displacement(len(mid)))
-        (mid)
+        .push(ops.eax)
+        .if_cond[ops.test_E](
+            f.op.mov(pyinternals.raw_addresses['PyDict_SetItem'],ops.ecx)
+        )
         .call(ops.ecx)
         .discard_stack_items(3)
         .check_err(True)
         .counted_pop(ops.eax)
         .decref()
+    )
+
+@hasname
+def _op_DELETE_NAME(f,name):
+    return (f()
+        .push_tos()
+        .push(address_of(name))
+        .mov(LOCALS,ops.eax)
+        .if_eax_is_zero(f()
+            .push(pyinternals.raw_addresses['NO_LOCALS_DELETE_MSG'])
+            .push(pyinternals.raw_addresses['PyExc_SystemError'])
+            .call('PyErr_Format')
+            .discard_stack_items(3)
+            .goto(f.end)
+        )
+        .push(ops.eax)
+        .call('PyObject_DelItem')
+        .discard_stack_items(2)
+        .if_eax_is_zero(f()
+            .invoke('format_exc_check_arg',
+                pyinternals.raw_addresses['PyExc_NameError'],
+                pyinternals.raw_addresses['NAME_ERROR_MSG'],
+                address_of(name))
+            .goto(f.end)
+        )
     )
 
 @hasname
@@ -1301,8 +1334,15 @@ def local_name_func(f):
     found = JumpTarget()
     
     return (f()
-        .push(ops.Address(STACK_ITEM_SIZE,ops.esp))
         .mov(LOCALS,ops.eax)
+        .push(ops.Address(STACK_ITEM_SIZE,ops.esp))
+        .if_eax_is_zero(f()
+            .push(pyinternals.raw_addresses['NO_LOCALS_LOAD_MSG'])
+            .push(pyinternals.raw_addresses['PyExc_SystemError'])
+            .call('PyErr_Format')
+            .discard_stack_items(3)
+            .ret(STACK_ITEM_SIZE)
+        )
         .push(ops.eax)
         
         # if (%eax)->ob_type != PyDict_Type:

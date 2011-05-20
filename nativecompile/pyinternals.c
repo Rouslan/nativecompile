@@ -52,6 +52,10 @@
 #define CANNOT_CATCH_MSG "catching classes that do not inherit from "\
                          "BaseException is not allowed"
 
+#define NO_LOCALS_LOAD_MSG "no locals when loading %R"
+#define NO_LOCALS_STORE_MSG "no locals found when storing %R"
+#define NO_LOCALS_DELETE_MSG "no locals when deleting %R"
+
 
 static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kwds);
 static PyObject *load_args(PyObject ***pp_stack, int na);
@@ -72,12 +76,13 @@ static PyObject *_cc_EvalCodeEx(PyObject *_co, PyObject *globals,
 
 
 
+typedef PyObject *(*entry_type)(PyFrameObject *);
 
 typedef struct {
     PyObject_HEAD
 
     PyObject *code;
-    PyObject *(*entry)(PyFrameObject *);
+    entry_type entry;
 
     /* a tuple of CodeWithCompiledCode objects, held here to prevent from being
        garbage-collected */
@@ -369,7 +374,7 @@ static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kw
             PyErr_SetFromErrno(PyExc_OSError);
             goto error;
         }
-        self->entry = (PyObject *(*)(PyFrameObject *))mem;
+        self->entry = (entry_type)mem;
 
 #else
         /* just load the file contents into memory */
@@ -382,14 +387,14 @@ static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kw
             goto io_error;
         }
         
-        if((self->entry = (PyObject *(*)(void))PyMem_Malloc(len)) == NULL) {
+        if((self->entry = (entry_type)PyMem_Malloc(len)) == NULL) {
             fclose(f);
             goto error;
         }
         
         read = fread(self->entry,1,len,f);
         fclose(f);
-        if(read < len) goto io_error;
+        if(read < (size_t)len) goto io_error;
 
 #endif
         goto end; /* skip over the error handling code */
@@ -509,7 +514,7 @@ fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
         }
         if(co->co_flags & CO_COMPILED) {
             CodeObjectWithCCode *ep = (CodeObjectWithCCode*)co;
-            retval = (ep->compiled_code->entry + ep->offset)(f);
+            retval = ((entry_type)((char*)(ep->compiled_code->entry) + ep->offset))(f);
         }
         else retval = PyEval_EvalFrameEx(f,0);
         ++tstate->recursion_depth;
@@ -873,7 +878,7 @@ _cc_EvalCodeEx(PyObject *_co, PyObject *globals, PyObject *locals,
 
     if(co->co_flags & CO_COMPILED) {
         CodeObjectWithCCode *ep = (CodeObjectWithCCode*)co;
-        retval = (ep->compiled_code->entry + ep->offset)(f);
+        retval = ((entry_type)((char*)(ep->compiled_code->entry) + ep->offset))(f);
     }
     else retval = PyEval_EvalFrameEx(f,0);
 
@@ -1201,7 +1206,8 @@ static PyMethodDef functions[] = {
     {"create_compiled_entry_point",create_compiled_entry_point,METH_O,NULL},
     {"cep_get_compiled_code",cep_get_compiled_code,METH_O,NULL},
     {"cep_get_offset",cep_get_offset,METH_O,NULL},
-    {"cep_set_offset",cep_set_offset,METH_VARARGS,NULL}
+    {"cep_set_offset",cep_set_offset,METH_VARARGS,NULL},
+    {NULL}
 };
 
 static struct PyModuleDef this_module = {
@@ -1237,6 +1243,8 @@ PyInit_pyinternals(void) {
     if(PyType_Ready(&CompiledCodeType) < 0) return NULL;
 
     m = PyModule_Create(&this_module);
+    if(!m) return NULL;
+
     ADD_INT_OFFSET("refcnt_offset",PyObject,ob_refcnt);
     ADD_INT_OFFSET("type_offset",PyObject,ob_type);
     ADD_INT_OFFSET("var_size_offset",PyVarObject,ob_size);
@@ -1267,6 +1275,7 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyDict_SetItem)
     ADD_ADDR(PyObject_GetItem)
     ADD_ADDR(PyObject_SetItem)
+    ADD_ADDR(PyObject_DelItem)
     ADD_ADDR(PyObject_GetIter)
     ADD_ADDR(PyObject_GetAttr)
     ADD_ADDR(PyObject_IsTrue)
@@ -1321,11 +1330,15 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyExc_NameError)
     ADD_ADDR(PyExc_StopIteration)
     ADD_ADDR(PyExc_UnboundLocalError)
+    ADD_ADDR(PyExc_SystemError)
     ADD_ADDR_NAME(&_PyThreadState_Current,"_PyThreadState_Current")
     ADD_ADDR(NAME_ERROR_MSG)
     ADD_ADDR(GLOBAL_NAME_ERROR_MSG)
     ADD_ADDR(UNBOUNDLOCAL_ERROR_MSG)
     ADD_ADDR(UNBOUNDFREE_ERROR_MSG)
+    ADD_ADDR(NO_LOCALS_LOAD_MSG)
+    ADD_ADDR(NO_LOCALS_STORE_MSG)
+    ADD_ADDR(NO_LOCALS_DELETE_MSG)
     
     Py_INCREF(&CompiledCodeType);
     if(PyModule_AddObject(m,"CompiledCode",(PyObject*)&CompiledCodeType) == -1) return NULL;
