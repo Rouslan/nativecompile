@@ -56,6 +56,9 @@ UNPACK_EX
 COMPARE_OP
 JUMP_FORWARD
 RAISE_VARARGS
+BUILD_MAP
+STORE_MAP
+MAP_ADD
 
 BINARY_ADD and INPLACE_ADD are also implemented but currently lack an
 optimization on strings that CPython normally does.

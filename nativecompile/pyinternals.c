@@ -1273,6 +1273,7 @@ PyInit_pyinternals(void) {
     ADD_ADDR(Py_DecRef)
     ADD_ADDR(PyDict_GetItem)
     ADD_ADDR(PyDict_SetItem)
+    ADD_ADDR(_PyDict_NewPresized)
     ADD_ADDR(PyObject_GetItem)
     ADD_ADDR(PyObject_SetItem)
     ADD_ADDR(PyObject_DelItem)

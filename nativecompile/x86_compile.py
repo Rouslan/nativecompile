@@ -257,9 +257,11 @@ def handler(func,name = None):
         if isinstance(f.op,ops.Assembly):
             r.comment(opname)
         if f.forward_targets and f.forward_targets[0][0] <= f.byte_offset:
-            ft = f.forward_targets.pop(0)
-            assert ft[0] == f.byte_offset
-            r.push_tos()(ft[1])
+            pos,t,pop = f.forward_targets.pop(0)
+            assert pos == f.byte_offset
+            r.push_tos()(t)
+            if pop:
+                r.counted_pop(ops.edx).decref(ops.edx)
 
         f.stack.current_pos(f.byte_offset)
 
@@ -298,6 +300,9 @@ LOCALS = ops.Address(STACK_ITEM_SIZE * -3,ops.ebp)
 FAST_LOCALS = ops.Address(STACK_ITEM_SIZE * -4,ops.ebp)
 
 
+def raw_addr_if_str(x):
+    return pyinternals.raw_addresses[x] if isinstance(x,str) else x
+
 class Frame:
     def __init__(self,code,op,tuning,local_name,entry_points):
         self.code = code
@@ -330,7 +335,7 @@ class Frame:
 
     def invoke(self,func,*args):
         if not args: return self.call(func)
-        return list(map(self.op.push,reversed(args))) + self.call(func) + [self.op.add(len(args)*STACK_ITEM_SIZE,ops.esp)]
+        return [self.op.push(raw_addr_if_str(a)) for a in reversed(args)] + self.call(func) + [self.op.add(len(args)*STACK_ITEM_SIZE,ops.esp)]
 
     def _if_eax_is(self,test,opcodes):
         if isinstance(opcodes,(bytes,ops.AsmSequence)):
@@ -427,20 +432,21 @@ class Frame:
         except KeyError:
             raise Exception('unexpected jump target')
 
-    def forward_target(self,at):
+    def forward_target(self,at,pop=False):
         assert at > self.byte_offset
 
         # there will rarely be more than two targets at any given time
         for i,ft in enumerate(self.forward_targets):
             if ft[0] == at:
+                assert ft[2] == pop
                 return ft[1]
             if ft[0] > at:
                 t = JumpTarget()
-                self.foward_targets.insert(i,(at,t))
+                self.forward_targets.insert(i,(at,t,pop))
                 return t
 
         t = JumpTarget()
-        self.forward_targets.append((at,t))
+        self.forward_targets.append((at,t,pop))
         return t
 
     def jump_to(self,op,max_size,to):
@@ -576,7 +582,7 @@ class Stitch:
     def __getattr__(self,name):
         func = getattr(self.f.op,name)
         def inner(*args):
-            self.code.append(func(*args))
+            self.code.append(func(*map(raw_addr_if_str,args)))
             return self
         return inner
 
@@ -724,20 +730,19 @@ def _op_LOAD_NAME(f,name):
 
 @hasname
 def _op_STORE_NAME(f,name):
-    mid = f.op.mov(pyinternals.raw_addresses['PyDict_SetItem'],ops.ecx)
     return (f()
         .push_tos(extra_push=True)
         .push(address_of(name))
         .mov(LOCALS,ops.eax)
         .if_eax_is_zero(f()
-            .push(pyinternals.raw_addresses['NO_LOCALS_STORE_MSG'])
-            .push(pyinternals.raw_addresses['PyExc_SystemError'])
+            .push('NO_LOCALS_STORE_MSG')
+            .push('PyExc_SystemError')
             .call('PyErr_Format')
             .discard_stack_items(4)
             .goto(f.end)
         )
-        .mov(pyinternals.raw_addresses['PyObject_SetItem'],ops.ecx)
-        .cmpl(pyinternals.raw_addresses['PyDict_Type'],ops.Address(pyinternals.type_offset,ops.eax))
+        .mov('PyObject_SetItem',ops.ecx)
+        .cmpl('PyDict_Type',ops.Address(pyinternals.type_offset,ops.eax))
         .push(ops.eax)
         .if_cond[ops.test_E](
             f.op.mov(pyinternals.raw_addresses['PyDict_SetItem'],ops.ecx)
@@ -756,8 +761,8 @@ def _op_DELETE_NAME(f,name):
         .push(address_of(name))
         .mov(LOCALS,ops.eax)
         .if_eax_is_zero(f()
-            .push(pyinternals.raw_addresses['NO_LOCALS_DELETE_MSG'])
-            .push(pyinternals.raw_addresses['PyExc_SystemError'])
+            .push('NO_LOCALS_DELETE_MSG')
+            .push('PyExc_SystemError')
             .call('PyErr_Format')
             .discard_stack_items(3)
             .goto(f.end)
@@ -767,8 +772,8 @@ def _op_DELETE_NAME(f,name):
         .discard_stack_items(2)
         .if_eax_is_zero(f()
             .invoke('format_exc_check_arg',
-                pyinternals.raw_addresses['PyExc_NameError'],
-                pyinternals.raw_addresses['NAME_ERROR_MSG'],
+                'PyExc_NameError',
+                'NAME_ERROR_MSG',
                 address_of(name))
             .goto(f.end)
         )
@@ -783,8 +788,8 @@ def _op_LOAD_GLOBAL(f,name):
             .invoke('PyDict_GetItem',BUILTINS,address_of(name))
             .if_eax_is_zero(f()
                 .invoke('format_exc_check_arg',
-                     pyinternals.raw_addresses['PyExc_NameError'],
-                     pyinternals.raw_addresses['GLOBAL_NAME_ERROR_MSG'],
+                     'PyExc_NameError',
+                     'GLOBAL_NAME_ERROR_MSG',
                      address_of(name))
                 .goto(f.end)
             )
@@ -844,11 +849,7 @@ def _op_SETUP_LOOP(f,to):
 @handler
 def _op_POP_BLOCK(f):
     assert not f.stack.tos_in_eax
-    return (f()
-        (f.blockends.pop())
-        .counted_pop(ops.eax)
-        .decref()
-    )
+    return [f.blockends.pop()]
 
 @handler
 def _op_GET_ITER(f):
@@ -876,12 +877,12 @@ def _op_FOR_ITER(f,to):
         .if_eax_is_zero(f()
             .call('PyErr_Occurred')
             .if_eax_is_not_zero(f()
-                .invoke('PyErr_ExceptionMatches',pyinternals.raw_addresses['PyExc_StopIteration'])
+                .invoke('PyErr_ExceptionMatches','PyExc_StopIteration')
                 .test(ops.eax,ops.eax)
                 (JumpSource(f.op.jz,f.end))
                 .call('PyErr_Clear')
             )
-            .goto(f.blockends[-1])
+            .goto(f.forward_target(f.next_byte_offset + to,True))
         )
     )
 
@@ -1032,8 +1033,8 @@ def _op_LOAD_FAST(f,arg):
         .mov(ops.Address(STACK_ITEM_SIZE*arg,ops.ecx),ops.eax)
         .if_eax_is_zero(f()
             .invoke('format_exc_check_arg',
-                pyinternals.raw_addresses['PyExc_UnboundLocalError'],
-                pyinternals.raw_addresses['UNBOUNDLOCAL_ERROR_MSG'],
+                'PyExc_UnboundLocalError',
+                'UNBOUNDLOCAL_ERROR_MSG',
                 address_of(f.code.co_varnames[arg]))
             .goto(f.end)
         )
@@ -1074,7 +1075,7 @@ def _op_UNPACK_SEQUENCE(f,arg):
 
     (r
         .mov(ops.Address(pyinternals.type_offset,ops.ebx),ops.edx)
-        .cmp(pyinternals.raw_addresses['PyTuple_Type'],ops.edx)
+        .cmp('PyTuple_Type',ops.edx)
         (JumpSource(f.op.jne,check_list))
             .cmpl(arg,ops.Address(pyinternals.var_size_offset,ops.ebx))
             (JumpSource(f.op.jne,else_)))
@@ -1102,7 +1103,7 @@ def _op_UNPACK_SEQUENCE(f,arg):
 
     (r
         (check_list)
-        .cmp(pyinternals.raw_addresses['PyList_Type'],ops.edx)
+        .cmp('PyList_Type',ops.edx)
         (JumpSource(f.op.jne,else_))
             .cmpl(arg,ops.Address(pyinternals.var_size_offset,ops.ebx))
             (JumpSource(f.op.jne,else_))
@@ -1287,6 +1288,38 @@ def _op_RAISE_VARARGS(f,arg):
         .goto(f.end)
     )
 
+@handler
+def _op_BUILD_MAP(f,arg):
+    return (f()
+        .push_tos(True)
+        .invoke('_PyDict_NewPresized',arg)
+        .check_err()
+    )
+
+def _op_map_store_add(offset,f):
+    in_eax = f.stack.tos_in_eax
+    return (f()
+        .push_tos()
+        .push(ops.Address(STACK_ITEM_SIZE,ops.esp))
+        .push(ops.eax if in_eax else ops.Address(STACK_ITEM_SIZE,ops.esp))
+        .push(ops.Address(STACK_ITEM_SIZE*(4+offset),ops.esp))
+        .call('PyDict_SetItem')
+        .discard_stack_items(3)
+        .check_err(True)
+        .counted_pop(ops.edx)
+        .decref(ops.edx)
+        .counted_pop(ops.edx)
+        .decref(ops.edx)
+    )
+
+@handler
+def _op_STORE_MAP(f):
+    return _op_map_store_add(0,f)
+
+@handler
+def _op_MAP_ADD(f,arg):
+    return _op_map_store_add(arg-1,f)
+
 
 
 def join(x):
@@ -1337,8 +1370,8 @@ def local_name_func(f):
         .mov(LOCALS,ops.eax)
         .push(ops.Address(STACK_ITEM_SIZE,ops.esp))
         .if_eax_is_zero(f()
-            .push(pyinternals.raw_addresses['NO_LOCALS_LOAD_MSG'])
-            .push(pyinternals.raw_addresses['PyExc_SystemError'])
+            .push('NO_LOCALS_LOAD_MSG')
+            .push('PyExc_SystemError')
             .call('PyErr_Format')
             .discard_stack_items(3)
             .ret(STACK_ITEM_SIZE)
@@ -1346,14 +1379,14 @@ def local_name_func(f):
         .push(ops.eax)
         
         # if (%eax)->ob_type != PyDict_Type:
-        .cmpl(pyinternals.raw_addresses['PyDict_Type'],ops.Address(pyinternals.type_offset,ops.eax))
+        .cmpl('PyDict_Type',ops.Address(pyinternals.type_offset,ops.eax))
         (JumpSource(f.op.je,else_))
             .call('PyObject_GetItem')
             .discard_stack_items(2)
             .test(ops.eax,ops.eax)
             (JumpSource(f.op.jnz,found))
             
-            .invoke('PyErr_ExceptionMatches',pyinternals.raw_addresses['PyExc_KeyError'])
+            .invoke('PyErr_ExceptionMatches','PyExc_KeyError')
             .if_eax_is_zero(
                 f.op.ret(STACK_ITEM_SIZE)
             )
@@ -1372,8 +1405,8 @@ def local_name_func(f):
             .invoke('PyDict_GetItem',BUILTINS,ops.Address(STACK_ITEM_SIZE,ops.esp))
             .if_eax_is_zero(f()
                 .invoke('format_exc_check_arg',
-                     pyinternals.raw_addresses['NAME_ERROR_MSG'],
-                     pyinternals.raw_addresses['PyExc_NameError'])
+                    'NAME_ERROR_MSG',
+                    'PyExc_NameError')
             )
         )
         
@@ -1441,6 +1474,7 @@ def compile_eval(f):
     
     
     assert f.stack.offset == stack_prolog, 'stack.offset should be {0}, but is {1}'.format(stack_prolog,f.stack.offset)
+    assert not f.blockends
     
     dr = join([f.op.pop(ops.edx)] + f.decref(ops.edx,True))
     
