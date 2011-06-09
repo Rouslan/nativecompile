@@ -893,10 +893,9 @@ fail:
 
 
 
-#define POP() va_arg(items,PyObject*)
+#define POP() (*items++)
 
-static PyObject *_make_function(int makeclosure,unsigned int arg,...) {
-    va_list items;
+static PyObject *_make_function(int makeclosure,unsigned int arg,PyObject **items) {
     PyObject *val;
     PyObject *key;
     PyObject *func;
@@ -905,14 +904,12 @@ static PyObject *_make_function(int makeclosure,unsigned int arg,...) {
     int kwdefaults = (arg>>8) & 0xff;
     int num_annotations = (arg >> 16) & 0x7fff;
 
-    va_start(items,arg);
 
     val = POP();
     func = PyFunction_New(val, PyEval_GetGlobals());
     Py_DECREF(val);
 
     if(!func) goto fail_closure;
-
 
 
     if(makeclosure) {
@@ -1010,7 +1007,6 @@ fail_kwdef:
     }
 fail_end:
     Py_XDECREF(func);
-    va_end(items);
     return NULL;
 }
 
@@ -1316,7 +1312,6 @@ PyInit_pyinternals(void) {
     ADD_ADDR(_LeaveRecursiveCall)
     ADD_ADDR(call_function)
     ADD_ADDR(format_exc_check_arg)
-    ADD_ADDR(_cc_EvalCodeEx)
     ADD_ADDR(_make_function)
     ADD_ADDR(_unpack_iterable)
     ADD_ADDR(_exception_cmp)

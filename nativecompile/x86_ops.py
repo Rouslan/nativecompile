@@ -29,6 +29,18 @@ class Register:
             ['al','cl','dl','bl','ah','ch','dh','bh'],
             ['eax','ecx','edx','ebx','esp','ebp','esi','edi']
         ][self.w][self.reg]
+    
+    def __eq__(self,b):
+        if isinstance(b,Register):
+            return self.w == b.w and self.reg == b.reg
+        
+        return NotImplemented
+    
+    def __ne__(self,b):
+        if isinstance(b,Register):
+            return self.w != b.w or self.reg != b.reg
+        
+        return NotImplemented
 
 
 class Address:
@@ -182,7 +194,7 @@ class AsmSequence:
                 indirect = name == 'call' or name == 'jmp'
                 nextaddr = addr + len(bin)
             
-                lines.append('{:8x}: {:16}{:8} {}\n'.format(
+                lines.append('{:8x}: {:20}{:8} {}\n'.format(
                     addr,
                     binascii.hexlify(bin).decode(),
                     name,

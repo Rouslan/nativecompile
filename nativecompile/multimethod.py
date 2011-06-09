@@ -15,7 +15,7 @@ class MultiMethod(object):
         types = tuple(arg.__class__ for arg in args)
         function = self.typemap.get(types)
         if function is None:
-            raise TypeError("no match")
+            raise TypeError("no match for {} called with ({})".format(self.name,','.join(t.__name__ for t in types)))
         return function(*args)
     def register(self, types, function):
         if types in self.typemap:
