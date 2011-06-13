@@ -1,9 +1,19 @@
 
+# To avoid repeating code, most of the functions and classes defined in this
+# module handle both 32 and 64 bit machine code, but this module should only be
+# used for writing 32 bit code. Use x86_64_ops for correct 64 bit code.
+
+
 import binascii
 from functools import partial
 
 from .multimethod import multimethod
 
+
+SIZE_B = 0
+# SIZE_W not used
+SIZE_D = 1
+SIZE_Q = 2
 
 def int_to_32(x):
     return x.to_bytes(4,byteorder='little',signed=True)
@@ -20,33 +30,39 @@ def immediate_data(w,data):
 
 
 class Register:
-    def __init__(self,w,reg):
-        self.w = w
-        self.reg = reg
-    
-    def __str__(self):
-        return '%' + [
-            ['al','cl','dl','bl','ah','ch','dh','bh'],
-            ['eax','ecx','edx','ebx','esp','ebp','esi','edi']
-        ][self.w][self.reg]
+    def __init__(self,size,code):
+        self.size = size
+        self.code = code
+
+    @property
+    def ext(self):
+        return bool(self.code & 0b1000)
+
+    @property
+    def reg(self):
+        return self.code & 0b111
+
+    @property
+    def w(self):
+        return bool(self.size)
     
     def __eq__(self,b):
         if isinstance(b,Register):
-            return self.w == b.w and self.reg == b.reg
+            return self.size == b.size and self.code == b.code
         
         return NotImplemented
     
     def __ne__(self,b):
         if isinstance(b,Register):
-            return self.w != b.w or self.reg != b.reg
+            return self.size != b.size or self.code != b.code
         
         return NotImplemented
-
 
 class Address:
     def __init__(self,offset=0,base=None,index=None,scale=1):
         assert scale in (1,2,4,8)
         assert (base is None or base.w) and (index is None or index.w)
+        assert base is None or index is None or base.size == index.size
         
         # %esp cannot be used as the index
         assert index is None or index.reg != 0b100
@@ -55,6 +71,12 @@ class Address:
         self.base = base
         self.index = index
         self.scale = scale
+
+    @property
+    def size(self):
+        if self.base: return self.base.size
+        if self.index: return self.index.size
+        return None
     
     def _sib(self):
         return bytes([
@@ -126,6 +148,45 @@ def fits_in_sbyte(x):
     return -128 <= x <= 127
 
 
+def rex(reg,rm,need_w=True):
+    """Return the REX prefix byte if needed.
+
+    This is only needed for 64-bit code. If given only 32-bit compatible
+    registers and addresses, this function will always return an empty byte
+    string.
+
+    """
+    assert reg is None or isinstance(reg,Register)
+    assert rm is None or isinstance(rm,(Register,Address))
+
+    rxb = 0
+    w = None
+
+    if reg:
+        w = reg.size == SIZE_Q
+        rxb |= reg.ext << 2
+
+    if rm:
+        if isinstance(rm,Address):
+            assert not (w is None and rm.size is None)
+            if rm.size:
+                assert w is None or w == (rm.size == SIZE_Q)
+                w = rm.size == SIZE_Q
+
+            if rm.index and rm.index.ext: rxb |= 0b10
+            if rm.base and rm.base.ext: rxb |= 1
+        else:
+            assert rm.size is not None
+            assert w is None or w == (rm.size == SIZE_Q)
+            w = rm.size == SIZE_Q
+            rxb |= rm.ext
+
+    assert w is not None
+
+    return bytes([0b01000000 | (w << 3) | rxb]) if ((w and need_w) or rxb) else b''
+
+
+
 class Test:
     def __init__(self,val):
         self.val = val
@@ -141,14 +202,23 @@ class Test:
         return ['o','no','b','nb','e','ne','be','a','s','ns','p','np','l','ge','le','g'][self.val]
 
 
+def reg_str(r):
+    assert (not r.ext) and r.size < SIZE_Q
+    return '%' + [
+        ['al','cl','dl','bl','ah','ch','dh','bh'],
+        ['eax','ecx','edx','ebx','esp','ebp','esi','edi']
+    ][r.size][r.reg]
+
 def asm_str(indirect,nextaddr,x):
     if isinstance(x,int):
         return '${:#x}'.format(x)
     if isinstance(x,Displacement):
         return '{:x}'.format(x.val + nextaddr)
+
+    val = reg_str(x) if isinstance(x,Register) else str(x)
     if indirect and isinstance(x,(Address,Register)):
-        return '*'+str(x)
-    return str(x)
+        return '*'+val
+    return val
 
 
 class AsmSequence:
@@ -221,22 +291,22 @@ class Assembly:
 
 
 
-al = Register(0,0b000)
-cl = Register(0,0b001)
-dl = Register(0,0b010)
-bl = Register(0,0b011)
-ah = Register(0,0b100)
-ch = Register(0,0b101)
-dh = Register(0,0b110)
-bh = Register(0,0b111)
-eax = Register(1,0b000)
-ecx = Register(1,0b001)
-edx = Register(1,0b010)
-ebx = Register(1,0b011)
-esp = Register(1,0b100)
-ebp = Register(1,0b101)
-esi = Register(1,0b110)
-edi = Register(1,0b111)
+al = Register(SIZE_B,0b000)
+cl = Register(SIZE_B,0b001)
+dl = Register(SIZE_B,0b010)
+bl = Register(SIZE_B,0b011)
+ah = Register(SIZE_B,0b100)
+ch = Register(SIZE_B,0b101)
+dh = Register(SIZE_B,0b110)
+bh = Register(SIZE_B,0b111)
+eax = Register(SIZE_D,0b000)
+ecx = Register(SIZE_D,0b001)
+edx = Register(SIZE_D,0b010)
+ebx = Register(SIZE_D,0b011)
+esp = Register(SIZE_D,0b100)
+ebp = Register(SIZE_D,0b101)
+esi = Register(SIZE_D,0b110)
+edi = Register(SIZE_D,0b111)
 
 
 
@@ -269,26 +339,28 @@ test_G = Test(0b1111)
 
 
 def _op_reg_reg(byte1,a,b):
-    assert a.w == b.w
-    return bytes([
+    assert a.size == b.size
+    return rex(a,b) + bytes([
         byte1 | a.w,
         0b11000000 | (a.reg << 3) | b.reg])
 
 def _op_addr_reg(byte1,a,b,reverse):
-    return bytes([byte1 | (reverse << 1) | b.w]) + a.mod_rm_sib_disp(b.reg)
+    return rex(b,a) + bytes([byte1 | (reverse << 1) | b.w]) + a.mod_rm_sib_disp(b.reg)
 
 def _op_imm_reg(byte1,mid,byte_alt,a,b):
-    if b.reg == 0b000:
-        return bytes([byte_alt | b.w]) + immediate_data(b.w,a)
+    if b.code == 0:
+        r = bytes([byte_alt | b.w]) + immediate_data(b.w,a)
+        if b.size == SIZE_Q: r = bytes([0b01001000]) + r
+        return r
 
     fits = fits_in_sbyte(a)
-    return bytes([
+    return rex(None,b) + bytes([
         byte1 | (fits << 1) | b.w,
         0b11000000 | (mid << 3) | b.reg]) + immediate_data(not fits,a)
 
 def _op_imm_addr(byte1,mid,a,b,w):
     fits = fits_in_sbyte(a)
-    return bytes([byte1 | (fits << 1) | w]) + b.mod_rm_sib_disp(mid) + immediate_data(not fits,a)
+    return rex(None,b) + bytes([byte1 | (fits << 1) | w]) + b.mod_rm_sib_disp(mid) + immediate_data(not fits,a)
 
 
 
@@ -312,13 +384,16 @@ def add(a : Register,b : Address):
 def add(a : int,b : Register):
     return _op_imm_reg(0b10000000,0,0b00000100,a,b)
 
+def add_imm_addr(a,b,w):
+    return _op_imm_addr(0b10000000,0b010 if b.size == SIZE_Q else 0,a,b,w)
+
 @multimethod
 def addb(a : int,b : Address):
-    return _op_imm_addr(0b10000000,0,a,b,False)
+    return add_imm_addr(a,b,False)
 
 @multimethod
 def addl(a : int,b : Address):
-    return _op_imm_addr(0b10000000,0,a,b,True)
+    return add_imm_addr(a,b,True)
 
 
 
@@ -331,13 +406,13 @@ CALL_DISP_LEN = 5
 @multimethod
 def call(proc : Register):
     assert proc.w
-    return bytes([
+    return rex(proc,None) + bytes([
         0b11111111,
         0b11010000 | proc.reg])
 
 @multimethod
 def call(proc : Address):
-    return bytes([0b11111111]) + proc.mod_rm_sib_disp(0b010)
+    return rex(None,proc) + bytes([0b11111111]) + proc.mod_rm_sib_disp(0b010)
 
 
 @multimethod
@@ -368,6 +443,7 @@ def cmpl(a : int,b : Address):
 
 @multimethod
 def dec(x : Register):
+    # REX omitted; dec is redefined in x86_64_ops
     if x.w:
         return bytes([0b01001000 | x.reg])
     else:
@@ -376,7 +452,7 @@ def dec(x : Register):
             0b11001000 | x.reg])
 
 def dec_addr(x,w):
-    return bytes([0b11111110 | w]) + x.mod_rm_sib_disp(0b001)
+    return rex(None,x) + bytes([0b11111110 | w]) + x.mod_rm_sib_disp(0b001)
 
 @multimethod
 def decb(x : Address):
@@ -390,6 +466,7 @@ def decl(x : Address):
 
 @multimethod
 def inc(x : Register):
+    # REX omitted; inc is redefined in x86_64_ops
     if x.w:
         return bytes([0b01000000 | x.reg])
     else:
@@ -398,7 +475,7 @@ def inc(x : Register):
             0b11000000 | x.reg])
 
 def inc_addr(x,w):
-    return bytes([0b11111110 | w]) + x.mod_rm_sib_disp(0)
+    return rex(None,x) + bytes([0b11111110 | w]) + x.mod_rm_sib_disp(0)
 
 @multimethod
 def incb(x : Address):
@@ -453,20 +530,20 @@ JMP_DISP_MAX_LEN = 5
 @multimethod
 def jmp(x : Register):
     assert x.w
-    return bytes([
+    return rex(None,x) + bytes([
         0b11111111,
         0b11100000 | x.reg])
 
 @multimethod
 def jmp(x : Address):
-    return bytes([0b11111111]) + x.mod_rm_sib_disp(0b100)
+    return rex(None,x) + bytes([0b11111111]) + x.mod_rm_sib_disp(0b100)
 
 
 
 @multimethod
 def lea(a : Address,b : Register):
     assert b.w
-    return bytes([0b10001101]) + a.mod_rm_sib_disp(b.reg)
+    return rex(b,a) + bytes([0b10001101]) + a.mod_rm_sib_disp(b.reg)
 
 
 
@@ -501,7 +578,9 @@ def mov(a : Register,b : Register):
 
 def mov_addr_reg(a,b,forward):
     if b.reg == 0b000 and a.offset_only():
-        return bytes([0b10100000 | (forward << 1) | b.w]) + int_to_32(a.offset)
+        r = bytes([0b10100000 | (forward << 1) | b.w]) + int_to_32(a.offset)
+        if b.size == SIZE_Q: r = bytes([0b01001000]) + r
+        return r
 
     return _op_addr_reg(0b10001000,a,b,forward)
 
@@ -537,21 +616,21 @@ def nop():
 
 @multimethod
 def pop(x : Register):
-    return bytes([0b01011000 | x.reg])
+    return rex(None,x,False) + bytes([0b01011000 | x.reg])
 
 @multimethod
 def pop(x : Address):
-    return bytes([0b10001111]) + x.mod_rm_sib_disp(0)
+    return rex(None,x,False) + bytes([0b10001111]) + x.mod_rm_sib_disp(0)
 
 
 
 @multimethod
 def push(x : Register):
-    return bytes([0b01010000 | x.reg])
+    return rex(None,x,False) + bytes([0b01010000 | x.reg])
 
 @multimethod
 def push(x : Address):
-    return bytes([0b11111111]) + x.mod_rm_sib_disp(0b110)
+    return rex(None,x,False) + bytes([0b11111111]) + x.mod_rm_sib_disp(0b110)
 
 @multimethod
 def push(x : int):

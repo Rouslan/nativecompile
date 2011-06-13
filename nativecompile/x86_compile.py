@@ -336,7 +336,7 @@ def interleave_ops(regs,steps):
     before, and interleave their instructions
 
     This is to take maximum advantage of the CPU's instruction pipeline. The
-    operations are only interleaved when pyinternals.ref_debug is false.
+    operations are only interleaved when pyinternals.REF_DEBUG is false.
     Otherwise the operations are arranged sequentially.  This is to allow the
     use of the code from Frame.incref, which cannot be interleaved when
     ref_debug is true.
@@ -346,7 +346,7 @@ def interleave_ops(regs,steps):
     pending = []
 
     try:
-        if pyinternals.ref_debug:
+        if pyinternals.REF_DEBUG:
             while True:
                 items.extend(steps(regs[0]))
 
@@ -425,7 +425,7 @@ BUILTINS = ops.Address(next(a),ops.ebp)
 LOCALS = ops.Address(next(a),ops.ebp)
 FAST_LOCALS = ops.Address(next(a),ops.ebp)
 
-# these are only used when pyinternals.ref_debug is True
+# these are only used when pyinternals.REF_DEBUG is True
 TEMP_EAX = ops.Address(next(a),ops.ebp)
 TEMP_ECX = ops.Address(next(a),ops.ebp)
 TEMP_EDX = ops.Address(next(a),ops.ebp)
@@ -509,7 +509,7 @@ class Frame:
         return self.op.subl(1,x) if self.tuning.prefer_addsub_over_incdec else self.op.decl(x)
 
     def incref(self,reg = ops.eax):
-        if pyinternals.ref_debug:
+        if pyinternals.REF_DEBUG:
             # the registers that would otherwise be undisturbed, must be preserved
             return ([
                 self.op.mov(ops.eax,TEMP_EAX),
@@ -520,10 +520,10 @@ class Frame:
                 self.op.mov(TEMP_ECX,ops.ecx),
                 self.op.mov(TEMP_EAX,ops.eax)])
 
-        return [self.incl_or_addl(ops.Address(pyinternals.refcnt_offset,reg))]
+        return [self.incl_or_addl(ops.Address(pyinternals.REFCNT_OFFSET,reg))]
 
     def decref(self,reg = ops.eax,preserve_eax = False):
-        if pyinternals.ref_debug:
+        if pyinternals.REF_DEBUG:
             inv = self.invoke('Py_DecRef',reg)
             return [self.op.mov(ops.eax,TEMP_EAX)] + inv + [self.op.mov(TEMP_EAX,ops.eax)] if preserve_eax else inv
 
@@ -535,14 +535,14 @@ class Frame:
             mid.append(self.op.mov(ops.eax,self.stack[-1]))
 
         mid += [
-            self.op.mov(ops.Address(pyinternals.type_offset,reg),ops.esi),
+            self.op.mov(ops.Address(pyinternals.TYPE_OFFSET,reg),ops.esi),
         ]
 
         mid += self.invoke(
-            ops.Address(pyinternals.type_dealloc_offset,ops.esi),
+            ops.Address(pyinternals.TYPE_DEALLOC_OFFSET,ops.esi),
             reg)
 
-        if pyinternals.count_allocs:
+        if pyinternals.COUNT_ALLOCS:
             mid += self.invoke('inc_count',ops.esi)
         
         if preserve_eax:
@@ -551,7 +551,7 @@ class Frame:
         mid = join(mid)
         
         return [
-            self.decl_or_subl(ops.Address(pyinternals.refcnt_offset,reg)),
+            self.decl_or_subl(ops.Address(pyinternals.REFCNT_OFFSET,reg)),
             self.op.jnz(ops.Displacement(len(mid))),
             mid
         ]
@@ -881,7 +881,7 @@ def _op_STORE_NAME(f,name):
             .goto_end()
         )
         .mov('PyObject_SetItem',ops.ecx)
-        .cmpl('PyDict_Type',ops.Address(pyinternals.type_offset,ops.eax))
+        .cmpl('PyDict_Type',ops.Address(pyinternals.TYPE_OFFSET,ops.eax))
         .push_arg(ops.eax,n=0)
         .if_cond[ops.test_E](
             f.op.mov(pyinternals.raw_addresses['PyDict_SetItem'],ops.ecx)
@@ -1003,8 +1003,8 @@ def _op_FOR_ITER(f,to):
         .push_tos(True)
         (f.rtarget())
         .mov(f.stack[0],argreg)
-        .mov(ops.Address(pyinternals.type_offset,argreg),ops.eax)
-        .mov(ops.Address(pyinternals.type_iternext_offset,ops.eax),ops.eax)
+        .mov(ops.Address(pyinternals.TYPE_OFFSET,argreg),ops.eax)
+        .mov(ops.Address(pyinternals.TYPE_ITERNEXT_OFFSET,ops.eax),ops.eax)
         .invoke(ops.eax,argreg)
         .if_eax_is_zero(f()
             .call('PyErr_Occurred')
@@ -1118,11 +1118,11 @@ def _op_BUILD_(f,items,new,item_offset,deref):
 
 @handler
 def _op_BUILD_LIST(f,items):
-    return _op_BUILD_(f,items,'PyList_New',pyinternals.list_item_offset,True)
+    return _op_BUILD_(f,items,'PyList_New',pyinternals.LIST_ITEM_OFFSET,True)
 
 @handler
 def _op_BUILD_TUPLE(f,items):
-    return _op_BUILD_(f,items,'PyTuple_New',pyinternals.tuple_item_offset,False)
+    return _op_BUILD_(f,items,'PyTuple_New',pyinternals.TUPLE_ITEM_OFFSET,False)
 
 @handler
 def _op_STORE_SUBSCR(f):
@@ -1219,16 +1219,16 @@ def _op_UNPACK_SEQUENCE(f,arg):
     seq_store = f.stack[-1-arg]
 
     (r
-        .mov(ops.Address(pyinternals.type_offset,ops.ebx),ops.edx)
+        .mov(ops.Address(pyinternals.TYPE_OFFSET,ops.ebx),ops.edx)
         .cmp('PyTuple_Type',ops.edx)
         (JumpSource(f.op.jne,check_list))
-            .cmpl(arg,ops.Address(pyinternals.var_size_offset,ops.ebx))
+            .cmpl(arg,ops.Address(pyinternals.VAR_SIZE_OFFSET,ops.ebx))
             (JumpSource(f.op.jne,else_)))
 
     if arg >= f.tuning.unpack_seq_loop_threshhold:
         s_top.index = ops.eax
         body = join(f()
-            .mov(ops.Address(pyinternals.tuple_item_offset-STACK_ITEM_SIZE,ops.ebx,ops.exc,STACK_ITEM_SIZE),ops.edx)
+            .mov(ops.Address(pyinternals.TUPLE_ITEM_OFFSET-STACK_ITEM_SIZE,ops.ebx,ops.exc,STACK_ITEM_SIZE),ops.edx)
             .incref(ops.edx)
             .mov(ops.edx,s_top)
             .inc_or_add(ops.eax).code)
@@ -1242,7 +1242,7 @@ def _op_UNPACK_SEQUENCE(f,arg):
         def unpack_one(reg):
             i = next(itr)
             return (f()
-                .mov(ops.Address(pyinternals.tuple_item_offset + STACK_ITEM_SIZE * i,ops.ebx),reg)
+                .mov(ops.Address(pyinternals.TUPLE_ITEM_OFFSET + STACK_ITEM_SIZE * i,ops.ebx),reg)
                 .incref(reg)
                 .mov(reg,f.stack[i-arg])).code
 
@@ -1254,9 +1254,9 @@ def _op_UNPACK_SEQUENCE(f,arg):
         (check_list)
         .cmp('PyList_Type',ops.edx)
         (JumpSource(f.op.jne,else_))
-            .cmpl(arg,ops.Address(pyinternals.var_size_offset,ops.ebx))
+            .cmpl(arg,ops.Address(pyinternals.VAR_SIZE_OFFSET,ops.ebx))
             (JumpSource(f.op.jne,else_))
-                .mov(ops.Address(pyinternals.list_item_offset,ops.ebx),ops.edx))
+                .mov(ops.Address(pyinternals.LIST_ITEM_OFFSET,ops.ebx),ops.edx))
     
     if arg >= f.tuning.unpack_seq_loop_threshhold:
         s_top.index = ops.ebx
@@ -1539,7 +1539,7 @@ def local_name_func(op,tuning):
         )
         
         # if (%eax)->ob_type != PyDict_Type:
-        .cmpl('PyDict_Type',ops.Address(pyinternals.type_offset,ops.eax))
+        .cmpl('PyDict_Type',ops.Address(pyinternals.TYPE_OFFSET,ops.eax))
         (JumpSource(f.op.je,else_))
             .invoke('PyObject_GetItem',ops.eax,ops.ebx)
             .test(ops.eax,ops.eax)
@@ -1590,7 +1590,7 @@ def compile_eval(code,op,tuning,local_name,entry_points):
 
     stack_first = 4
 
-    if pyinternals.ref_debug:
+    if pyinternals.REF_DEBUG:
         # a place to store %eax,%ecx and %edx when increasing reference counts
         # (which calls a function when ref_debug is True)
         stack_first += DEBUG_TEMPS
@@ -1625,22 +1625,22 @@ def compile_eval(code,op,tuning,local_name,entry_points):
         # headers), this is all that PyThreadState_GET boils down to:
         .mov(ops.Address(pyinternals.raw_addresses['_PyThreadState_Current']),ops.ecx)
 
-        .mov(ops.Address(pyinternals.frame_globals_offset,ops.eax),ops.edx)
-        .mov(ops.Address(pyinternals.frame_builtins_offset,ops.eax),ops.ebx)
+        .mov(ops.Address(pyinternals.FRAME_GLOBALS_OFFSET,ops.eax),ops.edx)
+        .mov(ops.Address(pyinternals.FRAME_BUILTINS_OFFSET,ops.eax),ops.ebx)
 
         .push_stack(ops.edx)
         .push_stack(ops.ebx)
 
-        .mov(ops.Address(pyinternals.frame_locals_offset,ops.eax),ops.edx)
-        .lea(ops.Address(pyinternals.frame_localsplus_offset,ops.eax),ops.ebx)
+        .mov(ops.Address(pyinternals.FRAME_LOCALS_OFFSET,ops.eax),ops.edx)
+        .lea(ops.Address(pyinternals.FRAME_LOCALSPLUS_OFFSET,ops.eax),ops.ebx)
 
         .push_stack(ops.edx)
         .push_stack(ops.ebx)
 
-        .mov(ops.eax,ops.Address(pyinternals.threadstate_frame_offset,ops.ecx))
+        .mov(ops.eax,ops.Address(pyinternals.THREADSTATE_FRAME_OFFSET,ops.ecx))
     )
 
-    if pyinternals.ref_debug:
+    if pyinternals.REF_DEBUG:
         # a place to store %eax,%ecx and %edx when increasing reference counts
         # (which calls a function when ref_debug is True
         f.stack.offset += DEBUG_TEMPS
@@ -1706,9 +1706,9 @@ def compile_eval(code,op,tuning,local_name,entry_points):
         .add(stack_ptr_shift,ops.esp)
         .pop(ops.esi)
         .pop(ops.ebx)
-        .mov(ops.Address(pyinternals.frame_back_offset,ops.edx),ops.edx)
+        .mov(ops.Address(pyinternals.FRAME_BACK_OFFSET,ops.edx),ops.edx)
         .pop(ops.ebp)
-        .mov(ops.edx,ops.Address(pyinternals.threadstate_frame_offset,ops.ecx))
+        .mov(ops.edx,ops.Address(pyinternals.THREADSTATE_FRAME_OFFSET,ops.ecx))
         .ret()
     )
 

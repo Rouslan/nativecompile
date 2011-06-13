@@ -5,9 +5,9 @@ import atexit
 
 from . import pyinternals
 
-if pyinternals.architecture == "X86":
+if pyinternals.ARCHITECTURE == "X86":
     from .x86_compile import compile_raw
-elif pyinternals.architexture == "X86_64":
+elif pyinternals.ARCHITEXTURE == "X86_64":
     raise Exception("native compilation is not supported for the 64-bit version of Python")
 else:
     raise Exception("native compilation is not supported on this CPU")

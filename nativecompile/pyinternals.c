@@ -1241,23 +1241,23 @@ PyInit_pyinternals(void) {
     m = PyModule_Create(&this_module);
     if(!m) return NULL;
 
-    ADD_INT_OFFSET("refcnt_offset",PyObject,ob_refcnt);
-    ADD_INT_OFFSET("type_offset",PyObject,ob_type);
-    ADD_INT_OFFSET("var_size_offset",PyVarObject,ob_size);
-    ADD_INT_OFFSET("type_dealloc_offset",PyTypeObject,tp_dealloc);
-    ADD_INT_OFFSET("type_iternext_offset",PyTypeObject,tp_iternext);
-    ADD_INT_OFFSET("type_flags_offset",PyTypeObject,tp_flags);
-    ADD_INT_OFFSET("list_item_offset",PyListObject,ob_item);
-    ADD_INT_OFFSET("tuple_item_offset",PyTupleObject,ob_item);
-    ADD_INT_OFFSET("frame_back_offset",PyFrameObject,f_back);
-    ADD_INT_OFFSET("frame_builtins_offset",PyFrameObject,f_builtins);
-    ADD_INT_OFFSET("frame_globals_offset",PyFrameObject,f_globals);
-    ADD_INT_OFFSET("frame_locals_offset",PyFrameObject,f_locals);
-    ADD_INT_OFFSET("frame_localsplus_offset",PyFrameObject,f_localsplus);
-    ADD_INT_OFFSET("threadstate_frame_offset",PyThreadState,frame);
-    if(PyModule_AddStringConstant(m,"architecture",ARCHITECTURE) == -1) return NULL;
-    if(PyModule_AddObject(m,"ref_debug",PyBool_FromLong(REF_DEBUG_VAL)) == -1) return NULL;
-    if(PyModule_AddObject(m,"count_allocs",PyBool_FromLong(COUNT_ALLOCS_VAL)) == -1) return NULL;
+    ADD_INT_OFFSET("REFCNT_OFFSET",PyObject,ob_refcnt);
+    ADD_INT_OFFSET("TYPE_OFFSET",PyObject,ob_type);
+    ADD_INT_OFFSET("VAR_SIZE_OFFSET",PyVarObject,ob_size);
+    ADD_INT_OFFSET("TYPE_DEALLOC_OFFSET",PyTypeObject,tp_dealloc);
+    ADD_INT_OFFSET("TYPE_ITERNEXT_OFFSET",PyTypeObject,tp_iternext);
+    ADD_INT_OFFSET("TYPE_FLAGS_OFFSET",PyTypeObject,tp_flags);
+    ADD_INT_OFFSET("LIST_ITEM_OFFSET",PyListObject,ob_item);
+    ADD_INT_OFFSET("TUPLE_ITEM_OFFSET",PyTupleObject,ob_item);
+    ADD_INT_OFFSET("FRAME_BACK_OFFSET",PyFrameObject,f_back);
+    ADD_INT_OFFSET("FRAME_BUILTINS_OFFSET",PyFrameObject,f_builtins);
+    ADD_INT_OFFSET("FRAME_GLOBALS_OFFSET",PyFrameObject,f_globals);
+    ADD_INT_OFFSET("FRAME_LOCALS_OFFSET",PyFrameObject,f_locals);
+    ADD_INT_OFFSET("FRAME_LOCALSPLUS_OFFSET",PyFrameObject,f_localsplus);
+    ADD_INT_OFFSET("THREADSTATE_FRAME_OFFSET",PyThreadState,frame);
+    if(PyModule_AddStringConstant(m,"ARCHITECTURE",ARCHITECTURE) == -1) return NULL;
+    if(PyModule_AddObject(m,"REF_DEBUG",PyBool_FromLong(REF_DEBUG_VAL)) == -1) return NULL;
+    if(PyModule_AddObject(m,"COUNT_ALLOCS",PyBool_FromLong(COUNT_ALLOCS_VAL)) == -1) return NULL;
 
     
     addrs = PyDict_New();
