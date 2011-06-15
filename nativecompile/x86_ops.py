@@ -58,6 +58,16 @@ class Register:
         
         return NotImplemented
 
+    def __str__(self):
+        assert (not r.ext) and r.size < SIZE_Q
+        return '%' + [
+            ['al','cl','dl','bl','ah','ch','dh','bh'],
+            ['eax','ecx','edx','ebx','esp','ebp','esi','edi']
+        ][self.size][self.reg]
+
+Register.__mmtype__ = Register
+
+
 class Address:
     def __init__(self,offset=0,base=None,index=None,scale=1):
         assert scale in (1,2,4,8)
@@ -127,6 +137,8 @@ class Address:
 
     def offset_only(self):
         return self.base is None and self.index is None and self.scale == 1
+
+Address.__mmtype__ = Address
 
 
 class Displacement:
@@ -202,23 +214,16 @@ class Test:
         return ['o','no','b','nb','e','ne','be','a','s','ns','p','np','l','ge','le','g'][self.val]
 
 
-def reg_str(r):
-    assert (not r.ext) and r.size < SIZE_Q
-    return '%' + [
-        ['al','cl','dl','bl','ah','ch','dh','bh'],
-        ['eax','ecx','edx','ebx','esp','ebp','esi','edi']
-    ][r.size][r.reg]
+
 
 def asm_str(indirect,nextaddr,x):
     if isinstance(x,int):
         return '${:#x}'.format(x)
     if isinstance(x,Displacement):
         return '{:x}'.format(x.val + nextaddr)
-
-    val = reg_str(x) if isinstance(x,Register) else str(x)
     if indirect and isinstance(x,(Address,Register)):
-        return '*'+val
-    return val
+        return '*'+str(x)
+    return str(x)
 
 
 class AsmSequence:
@@ -406,13 +411,13 @@ CALL_DISP_LEN = 5
 @multimethod
 def call(proc : Register):
     assert proc.w
-    return rex(proc,None) + bytes([
+    return rex(proc,None,False) + bytes([
         0b11111111,
         0b11010000 | proc.reg])
 
 @multimethod
 def call(proc : Address):
-    return rex(None,proc) + bytes([0b11111111]) + proc.mod_rm_sib_disp(0b010)
+    return rex(None,proc,False) + bytes([0b11111111]) + proc.mod_rm_sib_disp(0b010)
 
 
 @multimethod
@@ -650,33 +655,36 @@ def ret(pop : int):
 
 
 def shx_imm_reg(amount,x,shiftright):
+    r = rex(None,x)
+
     if amount == 1:
-        return bytes([
+        return r + bytes([
             0b11010000 | x.w,
             0b11100000 | (shiftright << 3) | x.reg])
     
-    return bytes([
+    return r + bytes([
         0b11000000 | x.w,
         0b11100000 | (shiftright << 3) | x.reg]) + immediate_data(False,amount)
 
 def shx_reg_reg(amount,x,shiftright):
-    assert amount is cl
+    assert amount == cl
     
-    return bytes([
+    return rex(None,x) + bytes([
         0b11010010 | x.w,
         0b11100000 | (shiftright << 3) | x.reg])
 
 def shx_imm_addr(amount,x,w,shiftright):
+    r = rex(None,x)
     rmsd = x.mod_rm_sib_disp(0b100 | shiftright)
     if amount == 1:
-        return bytes([0b11010000 | w]) + rmsd
+        return r + bytes([0b11010000 | w]) + rmsd
     
-    return bytes([0b11000000 | w]) + rmsd + immediate_data(False,amount)
+    return r + bytes([0b11000000 | w]) + rmsd + immediate_data(False,amount)
 
 def shx_reg_addr(amount,x,w,shiftright):
-    assert amount is cl
+    assert amount == cl
     
-    return bytes([0b11010010 | w]) + x.mod_rm_sib_disp(0b100 | shiftright)
+    return rex(None,x) + bytes([0b11010010 | w]) + x.mod_rm_sib_disp(0b100 | shiftright)
 
 
 @multimethod
@@ -770,7 +778,7 @@ def test(a : int,b : Register):
     return _op_imm_reg(0b11110110,0,0b10101000,a,b)
 
 def test_imm_addr(a,b,w):
-    return bytes([0b11110110 | w]) + b.mod_rm_sib_disp(0) + immedate_data(w,a)
+    return rex(None,b) + bytes([0b11110110 | w]) + b.mod_rm_sib_disp(0) + immedate_data(w,a)
 
 @multimethod
 def testb(a : int,b : Address):

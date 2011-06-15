@@ -1,11 +1,32 @@
 
 import .x86_ops
-from .x86_ops import Address,Register,al,cl,dl,bl,eax,ecx,edx,ebx,esp,ebp,esi,edi,test_O,test_NO,test_B,test_NB,test_E,test_Z,test_NE,test_NZ,test_BE,test_A,test_S,test_NS,test_P,test_NP,test_L,test_GE,test_LE,test_G
+from .x86_ops import (
+    Displacement,Test,AsmSequence,Assembly,al,cl,dl,bl,eax,ecx,edx,ebx,esp,ebp,
+    esi,edi,test_O,test_NO,test_B,test_NB,test_E,test_Z,test_NE,test_NZ,test_BE,
+    test_A,test_S,test_NS,test_P,test_NP,test_L,test_GE,test_LE,test_G,add,addb,
+    addl,cmp,cmpb,cmpl,decb,decl,incb,incl,jcc,JCC_MIN_LEN,JCC_MAX_LEN,jo,jno,
+    jb,jnb,je,jz,jne,jnz,jbe,ja,js,jns,jp,jnp,jl,jge,jle,jg,jmp,lea,leave,loop,
+    loopz,loope,loopnz,loopne,mov,movb,movl,nop,pop,ret,shl,shlb,shll,shr,shrb,
+    shrl,sub,subb,subl,test,testb,testl,xor,xorb,xorl,CALL_DISP_LEN,JCC_MIN_LEN,
+    JCC_MAX_LEN,JMP_DISP_MIN_LEN,JMP_DISP_MAX_LEN,LOOP_LEN
+)
 
 
 
 def immediate_data(w,data):
     return data.to_bytes(8 if w else 1,byteorder='little',signed=data<0)
+
+
+class Register(x86_ops.Register):
+    def __str__(self):
+        return '%' + [
+            ['al','cl','dl','bl','spl','bpl','sil','dil',
+             'r8b','r9b','r10b','r11b','r12b','r13b','r14b','r15b'],
+            ['eax','ecx','edx','ebx','esp','ebp','esi','edi',
+             'r8d','r9d','r10d','r11d','r12d','r13d','r14d','r15d'],
+            ['rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi',
+             'r8','r9','r10','r11','r12','r13','r14','r15']
+        ][self.size][self.code]
 
 
 spl = x86_ops.ah
@@ -47,19 +68,46 @@ r13 = Register(SIZE_Q,0b1101)
 r14 = Register(SIZE_Q,0b1110)
 r15 = Register(SIZE_Q,0b1111)
 
+class _Rip:
+    size = SIZE_Q
 
-def reg_str(r):
-    return '%' + [
-        ['al','cl','dl','bl','spl','bpl','sil','dil',
-         'r8b','r9b','r10b','r11b','r12b','r13b','r14b','r15b'],
-        ['eax','ecx','edx','ebx','esp','ebp','esi','edi',
-         'r8d','r9d','r10d','r11d','r12d','r13d','r14d','r15d'],
-        ['rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi',
-         'r8','r9','r10','r11','r12','r13','r14','r15']
-    ][r.size][r.code]
+rip = _Rip()
 
 
+class Address(x86_ops.Address):
+    def __init__(self,offset=0,base=None,index=None,scale=1):
+        self.rip = False
+        if base is rip:
+            assert index is None
+            self.rip = True
+            base = None
 
+        super().__init__(offset,base,index,scale)
+
+    def _mod_rm_sib_disp(self):
+        if self.rip or self.base or self.index:
+            return super()._mod_rm_sib_disp()
+
+        return 0b00, 0b100, bytes([0b10110000]) + int_to_32(self.offset)
+
+
+
+
+@multimethod
+def call(proc : Displacement):
+    return x86_ops.call(proc)
+
+CALL_DISP_LEN = 5
+
+@multimethod
+def call(proc : Register):
+    assert proc.size == SIZE_Q
+    return x86_ops.call(proc))
+
+@multimethod
+def call(proc : Address):
+    assert x.size is None or x.size == SIZE_Q
+    return x86_ops.call(proc)
 
 
 
@@ -82,10 +130,12 @@ def inc(x : Register):
 
 @multimethod
 def push(x : Register):
+    assert x.size == SIZE_Q
     return x86_ops.push(x)
 
 @multimethod
 def push(x : Address):
+    assert x.size is None or x.size == SIZE_Q
     return x86_ops.push(x)
 
 @multimethod
