@@ -15,8 +15,9 @@ PRINT_STACK_OFFSET = False
 
 CALL_ALIGN_MASK = 0xf
 MAX_ARGS = 4
-PRE_STACK = 4
+PRE_STACK = 2
 DEBUG_TEMPS = 3
+STACK_EXTRA = 1
 
 
 TPFLAGS_INT_SUBCLASS = 1<<23
@@ -89,7 +90,7 @@ class StackManager:
         self.resets = []
 
     def check_stack_space(self):
-        if (self.__offset + self.args) * self.abi.ptr_size > self.local_mem_size:
+        if (self.__offset + max(self.args-len(self.abi.r_arg),0)) * self.abi.ptr_size > self.local_mem_size:
             raise NCSystemError("Not enough stack space was reserved. This is either a bug or the code object being compiled has an incorrect value for co_stack_size.")
 
     def get_offset(self):
@@ -462,7 +463,7 @@ class Frame:
         self.rtargets = {}
 
 
-        a = itertools.count(abi.ptr_size * (1 - PRE_STACK),-abi.ptr_size)
+        a = itertools.count(abi.ptr_size * -4,-abi.ptr_size)
         self.GLOBALS = self.Address(next(a),abi.r_bp)
         self.BUILTINS = self.Address(next(a),abi.r_bp)
         self.LOCALS = self.Address(next(a),abi.r_bp)
@@ -747,7 +748,7 @@ class Stitch:
         else:
             after = JumpTarget()
             self.code += [
-                JumpSource(partial(self.f.op.jcc,self.f.abi,~test),after)
+                JumpSource(partial(self.f.op.jcc,~test),self.f.abi,after)
             ] + destitch(opcodes) + [
                 after
             ]
@@ -1640,14 +1641,16 @@ def compile_eval(code,op,abi,tuning,local_name,entry_points):
     #     - return address
     #     - old value of ebp
     #     - old value of ebx
+    #     - old value of esi
+    #     - Frame object
     #     - GLOBALS
     #     - BUILTINS
     #     - LOCALS
     #     - FAST_LOCALS
     #
-    # the first 3 will already be on the stack by the time %esp is adjusted
+    # the first 2 will already be on the stack by the time %esp is adjusted
 
-    stack_first = 4
+    stack_first = 7
 
     if pyinternals.REF_DEBUG:
         # a place to store %eax,%ecx and %edx when increasing reference counts
@@ -1655,9 +1658,15 @@ def compile_eval(code,op,abi,tuning,local_name,entry_points):
         stack_first += DEBUG_TEMPS
 
     local_stack_size = aligned_size(
-        (code.co_stacksize + max(MAX_ARGS-len(abi.r_arg),0) + PRE_STACK + stack_first) * abi.ptr_size + abi.shadow)
+        (code.co_stacksize + 
+         max(MAX_ARGS-len(abi.r_arg),0) + 
+         PRE_STACK + 
+         stack_first + 
+         STACK_EXTRA) * abi.ptr_size + abi.shadow)
 
-    stack_ptr_shift = local_stack_size - PRE_STACK * abi.ptr_size
+    # +2 for the two registers pushed onto the stack after saving the old stack
+    # pointer
+    stack_ptr_shift = local_stack_size - (PRE_STACK+2) * abi.ptr_size
 
     f = Frame(op,abi,tuning,local_stack_size,code,local_name,entry_points)
 
@@ -1668,36 +1677,38 @@ def compile_eval(code,op,abi,tuning,local_name,entry_points):
         .push(f.r_pres[1])
         .sub(stack_ptr_shift,abi.r_sp)
     )
-    f.stack.offset = PRE_STACK
+    f.stack.offset = PRE_STACK+2
 
     argreg = f.stack.arg_reg(n=0)
     (opcodes
+        .mov(f.stack.func_arg(0),f.r_pres[0])
         .lea(f.stack[-1],argreg)
         .movl(0,f.stack[-1])
         .invoke('_EnterRecursiveCall',argreg)
         .check_err(True)
-
-        .mov(f.stack.func_arg(0),f.r_ret)
 
         # as far as I can tell, after expanding the macros and removing the
         # "dynamic annotations" (see dynamic_annotations.h in the CPython
         # headers), this is all that PyThreadState_GET boils down to:
         .mov(f.Address(pyinternals.raw_addresses['_PyThreadState_Current']),f.r_scratch[0])
 
-        .mov(f.Address(pyinternals.FRAME_GLOBALS_OFFSET,f.r_ret),f.r_scratch[1])
-        .mov(f.Address(pyinternals.FRAME_BUILTINS_OFFSET,f.r_ret),f.r_pres[0])
+        .mov(f.Address(pyinternals.FRAME_GLOBALS_OFFSET,f.r_pres[0]),f.r_scratch[1])
+        .mov(f.Address(pyinternals.FRAME_BUILTINS_OFFSET,f.r_pres[0]),f.r_ret)
+
+        .push_stack(f.r_pres[0])
+        .push_stack(f.r_scratch[1])
+        .push_stack(f.r_ret)
+
+        .mov(f.Address(pyinternals.FRAME_LOCALS_OFFSET,f.r_pres[0]),f.r_scratch[1])
+        .lea(f.Address(pyinternals.FRAME_LOCALSPLUS_OFFSET,f.r_pres[0]),f.r_ret)
 
         .push_stack(f.r_scratch[1])
-        .push_stack(f.r_pres[0])
+        .push_stack(f.r_ret)
 
-        .mov(f.Address(pyinternals.FRAME_LOCALS_OFFSET,f.r_ret),f.r_scratch[1])
-        .lea(f.Address(pyinternals.FRAME_LOCALSPLUS_OFFSET,f.r_ret),f.r_pres[0])
-
-        .push_stack(f.r_scratch[1])
-        .push_stack(f.r_pres[0])
-
-        .mov(f.r_ret,f.Address(pyinternals.THREADSTATE_FRAME_OFFSET,f.r_scratch[0]))
+        .mov(f.r_pres[0],f.Address(pyinternals.THREADSTATE_FRAME_OFFSET,f.r_scratch[0]))
     )
+
+    cframe = f.Address(-3*f.ptr_size,f.abi.r_bp)
 
     if pyinternals.REF_DEBUG:
         # a place to store %eax,%ecx and %edx when increasing reference counts
@@ -1749,6 +1760,9 @@ def compile_eval(code,op,abi,tuning,local_name,entry_points):
     jlen = -(len(dr) + len(cmpjl) + f.JCC_MIN_LEN)
     assert jlen <= 127
     cmpjl += f.op.jb(f.Displacement(jlen))
+
+    # have to compensate for subtracting from the base pointer below
+    cframe.offset += f.ptr_size * stack_prolog
     
     # call Py_DECREF on anything left on the stack and return %eax
     (opcodes
@@ -1761,7 +1775,7 @@ def compile_eval(code,op,abi,tuning,local_name,entry_points):
         .call('_LeaveRecursiveCall')
         .mov(f.Address(base=abi.r_bp),f.r_ret)
         .mov(f.Address(pyinternals.raw_addresses['_PyThreadState_Current']),f.r_scratch[0])
-        .mov(f.stack.func_arg(0),f.r_scratch[1])
+        .mov(cframe,f.r_scratch[1])
         .add(stack_ptr_shift,abi.r_sp)
         .pop(f.r_pres[1])
         .pop(f.r_pres[0])

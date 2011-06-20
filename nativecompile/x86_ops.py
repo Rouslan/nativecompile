@@ -59,7 +59,7 @@ class Register:
         return NotImplemented
 
     def __str__(self):
-        assert (not r.ext) and r.size < SIZE_Q
+        assert (not self.ext) and self.size < SIZE_Q
         return '%' + [
             ['al','cl','dl','bl','ah','ch','dh','bh'],
             ['eax','ecx','edx','ebx','esp','ebp','esi','edi']
@@ -281,15 +281,17 @@ class AsmSequence:
 
 
 class Assembly:
-    @staticmethod
-    def op(name,*args):
-        return AsmSequence([(globals()[name](*args),name,args)])
+    def op(self,name,*args):
+        return AsmSequence([(self.binary(name)(*args),name,args)])
+
+    def binary(self,name):
+        return globals()[name]
     
     def __getattr__(self,name):
-        return partial(Assembly.op,name)
+        return partial(self.op,name)
     
     def jcc(self,test,x):
-        return Assembly.op('j'+test.mnemonic,x)
+        return self.op('j'+test.mnemonic,x)
 
     def comment(self,comm):
         return AsmSequence([(b'','$COMMENT$',comm)])
@@ -411,7 +413,7 @@ CALL_DISP_LEN = 5
 @multimethod
 def call(proc : Register):
     assert proc.w
-    return rex(proc,None,False) + bytes([
+    return rex(None,proc,False) + bytes([
         0b11111111,
         0b11010000 | proc.reg])
 
@@ -599,10 +601,10 @@ def mov(a : Register,b : Address):
 
 @multimethod
 def mov(a : int,b : Register):
-    return bytes([0b10110000 | (b.w << 3) | b.reg]) + immediate_data(b.w,a)
+    return rex(None,b) + bytes([0b10110000 | (b.w << 3) | b.reg]) + immediate_data(b.w,a)
 
 def mov_imm_addr(a,b,w):
-    return bytes([0b11000110 | w]) + b.mod_rm_sib_disp(0) + immediate_data(w,a)
+    return rex(None,b) + bytes([0b11000110 | w]) + b.mod_rm_sib_disp(0) + immediate_data(w,a)
 
 @multimethod
 def movb(a : int,b : Address):

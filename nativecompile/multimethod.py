@@ -3,6 +3,7 @@
 
 import inspect
 
+
 registry = {}
 
 
@@ -11,6 +12,7 @@ registry = {}
 # complete solution but it's enough for this package).
 def mmtype(x):
     return getattr(x,'__mmtype__',x)
+
 
 class MultiMethod(object):
     def __init__(self, name):
@@ -29,12 +31,19 @@ class MultiMethod(object):
             raise TypeError("duplicate registration")
         self.typemap[types] = function
 
+    def inherit(self,b):
+        """Add all overloads from b that this multimethod doesn't already
+        define."""
+
+        for k,v in b.typemap.items():
+            self.typemap.setdefault(k,v)
+
 
 def multimethod(function):
-    name = function.__name__
-    mm = registry.get(name)
+    i = (id(function.__globals__),function.__name__)
+    mm = registry.get(i)
     if mm is None:
-        mm = registry[name] = MultiMethod(name)
+        mm = registry[i] = MultiMethod(function.__name__)
     types = tuple(mmtype(function.__annotations__[arg]) for arg in inspect.getfullargspec(function)[0])
     mm.register(types, function)
     return mm

@@ -9,7 +9,7 @@ from .compile import compile_raw
 
 if pyinternals.ARCHITECTURE == "X86":
     from .x86_abi import CdeclAbi as Abi
-elif pyinternals.ARCHITEXTURE == "X86_64":
+elif pyinternals.ARCHITECTURE == "X86_64":
     from . import x86_64_abi
     if sys.platform in ('win32','cygwin'):
         Abi = x86_64_abi.MicrosoftX64Abi
@@ -39,4 +39,7 @@ def compile(code):
     return pyinternals.CompiledCode(f.name,code,entry_points)
 
 
+def compile_asm(code):
+    """Compile code and return the assembly representation"""
+    return compile_raw(code,Abi,binary=False)[0].dump()
 

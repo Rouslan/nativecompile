@@ -1,14 +1,15 @@
 
-import .x86_ops
+from . multimethod import multimethod
+from . import x86_ops
 from .x86_ops import (
-    Displacement,Test,AsmSequence,Assembly,al,cl,dl,bl,eax,ecx,edx,ebx,esp,ebp,
-    esi,edi,test_O,test_NO,test_B,test_NB,test_E,test_Z,test_NE,test_NZ,test_BE,
-    test_A,test_S,test_NS,test_P,test_NP,test_L,test_GE,test_LE,test_G,add,addb,
-    addl,cmp,cmpb,cmpl,decb,decl,incb,incl,jcc,JCC_MIN_LEN,JCC_MAX_LEN,jo,jno,
-    jb,jnb,je,jz,jne,jnz,jbe,ja,js,jns,jp,jnp,jl,jge,jle,jg,jmp,lea,leave,loop,
-    loopz,loope,loopnz,loopne,mov,movb,movl,nop,pop,ret,shl,shlb,shll,shr,shrb,
-    shrl,sub,subb,subl,test,testb,testl,xor,xorb,xorl,CALL_DISP_LEN,JCC_MIN_LEN,
-    JCC_MAX_LEN,JMP_DISP_MIN_LEN,JMP_DISP_MAX_LEN,LOOP_LEN
+    Displacement,Test,AsmSequence,al,cl,dl,bl,eax,ecx,edx,ebx,esp,ebp,esi,edi,
+    test_O,test_NO,test_B,test_NB,test_E,test_Z,test_NE,test_NZ,test_BE,test_A,
+    test_S,test_NS,test_P,test_NP,test_L,test_GE,test_LE,test_G,add,addb,addl,
+    cmp,cmpb,cmpl,decb,decl,incb,incl,jcc,JCC_MIN_LEN,JCC_MAX_LEN,jo,jno,jb,jnb,
+    je,jz,jne,jnz,jbe,ja,js,jns,jp,jnp,jl,jge,jle,jg,jmp,lea,leave,loop,loopz,
+    loope,loopnz,loopne,mov,movb,movl,nop,pop,ret,shl,shlb,shll,shr,shrb,shrl,
+    sub,subb,subl,test,testb,testl,xor,xorb,xorl,CALL_DISP_LEN,JCC_MIN_LEN,
+    JCC_MAX_LEN,JMP_DISP_MIN_LEN,JMP_DISP_MAX_LEN,LOOP_LEN,SIZE_B,SIZE_D,SIZE_Q
 )
 
 
@@ -88,8 +89,12 @@ class Address(x86_ops.Address):
         if self.rip or self.base or self.index:
             return super()._mod_rm_sib_disp()
 
-        return 0b00, 0b100, bytes([0b10110000]) + int_to_32(self.offset)
+        return 0b00, 0b100, bytes([0b00100101]) + x86_ops.int_to_32(self.offset)
 
+
+class Assembly(x86_ops.Assembly):
+    def binary(self,name):
+        return globals()[name]
 
 
 
@@ -97,16 +102,14 @@ class Address(x86_ops.Address):
 def call(proc : Displacement):
     return x86_ops.call(proc)
 
-CALL_DISP_LEN = 5
-
 @multimethod
 def call(proc : Register):
     assert proc.size == SIZE_Q
-    return x86_ops.call(proc))
+    return x86_ops.call(proc)
 
 @multimethod
 def call(proc : Address):
-    assert x.size is None or x.size == SIZE_Q
+    assert proc.size is None or proc.size == SIZE_Q
     return x86_ops.call(proc)
 
 
@@ -126,6 +129,15 @@ def inc(x : Register):
         0b11000000 | x.reg])
 
 
+
+@multimethod
+def mov(a : int,b : Register):
+    if b.size == SIZE_Q:
+        return x86_ops.rex(None,b) + bytes([0b10111000 | b.reg]) + immediate_data(True,a)
+
+    return x86_ops.mov(a,b)
+
+mov.inherit(x86_ops.mov)
 
 
 @multimethod
