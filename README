@@ -58,6 +58,9 @@ RAISE_VARARGS
 BUILD_MAP
 STORE_MAP
 MAP_ADD
+LOAD_BUILD_CLASS
+STORE_LOCALS
+STORE_ATTR
 
 BINARY_ADD and INPLACE_ADD are also implemented but currently lack an
 optimization on strings that CPython normally does.

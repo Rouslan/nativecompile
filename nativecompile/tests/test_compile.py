@@ -122,6 +122,20 @@ a,b,c = x
 print(a,b,c)
 ''')
 
+    def test_class(self):
+        self.compare_exec('''
+class Thingy:
+    a = 9
+    def __init__(self,hi='go away'):
+        self.hi = hi
+    
+    def __str__(self):
+        return str(self.hi)
+
+thing = Thingy()
+print(thing)
+''')
+
 
 if __name__ == '__main__':
     unittest.main()

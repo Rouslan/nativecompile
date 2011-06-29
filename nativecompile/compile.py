@@ -18,6 +18,7 @@ MAX_ARGS = 4
 PRE_STACK = 2
 DEBUG_TEMPS = 3
 STACK_EXTRA = 1
+SAVED_REGS = 2 # the number of registers saved *after* %ebp
 
 
 TPFLAGS_INT_SUBCLASS = 1<<23
@@ -91,7 +92,7 @@ class StackManager:
 
     def check_stack_space(self):
         if (self.__offset + max(self.args-len(self.abi.r_arg),0)) * self.abi.ptr_size > self.local_mem_size:
-            raise NCSystemError("Not enough stack space was reserved. This is either a bug or the code object being compiled has an incorrect value for co_stack_size.")
+            raise NCSystemError("Not enough stack space was reserved. This is either a bug or the code object being compiled has an incorrect value for co_stacksize.")
 
     def get_offset(self):
         return self.__offset
@@ -463,7 +464,8 @@ class Frame:
         self.rtargets = {}
 
 
-        a = itertools.count(abi.ptr_size * -4,-abi.ptr_size)
+        a = itertools.count(abi.ptr_size * -(SAVED_REGS+1),-abi.ptr_size)
+        self.FRAME = self.Address(next(a),abi.r_bp)
         self.GLOBALS = self.Address(next(a),abi.r_bp)
         self.BUILTINS = self.Address(next(a),abi.r_bp)
         self.LOCALS = self.Address(next(a),abi.r_bp)
@@ -633,6 +635,7 @@ def get_abi_ops_x(x):
 
 for x in (
         'Address',
+        'Register',
         'Displacement',
         'test_E',
         'test_Z',
@@ -663,6 +666,10 @@ def arg1_as_subscr(func):
             return partial(func,self.inst,arg1)
 
     return property(inner)
+
+
+def strs_to_addrs(func):
+    return lambda *args: func(*map(raw_addr_if_str,args))
 
 
 def destitch(x):
@@ -703,32 +710,52 @@ class Stitch:
         self.f.stack.offset += n
         return self
 
-    def inc_or_add(self,x):
-        self.code.append(self.f.inc_or_add(x))
-        return self
-
-    def incb_or_addb(self,x):
-        self.code.append(self.f.incb_or_addb(x))
-        return self
-
-    def incl_or_addl(self,x):
-        self.code.append(self.f.incl_or_addl(x))
-        return self
-
-    def dec_or_sub(self,x):
-        self.code.append(self.f.dec_or_sub(x))
-        return self
-
-    def decb_or_subb(self,x):
-        self.code.append(self.f.decb_or_subb(x))
-        return self
-
-    def decl_or_subl(self,x):
-        self.code.append(self.f.decl_or_subl(x))
-        return self
-
     def call(self,x):
         self.code += self.f.stack.call(x)
+        return self
+
+    @strs_to_addrs
+    def add(self,a,b):
+        if a == 1 and not self.f.tuning.prefer_addsub_over_incdec:
+            if isinstance(b,self.f.Address):
+                c = self.f.op.incl(b)
+            else:
+                c = self.f.op.inc(b)
+        else:
+            if isinstance(a,int) and isinstance(b,self.f.Address):
+                c = self.f.op.addl(a,b)
+            else:
+                c = self.f.op.add(a,b)
+
+        self.code.append(c)
+        return self
+
+    @strs_to_addrs
+    def sub(self,a,b):
+        if a == 1 and not self.f.tuning.prefer_addsub_over_incdec:
+            if isinstance(b,self.f.Address):
+                c = self.f.op.decl(b)
+            else:
+                c = self.f.op.dec(b)
+        else:
+            if isinstance(a,int) and isinstance(b,self.f.Address):
+                c = self.f.op.subl(a,b)
+            else:
+                c = self.f.op.sub(a,b)
+
+        self.code.append(c)
+        return self
+
+    @strs_to_addrs
+    def mov(self,a,b):
+        if a == 0 and isinstance(b,self.f.Register):
+            c = self.f.op.xor(b,b)
+        elif isinstance(a,int) and isinstance(b,self.f.Address):
+            c = self.f.op.movl(a,b)
+        else:
+            c = self.f.op.mov(a,b)
+
+        self.code.append(c)
         return self
 
     def if_eax_is_zero(self,opcodes):
@@ -780,8 +807,9 @@ class Stitch:
 
     def __getattr__(self,name):
         func = getattr(self.f.op,name)
+        @strs_to_addrs
         def inner(*args):
-            self.code.append(func(*map(raw_addr_if_str,args)))
+            self.code.append(func(*args))
             return self
         return inner
 
@@ -1107,7 +1135,7 @@ def _op_pop_jump_if_(f,to,state):
         .test(f.r_ret,f.r_ret)
         (JumpSource(jop1,f.abi,dont_jump))
         (f.jump_to(jop2,f.JCC_MAX_LEN,to))
-        .xor(f.r_ret,f.r_ret)
+        .mov(0,f.r_ret)
         .goto_end()
         (dont_jump)
     )
@@ -1140,7 +1168,7 @@ def _op_BUILD_(f,items,new,item_offset,deref):
                 (r
                     .mov(f.Address(item_offset,f.r_ret),f.r_pres[0])
                     .push_stack(f.r_ret)
-                    .xor(f.r_ret,f.r_ret)
+                    .mov(0,f.r_ret)
                 )
 
                 top.index = f.r_ret
@@ -1150,7 +1178,7 @@ def _op_BUILD_(f,items,new,item_offset,deref):
                     f.op.mov(f.r_scratch[1],f.Address(-f.ptr_size,f.r_pres[0],f.r_scratch[0],f.ptr_size)) +
                     f.inc_or_add(f.r_ret))
             else:
-                r.xor(f.r_pres[0],f.r_pres[0])
+                r.mov(0,f.r_pres[0])
 
                 top.index = f.r_pres[0]
 
@@ -1291,9 +1319,9 @@ def _op_UNPACK_SEQUENCE(f,arg):
             .mov(f.Address(pyinternals.TUPLE_ITEM_OFFSET-f.ptr_size,f.r_pres[0],f.r_scratch[0],f.ptr_size),f.r_scratch[1])
             .incref(f.r_scratch[1])
             .mov(f.r_scratch[1],s_top)
-            .inc_or_add(f.r_ret).code)
+            .add(1,f.r_ret).code)
         (r
-            .xor(f.r_ret,f.r_ret)
+            .mov(0,f.r_ret)
             .mov(arg,f.r_scratch[0])
             (body)
             .loop(f.Displacement(-len(body) - f.LOOP_LEN)))
@@ -1324,11 +1352,11 @@ def _op_UNPACK_SEQUENCE(f,arg):
             .mov(f.Address(-f.ptr_size,f.r_scratch[1],f.r_scratch[0],f.ptr_size),f.r_ret)
             .incref(f.r_ret)
             .mov(f.r_ret,s_top)
-            .inc_or_add(f.r_pres[0]).code)
+            .add(1,f.r_pres[0]).code)
         (r
             .mov(f.r_pres[0],seq_store)
             .mov(arg,f.r_scratch[0])
-            .xor(f.r_pres[0],f.r_pres[0])
+            .mov(0,f.r_pres[0])
             (body)
             .loop(f.Displacement(-(len(body) + f.LOOP_LEN)))
             .mov(seq_store,f.r_pres[0]))
@@ -1412,7 +1440,7 @@ def _op_COMPARE_OP(f,arg):
         temp = f.stack[-1]
         return (r
             .cmp(f.r_scratch[1],f.stack[0])
-            .movl(outcome_a,temp)
+            .mov(outcome_a,temp)
             .if_cond[f.test_E](
                 f.op.movl(outcome_b,temp)
             )
@@ -1432,7 +1460,7 @@ def _op_COMPARE_OP(f,arg):
             .invoke('PySequence_Contains',tos,f.stack[1])
             .test(f.r_ret,f.r_ret)
             .if_cond[f.test_L](f()
-                .xor(f.r_ret,f.r_ret)
+                .mov(0,f.r_ret)
                 .goto_end()
             )
             .mov(outcome_a,f.r_ret)
@@ -1537,6 +1565,50 @@ def _op_STORE_MAP(f):
 def _op_MAP_ADD(f,arg):
     return _op_map_store_add(arg-1,f)
 
+@handler
+def _op_LOAD_BUILD_CLASS(f):
+    return (f()
+        .push_tos(True)
+        .invoke('PyDict_GetItemString',f.BUILTINS,'__build_class__')
+        .if_eax_is_zero(f()
+            .invoke('PyErr_SetString','PyExc_ImportError','BUILD_CLASS_ERROR_MSG')
+            .goto_end()
+        )
+        .incref()
+   )
+
+@handler
+def _op_STORE_LOCALS(f):
+    return (f()
+        .push_tos()
+        .mov(f.LOCALS,f.r_ret)
+        .if_eax_is_not_zero(
+            join(f.decref())
+        )
+        .pop_stack(f.r_ret)
+        .mov(f.FRAME,f.r_scratch[0])
+        .mov(f.r_ret,f.LOCALS)
+        .mov(f.r_ret,f.Address(pyinternals.FRAME_LOCALS_OFFSET,f.r_scratch[0]))
+    )
+
+@hasname
+def _op_STORE_ATTR(f,name):
+    tos = f.stack.tos()
+    return (f()
+        .push_tos()
+        .invoke('PyObject_SetAttr',tos,address_of(name),f.stack[1])
+        .mov(f.r_ret,f.r_pres[0])
+        .pop_stack(f.r_ret)
+        .decref()
+        .pop_stack(f.r_ret)
+        .decref()
+        .test(f.r_pres[0],f.r_pres[0])
+        .if_cond[f.test_NZ](f()
+            .mov(0,f.r_ret)
+            .goto_end()
+        )
+    )
+
 
 
 def join(x):
@@ -1639,9 +1711,9 @@ def compile_eval(code,op,abi,tuning,local_name,entry_points):
 
     # the stack will have following items:
     #     - return address
-    #     - old value of ebp
-    #     - old value of ebx
-    #     - old value of esi
+    #     - old value of %ebp
+    #     - old value of %ebx
+    #     - old value of %esi
     #     - Frame object
     #     - GLOBALS
     #     - BUILTINS
@@ -1664,9 +1736,7 @@ def compile_eval(code,op,abi,tuning,local_name,entry_points):
          stack_first + 
          STACK_EXTRA) * abi.ptr_size + abi.shadow)
 
-    # +2 for the two registers pushed onto the stack after saving the old stack
-    # pointer
-    stack_ptr_shift = local_stack_size - (PRE_STACK+2) * abi.ptr_size
+    stack_ptr_shift = local_stack_size - (PRE_STACK+SAVED_REGS) * abi.ptr_size
 
     f = Frame(op,abi,tuning,local_stack_size,code,local_name,entry_points)
 
@@ -1677,13 +1747,13 @@ def compile_eval(code,op,abi,tuning,local_name,entry_points):
         .push(f.r_pres[1])
         .sub(stack_ptr_shift,abi.r_sp)
     )
-    f.stack.offset = PRE_STACK+2
+    f.stack.offset = PRE_STACK+SAVED_REGS
 
     argreg = f.stack.arg_reg(n=0)
     (opcodes
         .mov(f.stack.func_arg(0),f.r_pres[0])
         .lea(f.stack[-1],argreg)
-        .movl(0,f.stack[-1])
+        .mov(0,f.stack[-1])
         .invoke('_EnterRecursiveCall',argreg)
         .check_err(True)
 
@@ -1708,7 +1778,6 @@ def compile_eval(code,op,abi,tuning,local_name,entry_points):
         .mov(f.r_pres[0],f.Address(pyinternals.THREADSTATE_FRAME_OFFSET,f.r_scratch[0]))
     )
 
-    cframe = f.Address(-3*f.ptr_size,f.abi.r_bp)
 
     if pyinternals.REF_DEBUG:
         # a place to store %eax,%ecx and %edx when increasing reference counts
@@ -1762,7 +1831,7 @@ def compile_eval(code,op,abi,tuning,local_name,entry_points):
     cmpjl += f.op.jb(f.Displacement(jlen))
 
     # have to compensate for subtracting from the base pointer below
-    cframe.offset += f.ptr_size * stack_prolog
+    f.FRAME.offset += f.ptr_size * stack_prolog
     
     # call Py_DECREF on anything left on the stack and return %eax
     (opcodes
@@ -1775,7 +1844,7 @@ def compile_eval(code,op,abi,tuning,local_name,entry_points):
         .call('_LeaveRecursiveCall')
         .mov(f.Address(base=abi.r_bp),f.r_ret)
         .mov(f.Address(pyinternals.raw_addresses['_PyThreadState_Current']),f.r_scratch[0])
-        .mov(cframe,f.r_scratch[1])
+        .mov(f.FRAME,f.r_scratch[1])
         .add(stack_ptr_shift,abi.r_sp)
         .pop(f.r_pres[1])
         .pop(f.r_pres[0])

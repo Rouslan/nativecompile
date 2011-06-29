@@ -55,6 +55,7 @@
 #define NO_LOCALS_LOAD_MSG "no locals when loading %R"
 #define NO_LOCALS_STORE_MSG "no locals found when storing %R"
 #define NO_LOCALS_DELETE_MSG "no locals when deleting %R"
+#define BUILD_CLASS_ERROR_MSG "__build_class__ not found"
 
 
 static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kwds);
@@ -1269,12 +1270,14 @@ PyInit_pyinternals(void) {
     ADD_ADDR(Py_DecRef)
     ADD_ADDR(PyDict_GetItem)
     ADD_ADDR(PyDict_SetItem)
+    ADD_ADDR(PyDict_GetItemString)
     ADD_ADDR(_PyDict_NewPresized)
     ADD_ADDR(PyObject_GetItem)
     ADD_ADDR(PyObject_SetItem)
     ADD_ADDR(PyObject_DelItem)
     ADD_ADDR(PyObject_GetIter)
     ADD_ADDR(PyObject_GetAttr)
+    ADD_ADDR(PyObject_SetAttr)
     ADD_ADDR(PyObject_IsTrue)
     ADD_ADDR(PyObject_RichCompare)
     ADD_ADDR(PyEval_GetGlobals)
@@ -1284,6 +1287,7 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyErr_ExceptionMatches)
     ADD_ADDR(PyErr_Clear)
     ADD_ADDR(PyErr_Format)
+    ADD_ADDR(PyErr_SetString)
     ADD_ADDR(PyNumber_Multiply)
     ADD_ADDR(PyNumber_TrueDivide)
     ADD_ADDR(PyNumber_FloorDivide)
@@ -1327,6 +1331,7 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyExc_StopIteration)
     ADD_ADDR(PyExc_UnboundLocalError)
     ADD_ADDR(PyExc_SystemError)
+    ADD_ADDR(PyExc_ImportError)
     ADD_ADDR_NAME(&_PyThreadState_Current,"_PyThreadState_Current")
     ADD_ADDR(NAME_ERROR_MSG)
     ADD_ADDR(GLOBAL_NAME_ERROR_MSG)
@@ -1335,6 +1340,8 @@ PyInit_pyinternals(void) {
     ADD_ADDR(NO_LOCALS_LOAD_MSG)
     ADD_ADDR(NO_LOCALS_STORE_MSG)
     ADD_ADDR(NO_LOCALS_DELETE_MSG)
+    ADD_ADDR(BUILD_CLASS_ERROR_MSG)
+    ADD_ADDR_NAME("__build_class__","__build_class__")
     
     Py_INCREF(&CompiledCodeType);
     if(PyModule_AddObject(m,"CompiledCode",(PyObject*)&CompiledCodeType) == -1) return NULL;
