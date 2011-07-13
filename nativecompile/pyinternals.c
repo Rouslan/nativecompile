@@ -58,7 +58,6 @@
 #define BUILD_CLASS_ERROR_MSG "__build_class__ not found"
 
 
-static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kwds);
 static PyObject *load_args(PyObject ***pp_stack, int na);
 static void err_args(PyObject *func, int flags, int nargs);
 static PyObject *fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk);
@@ -67,6 +66,7 @@ static PyObject *_cc_EvalCodeEx(PyObject *_co, PyObject *globals,
     PyObject *locals, PyObject **args, int argcount, PyObject **kws,
     int kwcount, PyObject **defs, int defcount, PyObject *kwdefs,
     PyObject *closure);
+static PyObject *_cc_EvalCode(PyObject *_co, PyObject *globals, PyObject *locals);
 
 #define EXT_POP(STACK_POINTER) (*(STACK_POINTER)++)
 
@@ -82,12 +82,10 @@ typedef PyObject *(*entry_type)(PyFrameObject *);
 typedef struct {
     PyObject_HEAD
 
-    PyObject *code;
     entry_type entry;
 
-    /* a tuple of CodeWithCompiledCode objects, held here to prevent from being
-       garbage-collected */
-    PyObject *sub_entry_points;
+    /* a tuple of CodeObjectWithCCode objects */
+    PyObject *entry_points;
 
 #ifdef USE_MMAP
     int fd;
@@ -95,38 +93,15 @@ typedef struct {
 #endif
 } CompiledCode;
 
+static PyMemberDef CompiledCoded_members[] = {
+    {"entry_points",T_OBJECT_EX,offsetof(CompiledCode,entry_points),READONLY,NULL},
+    {NULL}
+};
 
 
-static void CompiledCode_dealloc(CompiledCode *self) {
-    Py_XDECREF(self->sub_entry_points);
-    if(self->entry) {
-#ifdef USE_MMAP
-        munmap(self->entry,self->len);
-        close(self->fd);
-#else
-        PyMem_Free(self->entry);
-#endif
-    }
-    Py_DECREF(self->code);
-}
-
-static PyObject *CompiledCode_call(CompiledCode *self,PyObject *args,PyObject *kw) {
-    PyObject *r;
-    PyThreadState *tstate = PyThreadState_GET();
-    PyFrameObject *frame = PyFrame_New(
-        tstate,
-        (PyCodeObject*)self->code,
-        PyEval_GetGlobals(),
-        PyEval_GetLocals());
-
-    r = self->entry(frame);
-
-    ++tstate->recursion_depth;
-    Py_DECREF(frame);
-    --tstate->recursion_depth;
-
-    return r;
-}
+static void CompiledCode_dealloc(CompiledCode *self);
+static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kwds);
+static PyObject *CompiledCode_call(CompiledCode *self,PyObject *args,PyObject *kw);
 
 static PyTypeObject CompiledCodeType = {
     PyVarObject_HEAD_INIT(NULL, 0)
@@ -157,7 +132,7 @@ static PyTypeObject CompiledCodeType = {
     0,	                       /* tp_iter */
     0,	                       /* tp_iternext */
     0,                         /* tp_methods */
-    0,                         /* tp_members */
+    CompiledCoded_members,     /* tp_members */
     0,                         /* tp_getset */
     0,                         /* tp_base */
     0,                         /* tp_dict */
@@ -173,6 +148,12 @@ static PyTypeObject CompiledCodeType = {
 
 
 #define CO_COMPILED (1 << 31)
+#define HAS_CCODE(obj) (((PyCodeObject*)obj)->co_flags & CO_COMPILED && \
+                        ((CodeObjectWithCCode*)obj)->compiled_code)
+#define GET_CCODE_FUNC(obj) ((entry_type)(\
+    (char*)(((CodeObjectWithCCode*)obj)->compiled_code->entry) + \
+    ((CodeObjectWithCCode*)obj)->offset))
+
 
 /* Since PyCodeObject cannot be subclassed, to support extra fields, we copy a
  * PyCodeObject to this surrogate and identify it using a bit in co_flags not
@@ -257,14 +238,18 @@ static PyObject *create_compiled_entry_point(PyObject *self,PyObject *_arg) {
     return (PyObject*)ep;
 }
 
+
+#define CEP_CHECK(X) \
+    if(!(PyCode_Check((PyObject*)X) && ((CodeObjectWithCCode*)X)->co_flags & CO_COMPILED)) { \
+        PyErr_SetString(PyExc_TypeError,"argument must be a compiled entry point"); \
+        return NULL; \
+    }
+
 static PyObject *cep_get_compiled_code(PyObject *self,PyObject *_arg) {
     PyObject *ret;
     CodeObjectWithCCode *arg = (CodeObjectWithCCode*)_arg;
 
-    if(!(PyCode_Check(_arg) && arg->co_flags & CO_COMPILED)) {
-        PyErr_SetString(PyExc_TypeError,"argument must be a compiled entry point");
-        return NULL;
-    }
+    CEP_CHECK(arg)
 
     ret = arg->compiled_code ? (PyObject*)arg->compiled_code : Py_None;
     Py_INCREF(ret);
@@ -274,10 +259,7 @@ static PyObject *cep_get_compiled_code(PyObject *self,PyObject *_arg) {
 static PyObject *cep_get_offset(PyObject *self,PyObject *_arg) {
     CodeObjectWithCCode *arg = (CodeObjectWithCCode*)_arg;
 
-    if(!(PyCode_Check(_arg) && arg->co_flags & CO_COMPILED)) {
-        PyErr_SetString(PyExc_TypeError,"argument must be a compiled entry point");
-        return NULL;
-    }
+    CEP_CHECK(arg)
 
     return PyLong_FromUnsignedLong(arg->offset);
 }
@@ -288,25 +270,96 @@ static PyObject *cep_set_offset(PyObject *self,PyObject *args) {
 
     if(!PyArg_ParseTuple(args,"OI",&cep,&offset)) return NULL;
 
-    if(!(PyCode_Check(cep) && ((PyCodeObject*)cep)->co_flags & CO_COMPILED)) {
-        PyErr_SetString(PyExc_TypeError,"the first argument must be a compiled entry point");
-        return NULL;
-    }
+    CEP_CHECK(cep)
 
     ((CodeObjectWithCCode*)cep)->offset = offset;
 
     Py_RETURN_NONE;
 }
 
+static PyObject *cep_exec(PyObject *self,PyObject *args) {
+    PyObject *r;
+    PyObject *cep;
+    PyObject *globals = Py_None;
+    PyObject *locals = Py_None;
+
+    if(!PyArg_ParseTuple(args,"O|OO",&cep,&globals,&locals)) return NULL;
+
+    CEP_CHECK(cep)
+
+    if (globals == Py_None) {
+        globals = PyEval_GetGlobals();
+        if (locals == Py_None) {
+            locals = PyEval_GetLocals();
+        }
+        if (!globals || !locals) {
+            PyErr_SetString(PyExc_SystemError,
+                            "globals and locals cannot be NULL");
+            return NULL;
+        }
+    }
+    else if (locals == Py_None)
+        locals = globals;
+
+    if (!PyDict_Check(globals)) {
+        PyErr_Format(PyExc_TypeError, "globals must be a dict, not %.100s",
+                     globals->ob_type->tp_name);
+        return NULL;
+    }
+    if (!PyMapping_Check(locals)) {
+        PyErr_Format(PyExc_TypeError,
+            "locals be a mapping or None, not %.100s",
+            locals->ob_type->tp_name);
+        return NULL;
+    }
+    if (PyDict_GetItemString(globals, "__builtins__") == NULL) {
+        if (PyDict_SetItemString(globals, "__builtins__",
+                                 PyEval_GetBuiltins()) != 0)
+            return NULL;
+    }
+
+    if (PyCode_GetNumFree((PyCodeObject *)cep) > 0) {
+        PyErr_SetString(PyExc_TypeError,
+                        "code object may not contain free variables");
+        return NULL;
+    }
+
+    r = _cc_EvalCode(cep,globals,locals);
+    if(r) {
+        Py_DECREF(r);
+        Py_RETURN_NONE;
+    }
+    return NULL;
+}
 
 
+
+static void CompiledCode_dealloc(CompiledCode *self) {
+    int i;
+    PyObject *ep;
+
+    if(self->entry_points) {
+        for(i=0; i<PyTuple_GET_SIZE(self->entry_points); ++i) {
+            ep = PyTuple_GET_ITEM(self->entry_points,i);
+            ((CodeObjectWithCCode*)ep)->compiled_code = NULL;
+        }
+        Py_DECREF(self->entry_points);
+    }
+    if(self->entry) {
+#ifdef USE_MMAP
+        munmap(self->entry,self->len);
+        close(self->fd);
+#else
+        PyMem_Free(self->entry);
+#endif
+    }
+}
 
 static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kwds) {
     CompiledCode *self;
     PyObject *filename_o;
     const char *filename_s;
-    PyObject *code;
-    PyObject *entry_points = Py_None;
+    PyObject *entry_points;
     int i;
     PyObject *item;
 
@@ -319,13 +372,11 @@ static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kw
     size_t read;
 #endif
 
-    static char *kwlist[] = {"filename","code","entry_points",NULL};
+    static char *kwlist[] = {"filename","entry_points",NULL};
 
-    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O&O!O",kwlist,
+    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O&O",kwlist,
         PyUnicode_FSConverter,
         &filename_o,
-        &PyCode_Type,
-        &code,
         &entry_points)) return NULL;
 
     filename_s = PyBytes_AS_STRING(filename_o);
@@ -333,20 +384,28 @@ static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kw
     self = (CompiledCode*)type->tp_alloc(type,0);
     if(self) {
         self->entry = NULL;
-        self->code = code;
-        Py_INCREF(code);
 
-        self->sub_entry_points = PyObject_CallFunctionObjArgs((PyObject*)&PyTuple_Type,entry_points,NULL);
-        if(!self->sub_entry_points) goto error;
+        self->entry_points = PyObject_CallFunctionObjArgs(
+            (PyObject*)&PyTuple_Type,
+            entry_points,NULL);
+        if(!self->entry_points) goto error;
 
-        i = PyTuple_Size(self->sub_entry_points);
+        i = PyTuple_Size(self->entry_points);
         if(PyErr_Occurred()) goto error;
+        if(i < 1) {
+            PyErr_SetString(PyExc_ValueError,"entry_points needs to have at least one entry");
+            goto error;
+        }
 
         while(--i >= 0) {
-            item = PyTuple_GET_ITEM(self->sub_entry_points,i);
+            item = PyTuple_GET_ITEM(self->entry_points,i);
 
             if(!(PyCode_Check(item) && ((PyCodeObject*)item)->co_flags & CO_COMPILED)) {
                 PyErr_SetString(PyExc_TypeError,"an item in entry_points is not a compiled entry point");
+                goto error;
+            }
+            if(((CodeObjectWithCCode*)item)->compiled_code) {
+                PyErr_SetString(PyExc_TypeError,"an item in entry_points is already part of another CompiledCode object");
                 goto error;
             }
 
@@ -411,6 +470,23 @@ end:
     Py_DECREF(filename_o);
     
     return (PyObject*)self;
+}
+
+static PyObject *CompiledCode_call(CompiledCode *self,PyObject *args,PyObject *kw) {
+    PyObject *r;
+
+    assert(PyTuple_GET_SIZE(self->entry_points) > 0);
+
+    r = _cc_EvalCode(
+        PyTuple_GET_ITEM(self->entry_points,0),
+        PyEval_GetGlobals(),
+        PyEval_GetLocals());
+    
+    if(r) {
+        Py_DECREF(r);
+        Py_RETURN_NONE;
+    }
+    return NULL;
 }
 
 
@@ -513,11 +589,9 @@ fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
             Py_INCREF(*stack);
             fastlocals[i] = *stack--;
         }
-        if(co->co_flags & CO_COMPILED) {
-            CodeObjectWithCCode *ep = (CodeObjectWithCCode*)co;
-            retval = ((entry_type)((char*)(ep->compiled_code->entry) + ep->offset))(f);
-        }
-        else retval = PyEval_EvalFrameEx(f,0);
+
+        retval = HAS_CCODE(co) ? GET_CCODE_FUNC(co)(f) : PyEval_EvalFrameEx(f,0);
+
         ++tstate->recursion_depth;
         Py_DECREF(f);
         --tstate->recursion_depth;
@@ -877,11 +951,7 @@ _cc_EvalCodeEx(PyObject *_co, PyObject *globals, PyObject *locals,
         return PyGen_New(f);
     }
 
-    if(co->co_flags & CO_COMPILED) {
-        CodeObjectWithCCode *ep = (CodeObjectWithCCode*)co;
-        retval = ((entry_type)((char*)(ep->compiled_code->entry) + ep->offset))(f);
-    }
-    else retval = PyEval_EvalFrameEx(f,0);
+    retval = HAS_CCODE(co) ? GET_CCODE_FUNC(co)(f) : PyEval_EvalFrameEx(f,0);
 
 fail:
 
@@ -890,6 +960,11 @@ fail:
     Py_DECREF(f);
     --tstate->recursion_depth;
     return retval;
+}
+
+static PyObject *
+_cc_EvalCode(PyObject *_co, PyObject *globals, PyObject *locals) {
+    return _cc_EvalCodeEx(_co,globals,locals,NULL,0,NULL,0,NULL,0,NULL,NULL);
 }
 
 
@@ -1204,6 +1279,7 @@ static PyMethodDef functions[] = {
     {"cep_get_compiled_code",cep_get_compiled_code,METH_O,NULL},
     {"cep_get_offset",cep_get_offset,METH_O,NULL},
     {"cep_set_offset",cep_set_offset,METH_VARARGS,NULL},
+    {"cep_exec",cep_exec,METH_VARARGS,NULL},
     {NULL}
 };
 

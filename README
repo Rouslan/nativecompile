@@ -75,6 +75,36 @@ Basic Usage:
 Hello World!
 
 
+Compiling Modules:
+
+By default, imported modules are not compiled. To have modules automatically
+compiled, the nativecompile.importer module supplies the function
+install_importer. install_importer must be called before any module you wish to
+compile is imported for the first time. The compiling importer can be removed
+with uninstall_importer.
+
+Usage:
+
+>>> import nativecompile
+>>> import nativecompile.importer
+>>> nativecompile.importer.install_importer()
+>>> import mymodule
+>>> bcode = compile('mymodule.myfunction()','<string>','exec')
+>>> mcode = nativecompile.compile()
+>>> mcode()
+
+Calling install_importer will install a path hook (see
+http://www.python.org/dev/peps/pep-0302 for details) that handles any python
+module inside a folder (the hook does not currently handle modules inside ZIP
+files). Any module that is handled by another path or meta-path hook will not be
+compiled (but will still run).
+
+The compiled code from a module is stored in the module's globals under the name
+of __nativecompile_compiled_code__. If this object is deleted, the compiled code
+will be gone, but the bytecode will remain so everything in the module will
+still work.
+
+
 This is a very unsophisticated compiler. The bytecode is translated into the
 equivalent machine code with no optimizations (almost; some push and pop
 instructions can be eliminated by using registers instead). However, this does
