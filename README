@@ -61,6 +61,9 @@ MAP_ADD
 LOAD_BUILD_CLASS
 STORE_LOCALS
 STORE_ATTR
+IMPORT_FROM
+IMPORT_STAR
+IMPORT_NAME
 
 BINARY_ADD and INPLACE_ADD are also implemented but currently lack an
 optimization on strings that CPython normally does.
@@ -80,8 +83,9 @@ Compiling Modules:
 By default, imported modules are not compiled. To have modules automatically
 compiled, the nativecompile.importer module supplies the function
 install_importer. install_importer must be called before any module you wish to
-compile is imported for the first time. The compiling importer can be removed
-with uninstall_importer.
+compile is imported for the first time. It makes no difference whether the
+module is imported inside or outside of compiled code. The compiling importer
+can be removed with uninstall_importer.
 
 Usage:
 
@@ -100,9 +104,11 @@ files). Any module that is handled by another path or meta-path hook will not be
 compiled (but will still run).
 
 The compiled code from a module is stored in the module's globals under the name
-of __nativecompile_compiled_code__. If this object is deleted, the compiled code
-will be gone, but the bytecode will remain so everything in the module will
-still work.
+__nativecompile_compiled_code__. If this object is deleted, the compiled code
+will be gone, but the bytecode will remain and everything in the module will
+still work. The variable is never referenced after being set, so as long as you
+preserve the compiled code object, the name can be reassigned to or unset
+without affecting the compiled code.
 
 
 This is a very unsophisticated compiler. The bytecode is translated into the

@@ -15,7 +15,7 @@ PRINT_STACK_OFFSET = False
 
 
 CALL_ALIGN_MASK = 0xf
-MAX_ARGS = 4
+MAX_ARGS = 6
 PRE_STACK = 2
 DEBUG_TEMPS = 3
 STACK_EXTRA = 1
@@ -411,9 +411,8 @@ def handler(func,name = None):
         f.stack.current_pos(f.byte_offset)
 
         if PRINT_STACK_OFFSET:
-            print('stack: {}  stack items: {}  opcode: {}'.format(
-                f.stack.offset,
-                f.stack.offset//f.ptr_size + f.stack.tos_in_eax,
+            print('stack items: {}  opcode: {}'.format(
+                f.stack.offset + f.stack.tos_in_eax,
                 opname),file=sys.stderr)
 
         return r + func(f,*extra)
@@ -699,8 +698,8 @@ class Stitch:
         self.code.append(self.f.stack.pop_stack(x))
         return self
 
-    def push_arg(self,*args,**kwds):
-        self.code += self.f.stack.push_arg(*args,**kwds)
+    def push_arg(self,x,*args,**kwds):
+        self.code += self.f.stack.push_arg(raw_addr_if_str(x),*args,**kwds)
         return self
 
     def clear_args(self):
@@ -1607,6 +1606,110 @@ def _op_STORE_ATTR(f,name):
         .if_cond[f.test_NZ](f()
             .mov(0,f.r_ret)
             .goto_end()
+        )
+    )
+
+@hasname
+def _op_IMPORT_FROM(f,name):
+    tos = f.stack.tos()
+    return (f()
+        .push_tos(True)
+        .invoke('PyObject_GetAttr',tos,address_of(name))
+        .if_eax_is_zero(f()
+            .invoke('PyErr_ExceptionMatches','PyExc_AttributeError')
+            .if_eax_is_not_zero(join(f()
+               .invoke('PyErr_Format','CANNOT_IMPORT_MSG',address_of(name))
+               .mov(0,f.r_ret)
+            .code))
+            .goto_end()
+        )
+    )
+
+@handler
+def _op_IMPORT_STAR(f):
+    r = f()
+    if not f.stack.use_tos():
+        r.pop_stack(f.r_ret)
+
+    return (r
+        # import_from decrements the reference count for us
+        .invoke('import_all_from',f.FRAME,f.r_ret)
+        .check_err(True)
+    )
+
+# Currently, the machine code produced by this function fails on x86_64 when
+# Python is built with debugging. GCC seems to use a different calling
+# convention for variadic functions in this case.
+@hasname
+def _op_IMPORT_NAME(f,name):
+    endif = JumpTarget()
+    r_imp = f.r_pres[0]
+
+    def prepare_args(n):
+        return (f()
+            .mov(f.LOCALS,f.r_ret)
+            .push_arg(n)
+            .push_arg(address_of(name))
+            .push_arg(f.GLOBALS)
+            .push_arg(f.r_ret)
+            .test(f.r_ret,f.r_ret)
+            .if_cond[f.test_Z](join(f()
+                .push_arg('Py_None',n=f.stack.args-1).code
+            ))
+            .push_arg(f.stack[0]))
+
+    r = (f()
+        .push_tos()
+        .invoke('PyDict_GetItemString',f.BUILTINS,'__import__')
+        .if_eax_is_zero(f()
+            .invoke('PyErr_SetString','PyExc_ImportError','IMPORT_NOT_FOUND_MSG')
+            .goto_end()
+        )
+        .mov(f.r_ret,r_imp)
+        .incref()
+        .invoke('PyLong_AsLong',f.stack[1])
+        .cmp(-1,f.r_ret)
+        .if_cond[f.test_NE](f()
+            .call('PyErr_Occurred')
+            .if_eax_is_not_zero(
+                prepare_args(5)
+                .push_arg(f.stack[1])
+                .call('PyTuple_Pack')
+                .goto(endif)
+            )
+        ) +
+        # else
+            prepare_args(4)
+            .call('PyTuple_Pack')
+        (endif)
+    )
+
+    a_args = f.stack[-1]
+    return (r
+        .mov(f.r_ret,a_args)
+        .pop_stack(f.r_ret)
+        .decref()
+        .pop_stack(f.r_ret)
+        .decref()
+        .mov(a_args,f.r_ret)
+        .test(f.r_ret,f.r_ret)
+        .if_cond[f.test_Z](f()
+            .decref(r_imp)
+            .goto_end()
+        )
+
+        # TODO: have this be able to call compiled code
+        .invoke('PyObject_Call',r_imp,f.r_ret,0)
+
+        .push_stack(f.r_ret)
+        .decref(r_imp)
+        .mov(a_args,f.r_ret)
+        .decref()
+        .mov(f.stack[0],f.r_ret)
+        .if_eax_is_zero(f()
+            .add_to_stack(-1)
+            .goto_end()
+            .add_to_stack(1)
         )
     )
 

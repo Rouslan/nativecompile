@@ -56,6 +56,8 @@
 #define NO_LOCALS_STORE_MSG "no locals found when storing %R"
 #define NO_LOCALS_DELETE_MSG "no locals when deleting %R"
 #define BUILD_CLASS_ERROR_MSG "__build_class__ not found"
+#define CANNOT_IMPORT_MSG "cannot import name %S"
+#define IMPORT_NOT_FOUND_MSG "__import__ not found"
 
 
 static PyObject *load_args(PyObject ***pp_stack, int na);
@@ -492,9 +494,7 @@ static PyObject *CompiledCode_call(CompiledCode *self,PyObject *args,PyObject *k
 
 
 
-/* The following are modified versions of functions in Python/ceval.c.
- * Profiling and statistics code has been removed because it uses global
- * variables not accessable to this module. */
+/* The following are modified versions of functions in Python/ceval.c */
 
 static PyObject *
 call_function(PyObject **pp_stack, int oparg)
@@ -1260,6 +1260,79 @@ raise_error:
     return NULL;
 }
 
+static int import_all_from(PyFrameObject *f, PyObject *v)
+{
+    PyObject *locals;
+    PyObject *all;
+    PyObject *dict, *name, *value;
+    int skip_leading_underscores = 0;
+    int pos;
+    int err = -1;
+
+    PyFrame_FastToLocals(f);
+    if ((locals = f->f_locals) == NULL) {
+        PyErr_SetString(PyExc_SystemError,
+                        "no locals found during 'import *'");
+        goto all_err;
+    }
+
+    all = PyObject_GetAttrString(v, "__all__");
+
+    if (all == NULL) {
+        if (!PyErr_ExceptionMatches(PyExc_AttributeError))
+            goto all_err;
+        PyErr_Clear();
+        dict = PyObject_GetAttrString(v, "__dict__");
+        if (dict == NULL) {
+            if (!PyErr_ExceptionMatches(PyExc_AttributeError))
+                goto all_err;
+            PyErr_SetString(PyExc_ImportError,
+            "from-import-* object has no __dict__ and no __all__");
+            goto all_err;
+        }
+        all = PyMapping_Keys(dict);
+        Py_DECREF(dict);
+        if (all == NULL)
+            goto all_err;
+        skip_leading_underscores = 1;
+    }
+
+    for (pos = 0, err = 0; ; pos++) {
+        name = PySequence_GetItem(all, pos);
+        if (name == NULL) {
+            if (!PyErr_ExceptionMatches(PyExc_IndexError))
+                err = -1;
+            else
+                PyErr_Clear();
+            break;
+        }
+        if (skip_leading_underscores &&
+            PyUnicode_Check(name) &&
+            PyUnicode_AS_UNICODE(name)[0] == '_')
+        {
+            Py_DECREF(name);
+            continue;
+        }
+        value = PyObject_GetAttr(v, name);
+        if (value == NULL)
+            err = -1;
+        else if (PyDict_CheckExact(locals))
+            err = PyDict_SetItem(locals, name, value);
+        else
+            err = PyObject_SetItem(locals, name, value);
+        Py_DECREF(name);
+        Py_XDECREF(value);
+        if (err != 0)
+            break;
+    }
+    Py_DECREF(all);
+all_err:
+    PyFrame_LocalsToFast(f, 0);
+    Py_DECREF(v);
+
+    return err;
+}
+
 
 
 /* Py_EnterRecursiveCall and Py_LeaveRecursiveCall are somewhat complicated
@@ -1356,6 +1429,7 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyObject_SetAttr)
     ADD_ADDR(PyObject_IsTrue)
     ADD_ADDR(PyObject_RichCompare)
+    ADD_ADDR(PyObject_Call)
     ADD_ADDR(PyEval_GetGlobals)
     ADD_ADDR(PyEval_GetBuiltins)
     ADD_ADDR(PyEval_GetLocals)
@@ -1385,8 +1459,10 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyNumber_InPlaceAnd)
     ADD_ADDR(PyNumber_InPlaceXor)
     ADD_ADDR(PyNumber_InPlaceOr)
+    ADD_ADDR(PyLong_AsLong)
     ADD_ADDR(PyList_New)
     ADD_ADDR(PyTuple_New)
+    ADD_ADDR(PyTuple_Pack)
     ADD_ADDR(PySequence_Contains)
     ADD_ADDR(_EnterRecursiveCall)
     ADD_ADDR(_LeaveRecursiveCall)
@@ -1396,9 +1472,11 @@ PyInit_pyinternals(void) {
     ADD_ADDR(_unpack_iterable)
     ADD_ADDR(_exception_cmp)
     ADD_ADDR(_do_raise)
+    ADD_ADDR(import_all_from)
     
     ADD_ADDR(Py_True)
     ADD_ADDR(Py_False)
+    ADD_ADDR(Py_None)
     ADD_ADDR_NAME(&PyDict_Type,"PyDict_Type")
     ADD_ADDR_NAME(&PyList_Type,"PyList_Type")
     ADD_ADDR_NAME(&PyTuple_Type,"PyTuple_Type")
@@ -1408,6 +1486,7 @@ PyInit_pyinternals(void) {
     ADD_ADDR(PyExc_UnboundLocalError)
     ADD_ADDR(PyExc_SystemError)
     ADD_ADDR(PyExc_ImportError)
+    ADD_ADDR(PyExc_AttributeError)
     ADD_ADDR_NAME(&_PyThreadState_Current,"_PyThreadState_Current")
     ADD_ADDR(NAME_ERROR_MSG)
     ADD_ADDR(GLOBAL_NAME_ERROR_MSG)
@@ -1417,7 +1496,10 @@ PyInit_pyinternals(void) {
     ADD_ADDR(NO_LOCALS_STORE_MSG)
     ADD_ADDR(NO_LOCALS_DELETE_MSG)
     ADD_ADDR(BUILD_CLASS_ERROR_MSG)
+    ADD_ADDR(CANNOT_IMPORT_MSG)
+    ADD_ADDR(IMPORT_NOT_FOUND_MSG)
     ADD_ADDR_NAME("__build_class__","__build_class__")
+    ADD_ADDR_NAME("__import__","__import__")
     
     Py_INCREF(&CompiledCodeType);
     if(PyModule_AddObject(m,"CompiledCode",(PyObject*)&CompiledCodeType) == -1) return NULL;
