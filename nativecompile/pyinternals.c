@@ -58,6 +58,7 @@
 #define BUILD_CLASS_ERROR_MSG "__build_class__ not found"
 #define CANNOT_IMPORT_MSG "cannot import name %S"
 #define IMPORT_NOT_FOUND_MSG "__import__ not found"
+#define BAD_EXCEPTION_MSG "'finally' pops bad exception"
 
 
 static PyObject *load_args(PyObject ***pp_stack, int na);
@@ -67,7 +68,7 @@ static PyObject *do_call(PyObject *func, PyObject ***pp_stack, int na, int nk);
 static PyObject *_cc_EvalCodeEx(PyObject *_co, PyObject *globals,
     PyObject *locals, PyObject **args, int argcount, PyObject **kws,
     int kwcount, PyObject **defs, int defcount, PyObject *kwdefs,
-    PyObject *closure);
+    PyObject *closure, int indexmult);
 static PyObject *_cc_EvalCode(PyObject *_co, PyObject *globals, PyObject *locals);
 
 #define EXT_POP(STACK_POINTER) (*(STACK_POINTER)++)
@@ -77,6 +78,9 @@ static PyObject *_cc_EvalCode(PyObject *_co, PyObject *globals, PyObject *locals
                                      GETLOCAL(i) = value; \
                                      Py_XDECREF(tmp); } while (0)
 
+
+
+static ternaryfunc old_func_call = NULL;
 
 
 typedef PyObject *(*entry_type)(PyFrameObject *);
@@ -310,7 +314,7 @@ static PyObject *cep_exec(PyObject *self,PyObject *args) {
     }
     if (!PyMapping_Check(locals)) {
         PyErr_Format(PyExc_TypeError,
-            "locals be a mapping or None, not %.100s",
+            "locals must be a mapping or None, not %.100s",
             locals->ob_type->tp_name);
         return NULL;
     }
@@ -606,7 +610,7 @@ fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
     return _cc_EvalCodeEx((PyObject*)co, globals,
                           (PyObject *)NULL, (*pp_stack)+n-1, na,
                           (*pp_stack)+2*nk-1, nk, d, nd, kwdefs,
-                          PyFunction_GET_CLOSURE(func));
+                          PyFunction_GET_CLOSURE(func),-1);
 }
 
 static PyObject *
@@ -720,10 +724,14 @@ format_exc_check_arg(PyObject *exc, const char *format_str, PyObject *obj)
     PyErr_Format(exc, format_str, obj_str);
 }
 
+/* we store stack values in reverse order compared to how CPython stores them so
+   this function is given an extra parameter to multiply the index by, which can
+   be 1 or -1 */
 static PyObject *
 _cc_EvalCodeEx(PyObject *_co, PyObject *globals, PyObject *locals,
            PyObject **args, int argcount, PyObject **kws, int kwcount,
-           PyObject **defs, int defcount, PyObject *kwdefs, PyObject *closure)
+           PyObject **defs, int defcount, PyObject *kwdefs, PyObject *closure,
+           int indexmult)
 {
     PyCodeObject* co = (PyCodeObject*)_co;
     register PyFrameObject *f;
@@ -776,7 +784,7 @@ _cc_EvalCodeEx(PyObject *_co, PyObject *globals, PyObject *locals,
             n = co->co_argcount;
         }
         for (i = 0; i < n; i++) {
-            x = args[-i];
+            x = args[i * indexmult];
             Py_INCREF(x);
             SETLOCAL(i, x);
         }
@@ -786,15 +794,15 @@ _cc_EvalCodeEx(PyObject *_co, PyObject *globals, PyObject *locals,
                 goto fail;
             SETLOCAL(total_args, u);
             for (i = n; i < argcount; i++) {
-                x = args[-i];
+                x = args[i * indexmult];
                 Py_INCREF(x);
                 PyTuple_SET_ITEM(u, i-n, x);
             }
         }
         for (i = 0; i < kwcount; i++) {
             PyObject **co_varnames;
-            PyObject *keyword = kws[-2*i];
-            PyObject *value = kws[-2*i - 1];
+            PyObject *keyword = kws[2*i*indexmult];
+            PyObject *value = kws[(2*i + 1) * indexmult];
             int j;
             if (keyword == NULL || !PyUnicode_Check(keyword)) {
                 PyErr_Format(PyExc_TypeError,
@@ -964,7 +972,7 @@ fail:
 
 static PyObject *
 _cc_EvalCode(PyObject *_co, PyObject *globals, PyObject *locals) {
-    return _cc_EvalCodeEx(_co,globals,locals,NULL,0,NULL,0,NULL,0,NULL,NULL);
+    return _cc_EvalCodeEx(_co,globals,locals,NULL,0,NULL,0,NULL,0,NULL,NULL,1);
 }
 
 
@@ -1333,6 +1341,74 @@ all_err:
     return err;
 }
 
+static PyObject *
+_function_call(PyObject *func, PyObject *arg, PyObject *kw)
+{
+    PyObject *result;
+    PyObject *argdefs;
+    PyObject *kwtuple = NULL;
+    PyObject **d, **k;
+    Py_ssize_t nk, nd;
+
+    argdefs = PyFunction_GET_DEFAULTS(func);
+    if (argdefs != NULL && PyTuple_Check(argdefs)) {
+        d = &PyTuple_GET_ITEM((PyTupleObject *)argdefs, 0);
+        nd = PyTuple_GET_SIZE(argdefs);
+    }
+    else {
+        d = NULL;
+        nd = 0;
+    }
+
+    if (kw != NULL && PyDict_Check(kw)) {
+        Py_ssize_t pos, i;
+        nk = PyDict_Size(kw);
+        kwtuple = PyTuple_New(2*nk);
+        if (kwtuple == NULL)
+            return NULL;
+        k = &PyTuple_GET_ITEM(kwtuple, 0);
+        pos = i = 0;
+        while (PyDict_Next(kw, &pos, &k[i], &k[i+1])) {
+            Py_INCREF(k[i]);
+            Py_INCREF(k[i+1]);
+            i += 2;
+        }
+        nk = i/2;
+    }
+    else {
+        k = NULL;
+        nk = 0;
+    }
+
+    result = _cc_EvalCodeEx(
+        PyFunction_GET_CODE(func),
+        PyFunction_GET_GLOBALS(func), (PyObject *)NULL,
+        &PyTuple_GET_ITEM(arg, 0), PyTuple_GET_SIZE(arg),
+        k, nk, d, nd,
+        PyFunction_GET_KW_DEFAULTS(func),
+        PyFunction_GET_CLOSURE(func),
+        1);
+
+    Py_XDECREF(kwtuple);
+
+    return result;
+}
+
+static PyObject *
+special_lookup(PyObject *o, char *meth, PyObject **cache)
+{
+    PyObject *res;
+    res = _PyObject_LookupSpecial(o, meth, cache);
+    if (res == NULL && !PyErr_Occurred()) {
+        PyErr_SetObject(PyExc_AttributeError, *cache);
+        return NULL;
+    }
+    return res;
+}
+
+static PyObject *exit_cache = NULL;
+static PyObject *enter_cache = NULL;
+
 
 
 /* Py_EnterRecursiveCall and Py_LeaveRecursiveCall are somewhat complicated
@@ -1356,6 +1432,11 @@ static PyMethodDef functions[] = {
     {NULL}
 };
 
+static void free_module(void *_) {
+    assert(old_func_call);
+    PyFunction_Type.tp_call = old_func_call;
+}
+
 static struct PyModuleDef this_module = {
     PyModuleDef_HEAD_INIT,
     "pyinternals",
@@ -1365,26 +1446,28 @@ static struct PyModuleDef this_module = {
     NULL,
     NULL,
     NULL,
-    NULL
+    free_module
 };
 
-#define ADD_ADDR_NAME(item,name) \
-    tmp = PyLong_FromUnsignedLong((unsigned long)(item)); \
-    ret = PyDict_SetItemString(addrs,name,tmp); \
-    Py_DECREF(tmp); \
-    if(ret == -1) return NULL;
 
-#define ADD_ADDR(item) ADD_ADDR_NAME(item,#item)
+#define ADD_ADDR(item) {#item,(unsigned long)item}
+#define ADD_ADDR_OF(item) {#item,(unsigned long)(&item)}
+#define ADD_ADDR_STR(item) {item,(unsigned long)item}
 
 #define ADD_INT_OFFSET(name,type,member) \
     if(PyModule_AddIntConstant(m,name,offsetof(type,member)) == -1) return NULL
+
+typedef struct {
+    const char *name;
+    unsigned long addr;
+} AddrRec;
 
 PyMODINIT_FUNC
 PyInit_pyinternals(void) {
     PyObject *m;
     PyObject *addrs;
     PyObject *tmp;
-    int ret;
+    int ret, i;
     
     if(PyType_Ready(&CompiledCodeType) < 0) return NULL;
 
@@ -1405,6 +1488,9 @@ PyInit_pyinternals(void) {
     ADD_INT_OFFSET("FRAME_LOCALS_OFFSET",PyFrameObject,f_locals);
     ADD_INT_OFFSET("FRAME_LOCALSPLUS_OFFSET",PyFrameObject,f_localsplus);
     ADD_INT_OFFSET("THREADSTATE_FRAME_OFFSET",PyThreadState,frame);
+    ADD_INT_OFFSET("THREADSTATE_TRACEBACK_OFFSET",PyThreadState,exc_traceback);
+    ADD_INT_OFFSET("THREADSTATE_VALUE_OFFSET",PyThreadState,exc_value);
+    ADD_INT_OFFSET("THREADSTATE_TYPE_OFFSET",PyThreadState,exc_type);
     if(PyModule_AddStringConstant(m,"ARCHITECTURE",ARCHITECTURE) == -1) return NULL;
     if(PyModule_AddObject(m,"REF_DEBUG",PyBool_FromLong(REF_DEBUG_VAL)) == -1) return NULL;
     if(PyModule_AddObject(m,"COUNT_ALLOCS",PyBool_FromLong(COUNT_ALLOCS_VAL)) == -1) return NULL;
@@ -1414,95 +1500,115 @@ PyInit_pyinternals(void) {
     if(!addrs) return NULL;
     
     if(PyModule_AddObject(m,"raw_addresses",addrs) == -1) return NULL;
+
+    AddrRec addr_records[] = {
+        ADD_ADDR(Py_IncRef),
+        ADD_ADDR(Py_DecRef),
+        ADD_ADDR(PyDict_GetItem),
+        ADD_ADDR(PyDict_SetItem),
+        ADD_ADDR(PyDict_GetItemString),
+        ADD_ADDR(_PyDict_NewPresized),
+        ADD_ADDR(PyObject_GetItem),
+        ADD_ADDR(PyObject_SetItem),
+        ADD_ADDR(PyObject_DelItem),
+        ADD_ADDR(PyObject_GetIter),
+        ADD_ADDR(PyObject_GetAttr),
+        ADD_ADDR(PyObject_SetAttr),
+        ADD_ADDR(PyObject_IsTrue),
+        ADD_ADDR(PyObject_RichCompare),
+        ADD_ADDR(PyObject_Call),
+        ADD_ADDR(PyObject_CallFunctionObjArgs),
+        ADD_ADDR(PyEval_GetGlobals),
+        ADD_ADDR(PyEval_GetBuiltins),
+        ADD_ADDR(PyEval_GetLocals),
+        ADD_ADDR(PyErr_Occurred),
+        ADD_ADDR(PyErr_ExceptionMatches),
+        ADD_ADDR(PyErr_Clear),
+        ADD_ADDR(PyErr_Format),
+        ADD_ADDR(PyErr_SetString),
+        ADD_ADDR(PyNumber_Multiply),
+        ADD_ADDR(PyNumber_TrueDivide),
+        ADD_ADDR(PyNumber_FloorDivide),
+        ADD_ADDR(PyNumber_Add),
+        ADD_ADDR(PyNumber_Subtract),
+        ADD_ADDR(PyNumber_Lshift),
+        ADD_ADDR(PyNumber_Rshift),
+        ADD_ADDR(PyNumber_And),
+        ADD_ADDR(PyNumber_Xor),
+        ADD_ADDR(PyNumber_Or),
+        ADD_ADDR(PyNumber_InPlaceMultiply),
+        ADD_ADDR(PyNumber_InPlaceTrueDivide),
+        ADD_ADDR(PyNumber_InPlaceFloorDivide),
+        ADD_ADDR(PyNumber_InPlaceRemainder),
+        ADD_ADDR(PyNumber_InPlaceAdd),
+        ADD_ADDR(PyNumber_InPlaceSubtract),
+        ADD_ADDR(PyNumber_InPlaceLshift),
+        ADD_ADDR(PyNumber_InPlaceRshift),
+        ADD_ADDR(PyNumber_InPlaceAnd),
+        ADD_ADDR(PyNumber_InPlaceXor),
+        ADD_ADDR(PyNumber_InPlaceOr),
+        ADD_ADDR(PyLong_AsLong),
+        ADD_ADDR(PyList_New),
+        ADD_ADDR(PyTuple_New),
+        ADD_ADDR(PyTuple_Pack),
+        ADD_ADDR(PySequence_Contains),
+        ADD_ADDR(_EnterRecursiveCall),
+        ADD_ADDR(_LeaveRecursiveCall),
+        ADD_ADDR(call_function),
+        ADD_ADDR(format_exc_check_arg),
+        ADD_ADDR(_make_function),
+        ADD_ADDR(_unpack_iterable),
+        ADD_ADDR(_exception_cmp),
+        ADD_ADDR(_do_raise),
+        ADD_ADDR(import_all_from),
+        ADD_ADDR(special_lookup),
     
-    ADD_ADDR(Py_IncRef)
-    ADD_ADDR(Py_DecRef)
-    ADD_ADDR(PyDict_GetItem)
-    ADD_ADDR(PyDict_SetItem)
-    ADD_ADDR(PyDict_GetItemString)
-    ADD_ADDR(_PyDict_NewPresized)
-    ADD_ADDR(PyObject_GetItem)
-    ADD_ADDR(PyObject_SetItem)
-    ADD_ADDR(PyObject_DelItem)
-    ADD_ADDR(PyObject_GetIter)
-    ADD_ADDR(PyObject_GetAttr)
-    ADD_ADDR(PyObject_SetAttr)
-    ADD_ADDR(PyObject_IsTrue)
-    ADD_ADDR(PyObject_RichCompare)
-    ADD_ADDR(PyObject_Call)
-    ADD_ADDR(PyEval_GetGlobals)
-    ADD_ADDR(PyEval_GetBuiltins)
-    ADD_ADDR(PyEval_GetLocals)
-    ADD_ADDR(PyErr_Occurred)
-    ADD_ADDR(PyErr_ExceptionMatches)
-    ADD_ADDR(PyErr_Clear)
-    ADD_ADDR(PyErr_Format)
-    ADD_ADDR(PyErr_SetString)
-    ADD_ADDR(PyNumber_Multiply)
-    ADD_ADDR(PyNumber_TrueDivide)
-    ADD_ADDR(PyNumber_FloorDivide)
-    ADD_ADDR(PyNumber_Add)
-    ADD_ADDR(PyNumber_Subtract)
-    ADD_ADDR(PyNumber_Lshift)
-    ADD_ADDR(PyNumber_Rshift)
-    ADD_ADDR(PyNumber_And)
-    ADD_ADDR(PyNumber_Xor)
-    ADD_ADDR(PyNumber_Or)
-    ADD_ADDR(PyNumber_InPlaceMultiply)
-    ADD_ADDR(PyNumber_InPlaceTrueDivide)
-    ADD_ADDR(PyNumber_InPlaceFloorDivide)
-    ADD_ADDR(PyNumber_InPlaceRemainder)
-    ADD_ADDR(PyNumber_InPlaceAdd)
-    ADD_ADDR(PyNumber_InPlaceSubtract)
-    ADD_ADDR(PyNumber_InPlaceLshift)
-    ADD_ADDR(PyNumber_InPlaceRshift)
-    ADD_ADDR(PyNumber_InPlaceAnd)
-    ADD_ADDR(PyNumber_InPlaceXor)
-    ADD_ADDR(PyNumber_InPlaceOr)
-    ADD_ADDR(PyLong_AsLong)
-    ADD_ADDR(PyList_New)
-    ADD_ADDR(PyTuple_New)
-    ADD_ADDR(PyTuple_Pack)
-    ADD_ADDR(PySequence_Contains)
-    ADD_ADDR(_EnterRecursiveCall)
-    ADD_ADDR(_LeaveRecursiveCall)
-    ADD_ADDR(call_function)
-    ADD_ADDR(format_exc_check_arg)
-    ADD_ADDR(_make_function)
-    ADD_ADDR(_unpack_iterable)
-    ADD_ADDR(_exception_cmp)
-    ADD_ADDR(_do_raise)
-    ADD_ADDR(import_all_from)
-    
-    ADD_ADDR(Py_True)
-    ADD_ADDR(Py_False)
-    ADD_ADDR(Py_None)
-    ADD_ADDR_NAME(&PyDict_Type,"PyDict_Type")
-    ADD_ADDR_NAME(&PyList_Type,"PyList_Type")
-    ADD_ADDR_NAME(&PyTuple_Type,"PyTuple_Type")
-    ADD_ADDR(PyExc_KeyError)
-    ADD_ADDR(PyExc_NameError)
-    ADD_ADDR(PyExc_StopIteration)
-    ADD_ADDR(PyExc_UnboundLocalError)
-    ADD_ADDR(PyExc_SystemError)
-    ADD_ADDR(PyExc_ImportError)
-    ADD_ADDR(PyExc_AttributeError)
-    ADD_ADDR_NAME(&_PyThreadState_Current,"_PyThreadState_Current")
-    ADD_ADDR(NAME_ERROR_MSG)
-    ADD_ADDR(GLOBAL_NAME_ERROR_MSG)
-    ADD_ADDR(UNBOUNDLOCAL_ERROR_MSG)
-    ADD_ADDR(UNBOUNDFREE_ERROR_MSG)
-    ADD_ADDR(NO_LOCALS_LOAD_MSG)
-    ADD_ADDR(NO_LOCALS_STORE_MSG)
-    ADD_ADDR(NO_LOCALS_DELETE_MSG)
-    ADD_ADDR(BUILD_CLASS_ERROR_MSG)
-    ADD_ADDR(CANNOT_IMPORT_MSG)
-    ADD_ADDR(IMPORT_NOT_FOUND_MSG)
-    ADD_ADDR_NAME("__build_class__","__build_class__")
-    ADD_ADDR_NAME("__import__","__import__")
+        ADD_ADDR(Py_True),
+        ADD_ADDR(Py_False),
+        ADD_ADDR(Py_None),
+        ADD_ADDR_OF(PyDict_Type),
+        ADD_ADDR_OF(PyList_Type),
+        ADD_ADDR_OF(PyTuple_Type),
+        ADD_ADDR(PyExc_KeyError),
+        ADD_ADDR(PyExc_NameError),
+        ADD_ADDR(PyExc_StopIteration),
+        ADD_ADDR(PyExc_UnboundLocalError),
+        ADD_ADDR(PyExc_SystemError),
+        ADD_ADDR(PyExc_ImportError),
+        ADD_ADDR(PyExc_AttributeError),
+        ADD_ADDR_OF(_PyThreadState_Current),
+        ADD_ADDR(NAME_ERROR_MSG),
+        ADD_ADDR(GLOBAL_NAME_ERROR_MSG),
+        ADD_ADDR(UNBOUNDLOCAL_ERROR_MSG),
+        ADD_ADDR(UNBOUNDFREE_ERROR_MSG),
+        ADD_ADDR(NO_LOCALS_LOAD_MSG),
+        ADD_ADDR(NO_LOCALS_STORE_MSG),
+        ADD_ADDR(NO_LOCALS_DELETE_MSG),
+        ADD_ADDR(BUILD_CLASS_ERROR_MSG),
+        ADD_ADDR(CANNOT_IMPORT_MSG),
+        ADD_ADDR(IMPORT_NOT_FOUND_MSG),
+        ADD_ADDR(BAD_EXCEPTION_MSG),
+        ADD_ADDR_STR("__build_class__"),
+        ADD_ADDR_STR("__import__"),
+        ADD_ADDR_STR("__exit__"),
+        ADD_ADDR_STR("__enter__"),
+        ADD_ADDR_OF(exit_cache),
+        ADD_ADDR_OF(enter_cache)
+    };
+
+    for(i=0; i<sizeof(addr_records)/sizeof(AddrRec); ++i) {
+        tmp = PyLong_FromUnsignedLong(addr_records[i].addr);
+        ret = PyDict_SetItemString(addrs,addr_records[i].name,tmp);
+        Py_DECREF(tmp);
+        if(ret == -1) return NULL;
+    }
     
     Py_INCREF(&CompiledCodeType);
     if(PyModule_AddObject(m,"CompiledCode",(PyObject*)&CompiledCodeType) == -1) return NULL;
+
+    assert(!old_func_call);
+    old_func_call = PyFunction_Type.tp_call;
+    PyFunction_Type.tp_call = _function_call;
     
     return m;
 }

@@ -5,6 +5,7 @@
 
 
 import binascii
+import copy
 from functools import partial
 
 from .multimethod import multimethod
@@ -137,6 +138,26 @@ class Address:
 
     def offset_only(self):
         return self.base is None and self.index is None and self.scale == 1
+
+    def __add__(self,b):
+        # this needs to work correctly for derived classes
+        if isinstance(b,int):
+            r = copy.copy(self)
+            r.offset += b
+            return r
+
+        return NotImplemented
+
+    def __sub__(self,b): return self.__add__(-b)
+
+    def __iadd__(self,b):
+        if isinstance(b,int):
+            self.offset += b
+            return self
+        
+        return NotImplemented
+
+    def __isub__(self,b): return self.__iadd__(-b)
 
 Address.__mmtype__ = Address
 

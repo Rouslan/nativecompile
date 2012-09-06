@@ -136,6 +136,36 @@ thing = Thingy()
 print(thing)
 ''')
 
+    def test_try_except_finally(self):
+        self.compare_exec('''
+a = 5
+try:
+    print(6/0)
+except Exception:
+    a = 1
+print(a)
+
+try:
+    print('ok')
+except:
+    print('not ok')
+
+try:
+    a = 14
+finally:
+    a = 99
+print(a)
+
+try:
+    a = "a"
+    print(3/0)
+except:
+    a = "b"
+finally:
+    a += " c"
+print(a)
+''')
+
 
 if __name__ == '__main__':
     unittest.main()
