@@ -164,6 +164,58 @@ except:
 finally:
     a += " c"
 print(a)
+
+try:
+    try:
+        1/0
+    except:
+        1/0
+    a = 0
+except:
+    a = 2
+print(a)
+
+a=0
+try:
+    try:
+        try:
+            1/0
+        finally:
+            1/0
+        a = -10
+    finally:
+        a = 2
+except:
+    a += 8
+print(a)
+
+a="car"
+def func():
+    global a
+    try:
+        try:
+            try:
+                1/0
+            finally:
+                return 777
+            a = "horse"
+        finally:
+            a = "he"
+    except:
+        a += "llo"
+print(func())
+print(a)
+
+a=0
+try:
+    for x in range(10):
+        try:
+            1/0
+        finally:
+            a += 2
+except:
+    a = a - 100
+print(a)
 ''')
 
 

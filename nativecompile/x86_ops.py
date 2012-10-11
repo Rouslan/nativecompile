@@ -16,6 +16,8 @@ SIZE_B = 0
 SIZE_D = 1
 SIZE_Q = 2
 
+TEST_MNEMONICS = [('o',),('no',),('b',),('nb',),('e','z'),('ne','nz'),('be',),('a',),('s',),('ns',),('p',),('np',),('l',),('ge',),('le',),('g',)]
+
 def int_to_32(x):
     return x.to_bytes(4,byteorder='little',signed=True)
 
@@ -229,10 +231,22 @@ class Test:
     
     def __int__(self):
         return self.val
+
+    def __eq__(self,b):
+        if isinstance(b,Test):
+            return self.val == b.val
+        
+        return NotImplemented
+    
+    def __ne__(self,b):
+        if isinstance(b,Test):
+            return self.val != b.val
+        
+        return NotImplemented
     
     @property
     def mnemonic(self):
-        return ['o','no','b','nb','e','ne','be','a','s','ns','p','np','l','ge','le','g'][self.val]
+        return TEST_MNEMONICS[self.val][0]
 
 
 
@@ -312,7 +326,7 @@ class Assembly:
         return partial(self.op,name)
     
     def jcc(self,test,x):
-        return self.op('j'+test.mnemonic,x)
+        return AsmSequence([(self.binary('jcc')(test,x),'j'+test.mnemonic,(x,))])
 
     def comment(self,comm):
         return AsmSequence([(b'','$COMMENT$',comm)])
@@ -413,7 +427,7 @@ def add(a : int,b : Register):
     return _op_imm_reg(0b10000000,0,0b00000100,a,b)
 
 def add_imm_addr(a,b,w):
-    return _op_imm_addr(0b10000000,0b010 if b.size == SIZE_Q else 0,a,b,w)
+    return _op_imm_addr(0b10000000,0,a,b,w)
 
 @multimethod
 def addb(a : int,b : Address):
@@ -525,25 +539,6 @@ def jcc(test : Test,x : Displacement):
 
 JCC_MIN_LEN = 2
 JCC_MAX_LEN = 6
-
-def jo(x): return jcc(test_O,x)
-def jno(x): return jcc(test_NO,x)
-def jb(x): return jcc(test_B,x)
-def jnb(x): return jcc(test_NB,x)
-def je(x): return jcc(test_E,x)
-jz = je
-def jne(x): return jcc(test_NE,x)
-jnz = jne
-def jbe(x): return jcc(test_BE,x)
-def ja(x): return jcc(test_A,x)
-def js(x): return jcc(test_S,x)
-def jns(x): return jcc(test_NS,x)
-def jp(x): return jcc(test_P,x)
-def jnp(x): return jcc(test_NP,x)
-def jl(x): return jcc(test_L,x)
-def jge(x): return jcc(test_GE,x)
-def jle(x): return jcc(test_LE,x)
-def jg(x): return jcc(test_G,x)
 
 
 
@@ -801,7 +796,7 @@ def test(a : int,b : Register):
     return _op_imm_reg(0b11110110,0,0b10101000,a,b)
 
 def test_imm_addr(a,b,w):
-    return rex(None,b) + bytes([0b11110110 | w]) + b.mod_rm_sib_disp(0) + immedate_data(w,a)
+    return rex(None,b) + bytes([0b11110110 | w]) + b.mod_rm_sib_disp(0) + immediate_data(w,a)
 
 @multimethod
 def testb(a : int,b : Address):

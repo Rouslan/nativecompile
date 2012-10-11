@@ -959,7 +959,15 @@ _cc_EvalCodeEx(PyObject *_co, PyObject *globals, PyObject *locals,
         return PyGen_New(f);
     }
 
-    retval = HAS_CCODE(co) ? GET_CCODE_FUNC(co)(f) : PyEval_EvalFrameEx(f,0);
+    /* retval = HAS_CCODE(co) ? GET_CCODE_FUNC(co)(f) : PyEval_EvalFrameEx(f,0); */
+    /* this way, a breakpoint can be placed right before run-time generated code
+       is run: */
+    if(HAS_CCODE(co)) {
+        entry_type func = GET_CCODE_FUNC(co);
+        retval = func(f);
+    } else {
+        retval = PyEval_EvalFrameEx(f,0);
+    }
 
 fail:
 
@@ -1406,6 +1414,49 @@ special_lookup(PyObject *o, char *meth, PyObject **cache)
     return res;
 }
 
+static int
+call_trace(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
+           int what, PyObject *arg)
+{
+    register PyThreadState *tstate = frame->f_tstate;
+    int result;
+    if (tstate->tracing)
+        return 0;
+    tstate->tracing++;
+    tstate->use_tracing = 0;
+    result = func(obj, frame, what, arg);
+    tstate->use_tracing = ((tstate->c_tracefunc != NULL)
+                           || (tstate->c_profilefunc != NULL));
+    tstate->tracing--;
+    return result;
+}
+
+static void
+call_exc_trace(Py_tracefunc func, PyObject *self, PyFrameObject *f)
+{
+    PyObject *type, *value, *traceback, *arg;
+    int err;
+    PyErr_Fetch(&type, &value, &traceback);
+    if (value == NULL) {
+        value = Py_None;
+        Py_INCREF(value);
+    }
+    arg = PyTuple_Pack(3, type, value, traceback);
+    if (arg == NULL) {
+        PyErr_Restore(type, value, traceback);
+        return;
+    }
+    err = call_trace(func, self, f, PyTrace_EXCEPTION, arg);
+    Py_DECREF(arg);
+    if (err == 0)
+        PyErr_Restore(type, value, traceback);
+    else {
+        Py_XDECREF(type);
+        Py_XDECREF(value);
+        Py_XDECREF(traceback);
+    }
+}
+
 static PyObject *exit_cache = NULL;
 static PyObject *enter_cache = NULL;
 
@@ -1491,6 +1542,8 @@ PyInit_pyinternals(void) {
     ADD_INT_OFFSET("THREADSTATE_TRACEBACK_OFFSET",PyThreadState,exc_traceback);
     ADD_INT_OFFSET("THREADSTATE_VALUE_OFFSET",PyThreadState,exc_value);
     ADD_INT_OFFSET("THREADSTATE_TYPE_OFFSET",PyThreadState,exc_type);
+    ADD_INT_OFFSET("THREADSTATE_TRACEFUNC_OFFSET",PyThreadState,c_tracefunc);
+    ADD_INT_OFFSET("THREADSTATE_TRACEOBJ_OFFSET",PyThreadState,c_traceobj);
     if(PyModule_AddStringConstant(m,"ARCHITECTURE",ARCHITECTURE) == -1) return NULL;
     if(PyModule_AddObject(m,"REF_DEBUG",PyBool_FromLong(REF_DEBUG_VAL)) == -1) return NULL;
     if(PyModule_AddObject(m,"COUNT_ALLOCS",PyBool_FromLong(COUNT_ALLOCS_VAL)) == -1) return NULL;
@@ -1526,6 +1579,10 @@ PyInit_pyinternals(void) {
         ADD_ADDR(PyErr_Clear),
         ADD_ADDR(PyErr_Format),
         ADD_ADDR(PyErr_SetString),
+        ADD_ADDR(PyErr_Fetch),
+        ADD_ADDR(PyErr_Restore),
+        ADD_ADDR(PyErr_NormalizeException),
+        ADD_ADDR(PyException_SetTraceback),
         ADD_ADDR(PyNumber_Multiply),
         ADD_ADDR(PyNumber_TrueDivide),
         ADD_ADDR(PyNumber_FloorDivide),
@@ -1548,10 +1605,12 @@ PyInit_pyinternals(void) {
         ADD_ADDR(PyNumber_InPlaceXor),
         ADD_ADDR(PyNumber_InPlaceOr),
         ADD_ADDR(PyLong_AsLong),
+        ADD_ADDR(PyLong_FromLong),
         ADD_ADDR(PyList_New),
         ADD_ADDR(PyTuple_New),
         ADD_ADDR(PyTuple_Pack),
         ADD_ADDR(PySequence_Contains),
+        ADD_ADDR(PyTraceBack_Here),
         ADD_ADDR(_EnterRecursiveCall),
         ADD_ADDR(_LeaveRecursiveCall),
         ADD_ADDR(call_function),
@@ -1562,6 +1621,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR(_do_raise),
         ADD_ADDR(import_all_from),
         ADD_ADDR(special_lookup),
+        ADD_ADDR(call_exc_trace),
     
         ADD_ADDR(Py_True),
         ADD_ADDR(Py_False),

@@ -2,14 +2,14 @@
 from . multimethod import multimethod
 from . import x86_ops
 from .x86_ops import (
-    Displacement,Test,AsmSequence,al,cl,dl,bl,eax,ecx,edx,ebx,esp,ebp,esi,edi,
-    test_O,test_NO,test_B,test_NB,test_E,test_Z,test_NE,test_NZ,test_BE,test_A,
-    test_S,test_NS,test_P,test_NP,test_L,test_GE,test_LE,test_G,add,addb,addl,
-    cmp,cmpb,cmpl,decb,decl,incb,incl,jcc,JCC_MIN_LEN,JCC_MAX_LEN,jo,jno,jb,jnb,
-    je,jz,jne,jnz,jbe,ja,js,jns,jp,jnp,jl,jge,jle,jg,jmp,lea,leave,loop,loopz,
-    loope,loopnz,loopne,mov,movb,movl,nop,pop,ret,shl,shlb,shll,shr,shrb,shrl,
-    sub,subb,subl,test,testb,testl,xor,xorb,xorl,CALL_DISP_LEN,JCC_MIN_LEN,
-    JCC_MAX_LEN,JMP_DISP_MIN_LEN,JMP_DISP_MAX_LEN,LOOP_LEN,SIZE_B,SIZE_D,SIZE_Q
+    TEST_MNEMONICS,Displacement,Test,AsmSequence,al,cl,dl,bl,eax,ecx,edx,ebx,
+    esp,ebp,esi,edi,test_O,test_NO,test_B,test_NB,test_E,test_Z,test_NE,test_NZ,
+    test_BE,test_A,test_S,test_NS,test_P,test_NP,test_L,test_GE,test_LE,test_G,
+    add,addb,addl,cmp,cmpb,cmpl,decb,decl,incb,incl,jcc,JCC_MIN_LEN,JCC_MAX_LEN,
+    jmp,lea,leave,loop,loopz,loope,loopnz,loopne,mov,movb,movl,nop,pop,ret,shl,
+    shlb,shll,shr,shrb,shrl,sub,subb,subl,test,testb,testl,xor,xorb,xorl,
+    CALL_DISP_LEN,JMP_DISP_MIN_LEN,JMP_DISP_MAX_LEN,LOOP_LEN,SIZE_B,SIZE_D,
+    SIZE_Q
 )
 
 
