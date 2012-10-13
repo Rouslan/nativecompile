@@ -2469,6 +2469,55 @@ def _op_DUP_TOP(f):
         .incref()
     )
 
+def _unary_op(f,func):
+    tos = f.stack.tos()
+    return (f()
+        .push_tos()
+        .invoke(func,tos)
+        .check_err()
+        .pop_stack(f.r_scratch[0])
+        .push_stack(f.r_ret)
+        .decref(f.r_scratch[0])
+    )
+
+@handler
+def _op_UNARY_POSITIVE(f):
+    return _unary_op(f,'PyNumber_Positive');
+
+@handler
+def _op_UNARY_NEGATIVE(f):
+    return _unary_op(f,'PyNumber_Negative');
+
+@handler
+def _op_UNARY_INVERT(f):
+    return _unary_op(f,'PyNumber_Invert');
+
+@handler
+def _op_UNARY_NOT(f):
+    elif_ = JumpTarget()
+    else_ = JumpTarget()
+    endif = JumpTarget()
+
+    tos = f.stack.tos()
+    return (f()
+        .push_tos(True)
+        .invoke('PyObject_IsTrue',tos)
+        .pop_stack(f.r_scratch[0])
+        .decref(f.r_scratch[0],preserve_reg=f.r_ret)
+        .test(f.r_ret,f.r_ret)
+        .jnz(elif_)
+            .mov('Py_True',f.r_ret)
+            .goto(endif)
+        (elif_)
+            .mov('Py_False',f.r_ret)
+            .goto(endif)
+        .jl(else_)
+        (else_)
+            .goto_end(True)
+        (endif)
+        .incref()
+    )
+
 
 def join(x):
     return b''.join(x) if isinstance(x[0],bytes) else reduce(operator.add,x)
