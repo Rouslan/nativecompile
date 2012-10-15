@@ -504,10 +504,11 @@ def get_handler(op):
 
 
 class BlockEnd:
-    def __init__(self,type,offset):
+    def __init__(self,type,offset,stack=None):
         self.type = type
         self.offset = offset # byte offset in the byte-code
         self.target = JumpTarget()
+        self.stack = stack
 
     def prepare(self,f):
         return []
@@ -520,17 +521,24 @@ class LoopBlockEnd(BlockEnd):
         # destination here and set "stack". This is needed by END_FINALLY.
         self.continue_offset = None
 
+
+class HandlerBlock:
+    def __init__(self,type,stack,has_return):
+        self.type = type
+        self.stack = stack
+        self.has_return = has_return
+
 class ExceptBlockEnd(BlockEnd):
     def __init__(self,type,offset,stack,protect=EXCEPT_VALUES,extra_code=(lambda f: [])):
         # "except" and "finally" blocks will have EXCEPT_VALUES values on the
         # stack for them to inspect
-        super().__init__(type,offset)
-        self.stack = stack+EXCEPT_VALUES
+        super().__init__(type,offset,stack+EXCEPT_VALUES)
         self.protect = stack + protect
         self.extra_code = extra_code
+        self.has_return = False
 
     def prepare(self,f):
-        # run it first in case the stack is altered
+        # run it first in case it alters the stack
         r = self.extra_code(f)
 
         if f.stack.offset is None:
@@ -538,7 +546,7 @@ class ExceptBlockEnd(BlockEnd):
         elif f.stack.offset != self.stack:
             raise NCCompileError('Incorrect stack size at except/finally block')
 
-        f.handler_blocks.append((self.type,self.protect))
+        f.handler_blocks.append(HandlerBlock(self.type,self.protect,self.has_return))
         f.stack.protected_items.append(self.protect)
 
         return r
@@ -625,11 +633,6 @@ class Frame:
             if b.type == BLOCK_LOOP: return b
         return None
 
-    def current_exc_handler(self):
-        for t,s in reversed(self.handler_blocks):
-            if t == BLOCK_EXCEPT: return s
-        return None
-
     @property
     def r_ret(self):
         return self.abi.r_ret
@@ -702,20 +705,20 @@ class Frame:
         r = []
 
         # since subsequent exception-unwinds overwrite previous exception-
-        # unwinds, we could skip everything before the last except block if the
-        # functions at unwind_exc and unwind_finally were made to check for
-        # nulls when freeing the other stack items
+        # unwinds, we could skip everything before the last except block at the
+        # cost of making the functions at unwind_exc and unwind_finally check
+        # for nulls when freeing the other stack items
 
-        for htype,hstack in reversed(self.handler_blocks):
-            assert hstack is not None and stack.offset >= hstack
+        for hblock in reversed(self.handler_blocks):
+            assert hblock.stack is not None and stack.offset >= hblock.stack
 
-            is_exc = htype == BLOCK_EXCEPT
+            is_exc = hblock.type == BLOCK_EXCEPT
 
-            if (hstack - (3 if is_exc else 6)) < down_to: break
+            if (hblock.stack - (3 if is_exc else 6)) < down_to: break
 
             stack.protected_items.pop()
 
-            h_free = stack.offset - hstack
+            h_free = stack.offset - hblock.stack
             
             r.append(self.op.lea(stack[h_free],self.r_pres[0]))
             r.extend(self.mov(-h_free,self.r_scratch[0]))
@@ -794,7 +797,7 @@ class Frame:
 
         Note: the register specified by r_pres[1] is used and not preserved by
         these instructions. Additionally, if preserve_reg is not None,
-        self.stack[-1] will be used.
+        stack[-1] will be used.
 
         """
         assert STACK_EXTRA >= 1 or not preserve_reg
@@ -803,7 +806,7 @@ class Frame:
         if reg is None: reg = self.r_ret
 
         if pyinternals.REF_DEBUG:
-            inv = self.invoke('Py_DecRef',reg) * amount
+            inv = self.mov(reg,self.r_pres[1]) + self.invoke('Py_DecRef',self.r_pres[1]) * amount
             return [self.op.mov(preserve_reg,self.TEMP_EAX)] + inv + [self.op.mov(self.TEMP_EAX,preserve_reg)] if preserve_reg else inv
 
         assert reg.reg != self.r_pres[1].reg
@@ -1422,7 +1425,7 @@ def _op_RETURN_VALUE(f):
 
     block = f.current_finally()
 
-    if len(f.handler_blocks):
+    if f.handler_blocks:
         limit = 0
         if block: limit = block.stack - EXCEPT_VALUES
 
@@ -1445,9 +1448,9 @@ def _op_RETURN_VALUE(f):
         (r
             .incref(f.r_scratch[0],EXCEPT_VALUES-2)
 
-            # CPython keeps an array of integer objects between -5 and 256. For
-            # values in that range, this function never raises an exception,
-            # thus no error checking is done here.
+            # CPython keeps an array of pre-allocated integer objects between -5
+            # and 256. For values in that range, this function never raises an
+            # exception, thus no error checking is done here.
             .invoke('PyLong_FromLong',WHY_RETURN)
             .push_stack(f.r_ret)
 
@@ -1458,6 +1461,11 @@ def _op_RETURN_VALUE(f):
 
     f.stack.offset = None
     f.stack.tos_in_eax = False
+
+    for b in f.blockends:
+        if isinstance(b,ExceptBlockEnd):
+            b.has_return = True
+
     return r
 
 @handler
@@ -2210,13 +2218,13 @@ def pop_handler_block(f,type):
 
     if not f.handler_blocks:
         raise block_mismatch()
-    btype,stack = f.handler_blocks.pop()
-    if btype != type:
+    block = f.handler_blocks.pop()
+    if block.type != type:
         raise block_mismatch()
 
-    if stack is not None:
+    if block.stack is not None:
         if f.stack.offset is not None:
-            if f.stack.offset + f.stack.tos_in_eax != stack:
+            if f.stack.offset + f.stack.tos_in_eax != block.stack:
                 raise NCCompileError(
                     'Incorrect stack size at POP_EXCEPT instruction'
                         if type == BLOCK_EXCEPT else
@@ -2226,6 +2234,8 @@ def pop_handler_block(f,type):
             assert not f.stack.tos_in_eax
 
         f.stack.protected_items.pop()
+
+    return block.has_return
 
 @handler
 def _op_POP_EXCEPT(f):
@@ -2317,7 +2327,8 @@ def _op_END_FINALLY(f):
             nextf = b
             break
 
-    pop_handler_block(f,BLOCK_FINALLY)
+    has_return = pop_handler_block(f,BLOCK_FINALLY)
+    has_continue = nextl and nextl.continue_offset is not None
 
     not_long = JumpTarget()
     not_except = JumpTarget()
@@ -2334,86 +2345,89 @@ def _op_END_FINALLY(f):
     if not n_fits:
         r.mov(n_addr,f.r_pres[1])
 
-    (r
-        .mov(f.type_of(r_tmp1),r_tmp2)
-        .testl(TPFLAGS_LONG_SUBCLASS,f.type_flags_of(r_tmp2))
-        .jz(not_long)
-    )
+    r.mov(f.type_of(r_tmp1),r_tmp2)
 
-    if nextf and not nextl:
-        if f.stack.offset != nextf.stack:
-            raise NCCompileError('Incorrect stack size')
-
-        # The value of r_tmp1 will be WHY_RETURN or WHY_CONTINUE (WHY_SILENCED
-        # is not yet handled). Either way, just go to the next finally block.
-        r.goto(nextf.target)
-    else:
-        may_continue = nextl and nextl.continue_offset is not None
-        not_ret = JumpTarget()
+    if has_return or has_continue:
         (r
-            .invoke('PyLong_AsLong',r_tmp1)
-            .cmp(WHY_RETURN,f.r_ret)
-            .jne(not_ret if may_continue else err) # "WHY_SILENCED" not yet handled
+            .testl(TPFLAGS_LONG_SUBCLASS,f.type_flags_of(r_tmp2))
+            .jz(not_long)
         )
 
-        if nextf:
-            f_stack_diff = f.stack.offset - nextf.stack
+        if nextf and not nextl:
+            if f.stack.offset != nextf.stack:
+                raise NCCompileError('Incorrect stack size')
 
-            # since there is at least one loop between here and the next finally
-            # block, there should be some values to pop
-            assert f_stack_diff
-
-            # free the extra values and shift our values down
-            for n in range(f_stack_diff):
-                r.mov(f.stack[n+EXCEPT_VALUES],f.r_ret).decref()
-
-            (r
-                .mov(f.stack[0],f.r_ret)
-                .mov(f.stack[1],f.r_scratch[0])
-                .mov(f.stack[2],f.r_scratch[1]) # Py_None
-                .mov(f.r_ret,f.stack[f_stack_diff])
-                .mov(f.r_scratch[0],f.stack[1+f_stack_diff])
-            )
-            
-            # padding (if f_stack_diff is between 1 and 3 then that many stack
-            # items will already be Py_None)
-            for n in range(max(4-f_stack_diff,0),4):
-                r.mov(f.r_scratch[1],f.stack[2+n])
-
+            # The value of r_tmp1 will be WHY_RETURN or WHY_CONTINUE
+            # (WHY_SILENCED is not yet handled). Either way, just go to the next
+            # finally block.
             r.goto(nextf.target)
         else:
-            b = r.branch()
+            
+            not_ret = JumpTarget()
+            r.invoke('PyLong_AsLong',r_tmp1)
 
-            # the return value will stay on the stack for now
-            retaddr = b.stack[1]
+            if has_return:
+                r.cmp(WHY_RETURN,f.r_ret)
+                r.jne(not_ret if has_continue else err) # "WHY_SILENCED" not yet handled
 
-            (b
-                .mov(b.stack[0],f.r_scratch[0])
-                .decref(f.r_scratch[0])
-                .mov(b.stack[2],f.r_ret)
-                .decref(f.r_ret,amount=EXCEPT_VALUES-2) # all Py_None
-                .add_to_stack(-EXCEPT_VALUES)
-            )
-            if len(f.handler_blocks): b.unwind_handler()
-            b.mov(retaddr,f.r_ret)
-            b.goto_end()
+                if nextf:
+                    f_stack_diff = f.stack.offset - nextf.stack
 
-        if may_continue:
-            (r.branch()
-                (not_ret)
-                .cmp(WHY_CONTINUE,f.r_ret)
-                .jne(err) # "WHY_SILENCED" not yet handled
-                .decref(r_tmp1)
-                .add_to_stack(-1)
-                .pop_stack(f.r_ret)
-                .decref(amount=EXCEPT_VALUES-1) # padding
-                .add_to_stack(2-EXCEPT_VALUES)
-                (JumpRSource(
-                    f.op.jmp,
-                    f.abi,
-                    f.abi.JMP_DISP_MAX_LEN,
-                    f.reverse_target(nextl.continue_offset)))
-            )
+                    # since there is at least one loop between here and the next finally
+                    # block, there should be some values to pop
+                    assert f_stack_diff
+
+                    # free the extra values and shift our values down
+                    for n in range(f_stack_diff):
+                        r.mov(f.stack[n+EXCEPT_VALUES],f.r_ret).decref()
+
+                    (r
+                        .mov(f.stack[0],f.r_ret)
+                        .mov(f.stack[1],f.r_scratch[0])
+                        .mov(f.stack[2],f.r_scratch[1]) # Py_None
+                        .mov(f.r_ret,f.stack[f_stack_diff])
+                        .mov(f.r_scratch[0],f.stack[1+f_stack_diff])
+                    )
+
+                    # padding (if f_stack_diff is between 1 and 3 then that many stack
+                    # items will already be Py_None)
+                    for n in range(max(4-f_stack_diff,0),4):
+                        r.mov(f.r_scratch[1],f.stack[2+n])
+
+                    r.goto(nextf.target)
+                else:
+                    b = r.branch()
+
+                    # the return value will stay on the stack for now
+                    retaddr = b.stack[1]
+
+                    (b
+                        .mov(b.stack[0],f.r_scratch[0])
+                        .decref(f.r_scratch[0])
+                        .mov(b.stack[2],f.r_ret)
+                        .decref(f.r_ret,amount=EXCEPT_VALUES-2) # all Py_None
+                        .add_to_stack(-EXCEPT_VALUES)
+                    )
+                    if f.handler_blocks: b.unwind_handler()
+                    b.mov(retaddr,f.r_ret)
+                    b.goto_end()
+
+            if has_continue:
+                (r.branch()
+                    (not_ret)
+                    .cmp(WHY_CONTINUE,f.r_ret)
+                    .jne(err) # "WHY_SILENCED" not yet handled
+                    .decref(r_tmp1)
+                    .add_to_stack(-1)
+                    .pop_stack(f.r_ret)
+                    .decref(amount=EXCEPT_VALUES-1) # padding
+                    .add_to_stack(2-EXCEPT_VALUES)
+                    (JumpRSource(
+                        f.op.jmp,
+                        f.abi,
+                        f.abi.JMP_DISP_MAX_LEN,
+                        f.reverse_target(nextl.continue_offset)))
+                )
     (r
         (not_long)
 
@@ -2509,9 +2523,9 @@ def _op_UNARY_NOT(f):
             .mov('Py_True',f.r_ret)
             .goto(endif)
         (elif_)
+        .jl(else_)
             .mov('Py_False',f.r_ret)
             .goto(endif)
-        .jl(else_)
         (else_)
             .goto_end(True)
         (endif)
