@@ -2,6 +2,7 @@
 #include <Python.h>
 #include <structmember.h>
 #include <frameobject.h>
+#include <opcode.h>
 
 #if defined(__linux__) || defined(__linux) || defined(linux)
     #include <sys/mman.h>
@@ -1457,6 +1458,71 @@ call_exc_trace(Py_tracefunc func, PyObject *self, PyFrameObject *f)
     }
 }
 
+static PyObject *
+unicode_concatenate(PyObject *v, PyObject *w, PyFrameObject *f,
+                    unsigned char next_instr, int instr_arg)
+{
+    Py_ssize_t v_len = PyUnicode_GET_SIZE(v);
+    Py_ssize_t w_len = PyUnicode_GET_SIZE(w);
+    Py_ssize_t new_len = v_len + w_len;
+    if (new_len < 0) {
+        PyErr_SetString(PyExc_OverflowError,
+                        "strings are too large to concat");
+        return NULL;
+    }
+
+    if (Py_REFCNT(v) == 2) {
+        switch (next_instr) {
+        case STORE_FAST:
+        {
+            PyObject **fastlocals = f->f_localsplus;
+            if (GETLOCAL(instr_arg) == v)
+                SETLOCAL(instr_arg, NULL);
+            break;
+        }
+        case STORE_DEREF:
+        {
+            PyObject **freevars = (f->f_localsplus +
+                                   f->f_code->co_nlocals);
+            PyObject *c = freevars[instr_arg];
+            if (PyCell_GET(c) == v)
+                PyCell_Set(c, NULL);
+            break;
+        }
+        case STORE_NAME:
+        {
+            PyObject *names = f->f_code->co_names;
+            PyObject *name = PyTuple_GET_ITEM(names, instr_arg);
+            PyObject *locals = f->f_locals;
+            if (PyDict_CheckExact(locals) &&
+                PyDict_GetItem(locals, name) == v) {
+                if (PyDict_DelItem(locals, name) != 0) {
+                    PyErr_Clear();
+                }
+            }
+            break;
+        }
+        }
+    }
+
+    if (Py_REFCNT(v) == 1 && !PyUnicode_CHECK_INTERNED(v)) {
+        if (PyUnicode_Resize(&v, new_len) != 0) {
+            return NULL;
+        }
+
+        memcpy(PyUnicode_AS_UNICODE(v) + v_len,
+               PyUnicode_AS_UNICODE(w), w_len*sizeof(Py_UNICODE));
+        return v;
+    }
+    else {
+        w = PyUnicode_Concat(v, w);
+        Py_DECREF(v);
+        return w;
+    }
+}
+
+
+
 static PyObject *exit_cache = NULL;
 static PyObject *enter_cache = NULL;
 
@@ -1625,6 +1691,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR(import_all_from),
         ADD_ADDR(special_lookup),
         ADD_ADDR(call_exc_trace),
+        ADD_ADDR(unicode_concatenate),
     
         ADD_ADDR(Py_True),
         ADD_ADDR(Py_False),
@@ -1632,6 +1699,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR_OF(PyDict_Type),
         ADD_ADDR_OF(PyList_Type),
         ADD_ADDR_OF(PyTuple_Type),
+        ADD_ADDR_OF(PyUnicode_Type),
         ADD_ADDR(PyExc_KeyError),
         ADD_ADDR(PyExc_NameError),
         ADD_ADDR(PyExc_StopIteration),

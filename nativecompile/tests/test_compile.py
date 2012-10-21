@@ -218,6 +218,18 @@ except:
 print(a)
 ''')
 
+    def test_string_optimize(self):
+        self.compare_exec('''
+a = 'watermelon'
+a += 'A' # so 'a' is no longer interned
+oldid = id(a)
+a += 'B'
+print(oldid == id(a))
+a = a + 'C'
+print(oldid == id(a))
+print(a)
+''')
+
 
 if __name__ == '__main__':
     unittest.main()

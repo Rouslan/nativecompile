@@ -987,6 +987,13 @@ for x in (
         'test_NE',
         'test_NZ',
         'test_L',
+        'test_G',
+        'test_LE',
+        'test_GE',
+        'test_NB',
+        'test_A',
+        'test_BE',
+        'test_B',
         'CALL_DISP_LEN',
         'JCC_MIN_LEN',
         'JCC_MAX_LEN',
@@ -1027,6 +1034,64 @@ def strs_to_addrs(func):
 
 def destitch(x):
     return x.code if isinstance(x,Stitch) else x
+
+
+CMP_LT = 0
+CMP_LE = 1
+CMP_GT = 2
+CMP_GE = 3
+CMP_EQ = 4
+CMP_NE = 5
+
+CMP_MIRROR = [CMP_GT,CMP_GE,CMP_LT,CMP_LE,CMP_EQ,CMP_NE]
+
+
+class RegTest:
+    def __init__(self,val,signed=True):
+        self.val = val
+        self.signed = signed
+
+    def code(self,f,dest):
+        assert isinstance(self.val,f.Register)
+        return [f.op.test(self.val,self.val),f.jcc(f.test_Z,dest)]
+
+def regtest_cmp(cmp):
+    def inner(self,b):
+        if isinstance(b,RegTest):
+            assert self.signed == b.signed
+            b = b.val
+        return RegCmp(self.val,b,cmp,self.signed)
+    return inner
+
+for i,f in enumerate(['lt','le','gt','ge','eq','ne']):
+    setattr(RegTest,'__{}__'.format(f),regtest_cmp(i))
+
+signed = lambda val: RegTest(val,True)
+unsigned = lambda val: RegTest(val,False)
+
+class RegCmp:
+    def __init__(self,a,b,cmp,signed):
+        self.a = a
+        self.b = b
+        self.cmp = cmp
+        self.signed = signed
+
+    def code(self,f,dest):
+        a = self.a
+        b = self.b
+        cmp = self.cmp
+        if a == 0 or isinstance(a,f.Address) or (b != 0 and isinstance(b,int)):
+            a,b = b,a
+            cmp = CMP_MIRROR[cmp]
+
+        # test is inverted because we want to jump when the condition is false
+        test = ([f.test_GE,f.test_G,f.test_LE,f.test_L,f.test_NE,f.test_E]
+                    if self.signed else
+                [f.test_NB,f.test_A,f.test_BE,f.test_B,f.test_NE,f.test_E])[cmp]
+
+        return [
+            f.op.test(a,a) if b == 0 else f.cmp(a,b),
+            f.jcc(test,dest)]
 
 
 F_METHODS = set('j'+mn for mn in itertools.chain.from_iterable(TEST_MNEMONICS))
@@ -1101,18 +1166,31 @@ class Stitch:
         return self
 
     @arg1_as_subscr
-    def if_cond(self,test,opcodes):
-        if isinstance(opcodes,(bytes,self.f.abi.ops.AsmSequence)):
-            self.code += [
-                self.f.jcc(~test,self.f.Displacement(len(opcodes))),
-                opcodes]
+    def if_cond(self,test,code):
+        if isinstance(code,(bytes,self.f.abi.ops.AsmSequence)):
+            self.code.append(self.f.jcc(~test,self.f.Displacement(len(code))))
+            self.code.append(code)
         else:
             after = JumpTarget()
-            self.code += [
-                self.f.jcc(~test,after)
-            ] + destitch(opcodes) + [
-                after
-            ]
+            self.code.append(self.f.jcc(~test,after))
+            self.code.extend(destitch(code))
+            self.code.append(after)
+
+        return self
+
+    @arg1_as_subscr
+    def if_(self,test,code):
+        if isinstance(test,self.f.Register):
+            test = RegTest(test)
+
+        if isinstance(code,(bytes,self.f.abi.ops.AsmSequence)):
+            self.code.extend(test.code(self.f,self.f.Displacement(len(code))))
+            self.code.append(code)
+        else:
+            after = JumpTarget()
+            self.code.extend(test.code(self.f,after))
+            self.code.extend(destitch(code))
+            self.code.append(after)
 
         return self
 
@@ -1205,10 +1283,70 @@ def _op_BINARY_TRUE_DIVIDE(f):
 def _op_BINARY_FLOOR_DIVIDE(f):
     return _binary_op(f,'PyNumber_FloorDivide')
 
+def _op_add(f,func):
+    not_unicode = JumpTarget()
+    end = JumpTarget()
+    err = JumpTarget()
+
+    r_arg1 = f.stack.arg_reg(f.r_scratch[0],0)
+    r_arg2 = f.stack.arg_reg(f.r_ret,1)
+
+    r = f()
+
+    str_addr = pyinternals.raw_addresses['PyUnicode_Type']
+    if not f.fits_imm32(str_addr):
+        r.mov(str_addr,f.r_pres[1])
+        str_addr = f.r_pres[1]
+
+    future = f.code.co_code[f.next_byte_offset:]
+    nextop = future[0]
+    nextarg = 0
+    if nextop >= dis.HAVE_ARGUMENT:
+        nextarg = (future[2] << 8) + future[1]
+
+    tos = f.stack.tos()
+    return (r
+        .push_tos()
+        .mov(tos,r_arg2)
+        .mov(f.stack[1],r_arg1)
+        .mov(f.type_of(r_arg2),f.r_scratch[1])
+        .mov(f.type_of(r_arg1),f.r_pres[0])
+
+        .cmp(str_addr,f.r_scratch[1])
+        .jne(not_unicode)
+        .cmp(str_addr,f.r_pres[0])
+        .jne(not_unicode)
+            .invoke('unicode_concatenate',
+                r_arg1,
+                r_arg2,
+                f.FRAME,
+                nextop,
+                nextarg
+            )
+            .test(f.r_ret,f.r_ret)
+            .jz(err)
+
+            # unicode_concatenate consumes the reference to r_arg1 (f.stack[1])
+            .mov(f.r_ret,f.stack[1])
+
+            .goto(end)
+        (not_unicode)
+            .invoke(func,r_arg1,r_arg2)
+            .if_eax_is_zero(f()
+                (err)
+                .goto_end(True)
+            )
+            .mov(f.stack[1],f.r_scratch[0])
+            .mov(f.r_ret,f.stack[1])
+            .decref(f.r_scratch[0])
+        (end)
+        .pop_stack(f.r_scratch[1])
+        .decref(f.r_scratch[1])
+    )
+
 @handler
 def _op_BINARY_ADD(f):
-    # TODO: implement the optimization that ceval.c uses for unicode strings
-    return _binary_op(f,'PyNumber_Add')
+    return _op_add(f,'PyNumber_Add')
 
 @handler
 def _op_BINARY_SUBTRACT(f):
@@ -1256,8 +1394,7 @@ def _op_INPLACE_MODULO(f):
 
 @handler
 def _op_INPLACE_ADD(f):
-    # TODO: implement the optimization that ceval.c uses for unicode strings
-    return _binary_op(f,'PyNumber_InPlaceAdd')
+    return _op_add(f,'PyNumber_InPlaceAdd')
 
 @handler
 def _op_INPLACE_SUBTRACT(f):
@@ -1299,7 +1436,6 @@ def _op_LOAD_NAME(f,name):
         .mov(address_of(name),f.r_pres[0])
         (InnerCall(f.op,f.abi,f.util_funcs.local_name))
         .check_err()
-        .incref()
     )
 
 @handler
@@ -1317,6 +1453,7 @@ def _op_STORE_NAME(f,name):
     )
     if not fits:
         r.mov(dict_addr,f.r_scratch[1])
+        dict_addr = f.r_scratch[1]
 
     return (r
         .if_eax_is_zero(f()
@@ -1326,8 +1463,7 @@ def _op_STORE_NAME(f,name):
         )
         .mov('PyObject_SetItem',f.r_scratch[0])
         .push_arg(f.r_ret,n=0)
-        .cmp(dict_addr if fits else f.r_scratch[1],f.type_of(f.r_ret))
-        .if_cond[f.test_E](f()
+        .if_[signed(dict_addr) == f.type_of(f.r_ret)](f()
             .mov('PyDict_SetItem',f.r_scratch[0])
         )
         .call(f.r_scratch[0])
@@ -1688,8 +1824,7 @@ def _op_STORE_FAST(f,arg):
         .mov(f.FAST_LOCALS,f.r_scratch[0])
         .mov(item,f.r_scratch[1])
         .mov(f.r_ret,item)
-        .test(f.r_scratch[1],f.r_scratch[1])
-        .if_cond[f.test_NZ](
+        .if_[f.r_scratch[1]](
             join(f.decref(f.r_scratch[1]))
         )
     )
@@ -1823,9 +1958,7 @@ def _op_UNPACK_EX(f,arg):
         .lea(f.stack[0],argreg)
         .invoke('_unpack_iterable',f.r_pres[0],arg & 0xff,arg >> 8,argreg)
         .decref(f.r_pres[0],f.r_ret)
-        .if_eax_is_zero(f()
-            .goto_end(True)
-        )
+        .check_err()
     )
 
 def false_true_addr(swap):
@@ -1855,8 +1988,7 @@ def _op_COMPARE_OP(f,arg):
 
         return (r
             .mov(outcome_a,f.r_pres[0])
-            .cmp(f.r_ret,f.stack[0])
-            .if_cond[f.test_E](
+            .if_[signed(f.r_ret) == f.stack[0]](
                 f.mov(outcome_b,f.r_pres[0])
             )
             .decref(f.r_ret)
@@ -1873,8 +2005,7 @@ def _op_COMPARE_OP(f,arg):
         return (f()
             .push_tos()
             .invoke('PySequence_Contains',tos,f.stack[1])
-            .test(f.r_ret,f.r_ret)
-            .if_cond[f.test_L](f()
+            .if_[signed(f.r_ret) < 0](f()
                 .mov(0,f.r_ret)
                 .goto_end(True)
             )
@@ -2022,8 +2153,7 @@ def _op_STORE_ATTR(f,name):
         .decref()
         .pop_stack(f.r_ret)
         .decref()
-        .test(f.r_pres[0],f.r_pres[0])
-        .if_cond[f.test_NZ](f()
+        .if_[f.r_pres[0]](f()
             .mov(0,f.r_ret)
             .goto_end(True)
         )
@@ -2074,8 +2204,7 @@ def _op_IMPORT_NAME(f,name):
             .push_arg(address_of(name))
             .push_arg(f.GLOBALS)
             .push_arg(f.r_ret)
-            .test(f.r_ret,f.r_ret)
-            .if_cond[f.test_Z](join(f()
+            .if_eax_is_zero(join(f()
                 .push_arg('Py_None',n=f.stack.args-1).code
             ))
             .push_arg(f.stack[0]))
@@ -2090,8 +2219,7 @@ def _op_IMPORT_NAME(f,name):
         .mov(f.r_ret,r_imp)
         .incref()
         .invoke('PyLong_AsLong',f.stack[1])
-        .cmp(-1,f.r_ret)
-        .if_cond[f.test_NE](f()
+        .if_[signed(f.r_ret) != -1](f()
             .call('PyErr_Occurred')
             .if_eax_is_not_zero(
                 prepare_args(5)
@@ -2114,8 +2242,7 @@ def _op_IMPORT_NAME(f,name):
         .pop_stack(f.r_ret)
         .decref()
         .mov(a_args,f.r_ret)
-        .test(f.r_ret,f.r_ret)
-        .if_cond[f.test_Z](f()
+        .if_eax_is_zero(f()
             .decref(r_imp)
             .goto_end(True)
         )
@@ -2253,10 +2380,8 @@ def _op_POP_EXCEPT(f):
         .mov(f.r_pres[0],f.Address(pyinternals.THREADSTATE_TYPE_OFFSET,f.r_pres[1]))
         .mov(f.r_ret,f.Address(pyinternals.THREADSTATE_VALUE_OFFSET,f.r_pres[1]))
         .mov(f.r_scratch[0],f.Address(pyinternals.THREADSTATE_TRACEBACK_OFFSET,f.r_pres[1]))
-        .test(f.r_scratch[0],f.r_scratch[0])
-        .if_cond[f.test_NZ](f.decref(f.r_scratch[0],preserve_reg=f.r_ret))
-        .test(f.r_ret,f.r_ret)
-        .if_cond[f.test_NZ](f.decref(f.r_ret))
+        .if_[f.r_scratch[0]](f.decref(f.r_scratch[0],preserve_reg=f.r_ret))
+        .if_[f.r_ret](f.decref(f.r_ret))
         .decref(f.r_pres[0]) # set to Py_None if NULL by prepare_exc_handler_func
         .add_to_stack(-3)
     )
@@ -2582,6 +2707,7 @@ def local_name_func(op,abi,tuning):
     else_ = JumpTarget()
     endif = JumpTarget()
     ret = JumpTarget()
+    inc_ret = JumpTarget()
 
     d_addr = pyinternals.raw_addresses['PyDict_Type']
     fits = f.fits_imm32(d_addr)
@@ -2595,8 +2721,7 @@ def local_name_func(op,abi,tuning):
         .mov(f.LOCALS,f.r_ret)
         .if_eax_is_zero(f()
             .invoke('PyErr_Format','PyExc_SystemError','NO_LOCALS_LOAD_MSG',f.r_pres[0])
-            .add(stack_ptr_shift,abi.r_sp)
-            .ret()
+            .goto(ret)
         )
         
         .cmp(d_addr if fits else f.r_scratch[0],f.type_of(f.r_ret))
@@ -2614,7 +2739,7 @@ def local_name_func(op,abi,tuning):
         (else_)
             .invoke('PyDict_GetItem',f.r_ret,f.r_pres[0])
             .test(f.r_ret,f.r_ret)
-            .jnz(ret)
+            .jnz(inc_ret)
         (endif)
     
         .invoke('PyDict_GetItem',f.GLOBALS,f.r_pres[0])
@@ -2624,9 +2749,13 @@ def local_name_func(op,abi,tuning):
                 .invoke('format_exc_check_arg',
                     'NAME_ERROR_MSG',
                     'PyExc_NameError')
+                .mov(0,f.r_ret)
+                .goto(ret)
             )
         )
         
+        (inc_ret)
+        .incref(f.r_ret)
         (ret)
         .add(stack_ptr_shift,abi.r_sp)
         .ret()
@@ -2657,8 +2786,7 @@ def prepare_exc_handler_func_head(op,abi,tuning):
         .invoke('PyTraceBack_Here',f.FRAME)
         .mov(f.Address(pyinternals.THREADSTATE_TRACEFUNC_OFFSET,f.r_pres[1]),r_tmp1)
         .mov(f.Address(pyinternals.THREADSTATE_TRACEOBJ_OFFSET,f.r_pres[1]),r_tmp2)
-        .test(r_tmp1,r_tmp1)
-        .if_cond[f.test_NZ](
+        .if_[r_tmp1](
             f.invoke('call_exc_trace',r_tmp1,r_tmp2)
         )
         .pop_stack(f.r_scratch[0])
@@ -2723,8 +2851,7 @@ def prepare_exc_handler_func_tail(op,abi,tuning):
         .mov(tb,f.r_scratch[1])
         .incref(f.r_ret)
         .incref(f.r_scratch[0])
-        .test(f.r_scratch[1],f.r_scratch[1])
-        .if_cond[f.test_Z](
+        .if_[signed(f.r_scratch[1]) == 0](
             f().mov('Py_None',f.r_scratch[1])
         )
         .mov(f.r_ret,f.Address(pyinternals.THREADSTATE_TYPE_OFFSET,f.r_pres[1]))
@@ -2814,10 +2941,8 @@ def unwind_exc_func_tail(op,abi,tuning):
     del t_exc, t_val, t_tb
     return (r
         .decref(f.r_scratch[0],preserve_reg=f.r_scratch[1]) # set to Py_None if NULL by prepare_exc_handler_func
-        .test(f.r_scratch[1],f.r_scratch[1])
-        .if_cond[f.test_NZ](f.decref(f.r_scratch[1]))
-        .test(f.r_pres[1],f.r_pres[0])
-        .if_cond[f.test_NZ](f.decref(f.r_pres[0]))
+        .if_[f.r_scratch[1]](f.decref(f.r_scratch[1]))
+        .if_[f.r_pres[0]](f.decref(f.r_pres[0]))
         .add(stack_ptr_shift,abi.r_sp)
         .ret()
     )
