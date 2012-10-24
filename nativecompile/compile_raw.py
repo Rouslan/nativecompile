@@ -1574,24 +1574,23 @@ def _op_RETURN_VALUE(f):
         r.pop_stack(f.r_ret)
     
     if block:
-        (r
-            .mov('Py_None',f.r_scratch[0])
-            .add_to_stack(EXCEPT_VALUES-2)
-            .push_stack(f.r_ret)
-        )
+        r.mov('Py_None',f.r_scratch[0])
+        r.add_to_stack(EXCEPT_VALUES-2)
+        r.push_stack(f.r_ret)
+
         for i in range(1,EXCEPT_VALUES-1):
             r.mov(f.r_scratch[0],r.stack[i])
-        (r
-            .incref(f.r_scratch[0],EXCEPT_VALUES-2)
 
-            # CPython keeps an array of pre-allocated integer objects between -5
-            # and 256. For values in that range, this function never raises an
-            # exception, thus no error checking is done here.
-            .invoke('PyLong_FromLong',WHY_RETURN)
-            .push_stack(f.r_ret)
+        r.incref(f.r_scratch[0],EXCEPT_VALUES-2)
 
-            .goto(block.target)
-        )
+        # CPython keeps an array of pre-allocated integer objects between -5 and
+        # 256. For values in that range, this function never raises an
+        # exception, thus no error checking is done here.
+        r.invoke('PyLong_FromLong',WHY_RETURN)
+        r.push_stack(f.r_ret)
+
+        r.goto(block.target)
+
     else:
         r.end_func()
 
@@ -2542,15 +2541,15 @@ def _op_END_FINALLY(f):
                     (not_ret)
                     .cmp(WHY_CONTINUE,f.r_ret)
                     .jne(err) # "WHY_SILENCED" not yet handled
-                    .decref(r_tmp1)
-                    .add_to_stack(-1)
+                    .pop_stack(f.r_scratch[0])
+                    .decref(f.r_scratch[0])
                     .pop_stack(f.r_ret)
                     .decref(amount=EXCEPT_VALUES-1) # padding
                     .add_to_stack(2-EXCEPT_VALUES)
                     (JumpRSource(
                         f.op.jmp,
                         f.abi,
-                        f.abi.JMP_DISP_MAX_LEN,
+                        f.JMP_DISP_MAX_LEN,
                         f.reverse_target(nextl.continue_offset)))
                 )
     (r
@@ -2656,6 +2655,56 @@ def _op_UNARY_NOT(f):
         (endif)
         .incref()
     )
+
+@handler
+def _op_CONTINUE_LOOP(f,to):
+    fblock = None
+    for b in reversed(f.blockends):
+        if b.type == BLOCK_FINALLY and not fblock:
+            fblock = b
+        elif b.type == BLOCK_LOOP:
+            if b.continue_offset is None:
+                b.continue_offset = to
+                b.stack = f.stack.offset
+            else:
+                if b.continue_offset != to:
+                    raise NCCompileError('Loop has multiple "continue" statements with disagreeing targets')
+                if b.stack != f.stack.offset:
+                    raise NCCompileError('Loop has multiple "continue" statements with disagreeing stack offsets')
+            break
+    else:
+        raise NCCompileError('"continue" statement found not inside loop')
+
+    # .unwind_handler() alters StackManager.protected_items
+    r = f().push_tos().branch()
+
+    if f.handler_blocks:
+        limit = r.stack.offset
+        if fblock:
+            assert (fblock.stack - EXCEPT_VALUES) >= limit
+            limit = fblock.stack - EXCEPT_VALUES
+        r.unwind_handler(limit)
+
+    if fblock:
+        r.mov('Py_None',f.r_scratch[0])
+        r.add_to_stack(EXCEPT_VALUES-1)
+
+        for i in range(1,EXCEPT_VALUES-1):
+            r.mov(f.r_scratch[0],r.stack[i])
+
+        r.incref(f.r_scratch[0],EXCEPT_VALUES-1)
+
+        # CPython keeps an array of pre-allocated integer objects between -5 and
+        # 256. For values in that range, this function never raises an
+        # exception, thus no error checking is done here.
+        r.invoke('PyLong_FromLong',WHY_CONTINUE)
+        r.push_stack(f.r_ret)
+
+        r.goto(fblock.target)
+    else:
+        r(JumpRSource(f.op.jmp,f.abi,f.JMP_DISP_MAX_LEN,f.reverse_target(to)))
+
+    return r
 
 
 def join(x):

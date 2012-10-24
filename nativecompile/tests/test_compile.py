@@ -216,6 +216,15 @@ try:
 except:
     a = a - 100
 print(a)
+
+a=0
+for x in range(10):
+    try:
+        if x == 6: continue
+        a += 1
+    finally:
+        a += 10
+print(a)
 ''')
 
     def test_string_optimize(self):
