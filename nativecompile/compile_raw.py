@@ -521,6 +521,8 @@ class LoopBlockEnd(BlockEnd):
         # destination here and set "stack". This is needed by END_FINALLY.
         self.continue_offset = None
 
+        self.has_break = False
+
 
 class HandlerBlock:
     def __init__(self,type,stack,has_return):
@@ -2389,6 +2391,8 @@ _op_POP_EXCEPT.omitted = lambda f: pop_handler_block(f,BLOCK_EXCEPT)
 
 @handler
 def _op_END_FINALLY(f):
+    # WHY_SILENCED not yet handled
+
     # if this value changes, the code here will need updating
     assert EXCEPT_VALUES == 6
 
@@ -2453,6 +2457,7 @@ def _op_END_FINALLY(f):
 
     has_return = pop_handler_block(f,BLOCK_FINALLY)
     has_continue = nextl and nextl.continue_offset is not None
+    has_break = nextl and nextl.has_break
 
     not_long = JumpTarget()
     not_except = JumpTarget()
@@ -2471,7 +2476,7 @@ def _op_END_FINALLY(f):
 
     r.mov(f.type_of(r_tmp1),r_tmp2)
 
-    if has_return or has_continue:
+    if has_return or has_continue or has_break:
         (r
             .testl(TPFLAGS_LONG_SUBCLASS,f.type_flags_of(r_tmp2))
             .jz(not_long)
@@ -2481,24 +2486,25 @@ def _op_END_FINALLY(f):
             if f.stack.offset != nextf.stack:
                 raise NCCompileError('Incorrect stack size')
 
-            # The value of r_tmp1 will be WHY_RETURN or WHY_CONTINUE
+            # The value of r_tmp1 will be WHY_RETURN, WHY_CONTINUE or WHY_BREAK
             # (WHY_SILENCED is not yet handled). Either way, just go to the next
             # finally block.
             r.goto(nextf.target)
         else:
             
-            not_ret = JumpTarget()
+            check_break = JumpTarget()
+            check_cont = JumpTarget()
             r.invoke('PyLong_AsLong',r_tmp1)
 
             if has_return:
                 r.cmp(WHY_RETURN,f.r_ret)
-                r.jne(not_ret if has_continue else err) # "WHY_SILENCED" not yet handled
+                r.jne(check_break if has_break else (check_cont if has_continue else err))
 
                 if nextf:
                     f_stack_diff = f.stack.offset - nextf.stack
 
-                    # since there is at least one loop between here and the next finally
-                    # block, there should be some values to pop
+                    # since there is at least one loop between here and the next
+                    # finally block, there should be some values to pop
                     assert f_stack_diff
 
                     # free the extra values and shift our values down
@@ -2513,8 +2519,8 @@ def _op_END_FINALLY(f):
                         .mov(f.r_scratch[0],f.stack[1+f_stack_diff])
                     )
 
-                    # padding (if f_stack_diff is between 1 and 3 then that many stack
-                    # items will already be Py_None)
+                    # padding (if f_stack_diff is between 1 and 3 then that many
+                    # stack items will already be Py_None)
                     for n in range(max(4-f_stack_diff,0),4):
                         r.mov(f.r_scratch[1],f.stack[2+n])
 
@@ -2536,22 +2542,37 @@ def _op_END_FINALLY(f):
                     b.mov(retaddr,f.r_ret)
                     b.goto_end()
 
-            if has_continue:
-                (r.branch()
-                    (not_ret)
-                    .cmp(WHY_CONTINUE,f.r_ret)
-                    .jne(err) # "WHY_SILENCED" not yet handled
+            if has_break or has_continue:
+                loop_jump_inner = join(f().branch()
                     .pop_stack(f.r_scratch[0])
                     .decref(f.r_scratch[0])
                     .pop_stack(f.r_ret)
                     .decref(amount=EXCEPT_VALUES-1) # padding
-                    .add_to_stack(2-EXCEPT_VALUES)
-                    (JumpRSource(
-                        f.op.jmp,
-                        f.abi,
-                        f.JMP_DISP_MAX_LEN,
-                        f.reverse_target(nextl.continue_offset)))
+                    .code
                 )
+
+                if has_break:
+                    (r
+                        (check_break)
+                        .cmp(WHY_BREAK,f.r_ret)
+                        .jne(check_cont if has_continue else err)
+                        (loop_jump_inner)
+                        .goto(nextl.target)
+                    )
+
+                if has_continue:
+                    (r
+                        (check_cont)
+                        .cmp(WHY_CONTINUE,f.r_ret)
+                        .jne(err)
+                        (loop_jump_inner)
+                        (JumpRSource(
+                            f.op.jmp,
+                            f.abi,
+                            f.JMP_DISP_MAX_LEN,
+                            f.reverse_target(nextl.continue_offset)))
+                    )
+
     (r
         (not_long)
 
@@ -2581,6 +2602,7 @@ def _op_END_FINALLY(f):
         .if_cond[f.test_NE](f()
             (err)
             .invoke('PyErr_SetString','PyExc_SystemError','BAD_EXCEPTION_MSG')
+            .mov(0,f.r_ret)
             .goto_end(True)
         )
         .decref(r_tmp1,amount=EXCEPT_VALUES) # all values are None
@@ -2656,25 +2678,7 @@ def _op_UNARY_NOT(f):
         .incref()
     )
 
-@handler
-def _op_CONTINUE_LOOP(f,to):
-    fblock = None
-    for b in reversed(f.blockends):
-        if b.type == BLOCK_FINALLY and not fblock:
-            fblock = b
-        elif b.type == BLOCK_LOOP:
-            if b.continue_offset is None:
-                b.continue_offset = to
-                b.stack = f.stack.offset
-            else:
-                if b.continue_offset != to:
-                    raise NCCompileError('Loop has multiple "continue" statements with disagreeing targets')
-                if b.stack != f.stack.offset:
-                    raise NCCompileError('Loop has multiple "continue" statements with disagreeing stack offsets')
-            break
-    else:
-        raise NCCompileError('"continue" statement found not inside loop')
-
+def _loop_jump(f,fblock,jmp_source,typecode):
     # .unwind_handler() alters StackManager.protected_items
     r = f().push_tos().branch()
 
@@ -2697,14 +2701,55 @@ def _op_CONTINUE_LOOP(f,to):
         # CPython keeps an array of pre-allocated integer objects between -5 and
         # 256. For values in that range, this function never raises an
         # exception, thus no error checking is done here.
-        r.invoke('PyLong_FromLong',WHY_CONTINUE)
+        r.invoke('PyLong_FromLong',typecode)
         r.push_stack(f.r_ret)
 
         r.goto(fblock.target)
     else:
-        r(JumpRSource(f.op.jmp,f.abi,f.JMP_DISP_MAX_LEN,f.reverse_target(to)))
+        r(jmp_source)
 
     return r
+
+@handler
+def _op_CONTINUE_LOOP(f,to):
+    fblock = None
+    for b in reversed(f.blockends):
+        if b.type == BLOCK_FINALLY and not fblock:
+            fblock = b
+        elif b.type == BLOCK_LOOP:
+            if b.continue_offset is None:
+                b.continue_offset = to
+                b.stack = f.stack.offset
+            else:
+                if b.continue_offset != to:
+                    raise NCCompileError('Loop has multiple "continue" statements with disagreeing targets')
+                if b.stack != f.stack.offset:
+                    raise NCCompileError('Loop has multiple "continue" statements with disagreeing stack offsets')
+            break
+    else:
+        raise NCCompileError('"continue" op-code found not inside loop')
+
+    return _loop_jump(
+        f,
+        fblock,
+        JumpRSource(f.op.jmp,f.abi,f.JMP_DISP_MAX_LEN,f.reverse_target(to)),
+        WHY_CONTINUE)
+
+@handler
+def _op_BREAK_LOOP(f):
+    fblock = None
+    target = None
+    for b in reversed(f.blockends):
+        if b.type == BLOCK_FINALLY and not fblock:
+            fblock = b
+        elif b.type == BLOCK_LOOP:
+            b.has_break = True
+            target = b.target
+            break
+    else:
+        raise NCCompileError('"break" op-code found not inside loop')
+
+    return _loop_jump(f,fblock,f.goto(target),WHY_BREAK)
 
 
 def join(x):

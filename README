@@ -8,7 +8,6 @@ The compiler supports the x86 and x86-64 instruction sets.
 The following bytecode instructions are not yet implemented:
 BINARY_MODULO
 BINARY_POWER
-BREAK_LOOP
 BUILD_SET
 BUILD_SLICE
 CALL_FUNCTION_KW
@@ -61,7 +60,7 @@ Usage:
 >>> nativecompile.importer.install_importer()
 >>> import mymodule
 >>> bcode = compile('mymodule.myfunction()','<string>','exec')
->>> mcode = nativecompile.compile()
+>>> mcode = nativecompile.compile(bcode)
 >>> mcode()
 
 Calling install_importer will install a path hook (see
