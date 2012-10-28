@@ -710,19 +710,19 @@ err_args(PyObject *func, int flags, int nargs)
                      nargs);
 }
 
-static void
+static PyObject *
 format_exc_check_arg(PyObject *exc, const char *format_str, PyObject *obj)
 {
     const char *obj_str;
 
     if (!obj)
-        return;
+        return NULL;
 
     obj_str = _PyUnicode_AsString(obj);
     if (!obj_str)
-        return;
+        return NULL;
 
-    PyErr_Format(exc, format_str, obj_str);
+    return PyErr_Format(exc, format_str, obj_str);
 }
 
 /* we store stack values in reverse order compared to how CPython stores them so

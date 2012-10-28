@@ -831,6 +831,8 @@ class Frame:
         
         if preserve_reg:
             mid.append(self.op.mov(stack[-1],preserve_reg))
+        elif preserve_reg == 0:
+            mid.extend(self.mov(0,self.r_ret))
         
         mid = join(mid)
         
@@ -1082,7 +1084,9 @@ class RegCmp:
         a = self.a
         b = self.b
         cmp = self.cmp
-        if a == 0 or isinstance(a,f.Address) or (b != 0 and isinstance(b,int)):
+        if ((a == 0 and not isinstance(b,f.Address)) or
+                isinstance(a,f.Address) or
+                (b != 0 and isinstance(b,int))):
             a,b = b,a
             cmp = CMP_MIRROR[cmp]
 
@@ -1488,7 +1492,7 @@ def _op_DELETE_NAME(f,name):
             .goto_end(True)
         )
         .invoke('PyObject_DelItem',f.r_ret,address_of(name))
-        .if_eax_is_zero(f()
+        .if_eax_is_not_zero(f()
             .invoke('format_exc_check_arg',
                 'PyExc_NameError',
                 'NAME_ERROR_MSG',
@@ -1936,7 +1940,7 @@ def _op_UNPACK_SEQUENCE(f,arg):
             .lea(f.stack[0],p3)
             .invoke('_unpack_iterable',f.r_pres[0],arg,-1,p3)
             .if_eax_is_zero(f()
-                .decref(f.r_pres[0])
+                .decref(f.r_pres[0],preserve_reg=0)
                 .goto_end(True)
             )
         (done)
@@ -2123,6 +2127,7 @@ def _op_LOAD_BUILD_CLASS(f):
         .invoke('PyDict_GetItemString',f.BUILTINS,'__build_class__')
         .if_eax_is_zero(f()
             .invoke('PyErr_SetString','PyExc_ImportError','BUILD_CLASS_ERROR_MSG')
+            .mov(0,f.r_ret)
             .goto_end(True)
         )
         .incref()
@@ -2215,6 +2220,7 @@ def _op_IMPORT_NAME(f,name):
         .invoke('PyDict_GetItemString',f.BUILTINS,'__import__')
         .if_eax_is_zero(f()
             .invoke('PyErr_SetString','PyExc_ImportError','IMPORT_NOT_FOUND_MSG')
+            .mov(0,f.r_ret)
             .goto_end(True)
         )
         .mov(f.r_ret,r_imp)
@@ -2244,7 +2250,7 @@ def _op_IMPORT_NAME(f,name):
         .decref()
         .mov(a_args,f.r_ret)
         .if_eax_is_zero(f()
-            .decref(r_imp)
+            .decref(r_imp,preserve_reg=0)
             .goto_end(True)
         )
 
@@ -2437,6 +2443,7 @@ def _op_END_FINALLY(f):
         (r
             (err)
             .invoke('PyErr_SetString','PyExc_SystemError','BAD_EXCEPTION_MSG')
+            .mov(0,f.r_ret)
             .goto_end(True)
         )
         f.stack.offset = None
@@ -2673,6 +2680,7 @@ def _op_UNARY_NOT(f):
             .mov('Py_False',f.r_ret)
             .goto(endif)
         (else_)
+            .mov(0,f.r_ret)
             .goto_end(True)
         (endif)
         .incref()
@@ -2750,6 +2758,62 @@ def _op_BREAK_LOOP(f):
         raise NCCompileError('"break" op-code found not inside loop')
 
     return _loop_jump(f,fblock,f.goto(target),WHY_BREAK)
+
+@handler
+def _op_DELETE_SUBSCR(f):
+    tos = f.stack.tos()
+    return (f()
+        .push_tos()
+        .invoke('PyObject_DelItem',f.stack[1],tos)
+        .check_err(True)
+        .pop_stack(f.r_ret)
+        .decref()
+        .pop_stack(f.r_ret)
+        .decref()
+    )
+
+@handler
+@hasname
+def _op_DELETE_ATTR(f,name):
+    tos = f.stack.tos()
+    return (f()
+        .push_tos()
+        .invoke('PyObject_SetAttr',tos,address_of(name),0)
+        .check_err(True)
+        .pop_stack(f.r_ret)
+        .decref()
+    )
+
+@handler
+@hasname
+def _op_DELETE_GLOBAL(f,name):
+    return (f()
+        .push_tos()
+        .invoke('PyDict_DelItem',f.GLOBALS,address_of(name))
+        .if_eax_is_not_zero(f()
+            .invoke('format_exc_check_arg',
+                'PyExc_NameError',
+                'GLOBAL_NAME_ERROR_MSG',
+                address_of(name))
+            .goto_end(True)
+        )
+    )
+
+@handler
+def _op_DELETE_FAST(f,arg):
+    item = f.Address(arg*f.ptr_size,f.r_scratch[0])
+    return (f()
+        .push_tos()
+        .mov(f.FAST_LOCALS,f.r_scratch[0])
+        .if_[signed(item) == 0](f()
+            .invoke('format_exc_check_arg',
+                'PyExc_UnboundLocalError',
+                'UNBOUNDLOCAL_ERROR_MSG',
+                address_of(f.code.co_varnames[arg]))
+            .goto_end(True)
+        )
+        .mov(0,item)
+    )
 
 
 def join(x):
@@ -2841,9 +2905,9 @@ def local_name_func(op,abi,tuning):
             .invoke('PyDict_GetItem',f.BUILTINS,f.r_pres[0])
             .if_eax_is_zero(f()
                 .invoke('format_exc_check_arg',
+                    'PyExc_NameError',
                     'NAME_ERROR_MSG',
-                    'PyExc_NameError')
-                .mov(0,f.r_ret)
+                    f.r_pres[0])
                 .goto(ret)
             )
         )
