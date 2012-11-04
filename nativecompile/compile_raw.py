@@ -6,7 +6,7 @@ import operator
 import types
 import itertools
 import collections
-from functools import partial, reduce, update_wrapper
+from functools import partial, reduce, update_wrapper, wraps
 
 from . import pyinternals
 from .x86_ops import TEST_MNEMONICS
@@ -46,10 +46,11 @@ WHY_SILENCED =  0x0080
 BLOCK_LOOP = 1
 BLOCK_EXCEPT = 2
 BLOCK_FINALLY = 3
+BLOCK_WITH = 4
 
 EXCEPT_VALUES = 6
 
-RERAISE = 2 # (True + 1)
+RERAISE = True + 1
 
 
 class NCCompileError(SystemError):
@@ -525,7 +526,7 @@ class LoopBlockEnd(BlockEnd):
 
 
 class HandlerBlock:
-    def __init__(self,type,stack,has_return):
+    def __init__(self,type,stack,has_return=False):
         self.type = type
         self.stack = stack
         self.has_return = has_return
@@ -553,13 +554,16 @@ class ExceptBlockEnd(BlockEnd):
 
         return r
 
+def is_finally(x):
+    return x.type == BLOCK_FINALLY or x.type == BLOCK_WITH
+
 class OmittedExceptBlockEnd:
     def __init__(self,type,offset):
         self.type = type
         self.offset = offset # byte offset in the byte-code
 
     def prepare(self,f):
-        f.handler_blocks.append((self.type,None))
+        f.handler_blocks.append(HandlerBlock(self.type,None))
         return []
     
 
@@ -622,12 +626,12 @@ class Frame:
 
     def current_except_or_finally(self):
         for b in reversed(self.blockends):
-            if b.type == BLOCK_EXCEPT or b.type == BLOCK_FINALLY: return b
+            if b.type == BLOCK_EXCEPT or is_finally(b): return b
         return None
 
     def current_finally(self):
         for b in reversed(self.blockends):
-            if b.type == BLOCK_FINALLY: return b
+            if is_finally(b): return b
         return None
 
     def current_loop(self):
@@ -2269,86 +2273,102 @@ def _op_IMPORT_NAME(f,name):
         )
     )
 
-#@handler
-#def _op_SETUP_WITH(f,arg):
-#    r = f()
-#    if f.use_tos():
-#        r.mov(f.r_ret,f.r_pres[0])
-#    else:
-#        r.pop_stack(f.r_pres[0])
-#
-#    return (r
-#        .invoke('special_lookup',f.r_pres[0],'__exit__','exit_cache')
-#        .if_eax_is_zero(f()
-#            .decref(f.r_pres[0])
-#            .mov(0,f.r_ret)
-#            .goto_end(True)
-#        )
-#        .push_stack(f.r_ret)
-#        .invoke('special_lookup',f.r_pres[0],'__enter__','enter_cache')
-#        .decref(f.r_pres[0],f.r_ret)
-#        .mov(f.r_ret,f.r_pres[0])
-#        .check_err()
-#        .invoke('PyObject_CallFunctionObjArgs',f.r_ret,0)
-#        .decref(f.r_pres[0],f.r_ret)
-#        .check_err()
+def block_start(type,**kwds):
+    def decorator(func):
+        @wraps(func)
+        @hasoffset
+        def inner(f,to):
+            r = func(f,to)
 
+            f.blockends.append(ExceptBlockEnd(type,to,f.stack.offset,**kwds))
+            f.stack.conditional_jump(to,EXCEPT_VALUES)
+
+            return r
+
+        inner.omitted = hasoffset(
+            lambda f,to: f.blockends.append(OmittedExceptBlockEnd(type,to)))
+
+        return inner
+    return decorator
+
+# When a finally block is entered without a jump, only one value will be
+# pushed onto the stack for it to look at, so we pad the stack with 5 more
+def add_nones(f):
+    # if stack.offset is None, the finally block is never reached by
+    # fall-through, only by an exception, return, break or continue
+    if f.stack.offset is not None:
+        r = f()
+        if isinstance(f.op,f.abi.ops.Assembly):
+            r.comment("'finally' fixup")
+        if not f.stack.use_tos():
+            r.pop_stack(f.r_ret)
+
+        r.mov('Py_None',f.r_scratch[0])
+        for x in range(EXCEPT_VALUES-1):
+            r.push_stack(f.r_scratch[0])
+
+        return (r
+            .push_stack(f.r_ret)
+            .incref(f.r_scratch[0],EXCEPT_VALUES-1)
+        )
+    return []
+
+# unlike "except" and "finally" blocks, "with" blocks don't have user-defined
+# handler code, so this function makes sure the next two opcodes are
+# WITH_CLEANUP and END_FINALLY
+def with_cleanup(f):
+    c = f.code.co_code
+    if (len(c) < f.byte_offset + 2 or
+            c[f.byte_offset] != dis.opmap['WITH_CLEANUP'] or
+            c[f.byte_offset+1] != dis.opmap['END_FINALLY']):
+        raise NCCompileError('There is a "with" block that is not properly cleaned up')
+
+    return add_nones(f)
 
 @handler
-@hasoffset
+@block_start(BLOCK_WITH,extra_code=with_cleanup)
+def _op_SETUP_WITH(f,to):
+    r = f()
+    if f.stack.use_tos(True):
+        r.mov(f.r_ret,f.r_pres[0])
+    else:
+        r.pop_stack(f.r_pres[0])
+
+    return (r
+        .invoke('special_lookup',f.r_pres[0],'__exit__','exit_cache')
+        .if_eax_is_zero(f()
+            .decref(f.r_pres[0],preserve_reg=0)
+            .goto_end(True)
+        )
+        .push_stack(f.r_ret)
+        .invoke('special_lookup',f.r_pres[0],'__enter__','enter_cache')
+        .decref(f.r_pres[0],f.r_ret)
+        .mov(f.r_ret,f.r_pres[0])
+        .check_err()
+        .invoke('PyObject_CallFunctionObjArgs',f.r_ret,0)
+        .decref(f.r_pres[0],f.r_ret)
+        .check_err()
+    )
+
+# if this value changes, the code here will need updating
+assert EXCEPT_VALUES == 6
+@handler
+@block_start(BLOCK_EXCEPT,protect=3)
 def _op_SETUP_EXCEPT(f,to):
-    # if this value changes, the code here will need updating
-    assert EXCEPT_VALUES == 6
-
-    f.blockends.append(ExceptBlockEnd(BLOCK_EXCEPT,to,f.stack.offset,3))
-    f.stack.conditional_jump(to,EXCEPT_VALUES)
     return []
-
-@hasoffset
-def omitted(f,to):
-    f.blockends.append(OmittedExceptBlockEnd(BLOCK_EXCEPT,to))
-
-_op_SETUP_EXCEPT.omitted = omitted
 
 @handler
-@hasoffset
+@block_start(BLOCK_FINALLY,extra_code=add_nones)
 def _op_SETUP_FINALLY(f,to):
-    # When a finally block is entered without a jump, only one value will be
-    # pushed onto the stack for it to look at, so we pad the stack with 5 more
-    def add_nones(f):
-        if f.stack.offset is not None:
-            r = f()
-            if isinstance(f.op,f.abi.ops.Assembly):
-                r.comment("'finally' fixup")
-            if not f.stack.use_tos():
-                r.pop_stack(f.r_ret)
-
-            r.mov('Py_None',f.r_scratch[0])
-            for x in range(EXCEPT_VALUES-1):
-                r.push_stack(f.r_scratch[0])
-
-            return (r
-                .push_stack(f.r_ret)
-                .incref(f.r_scratch[0],EXCEPT_VALUES-1)
-            )
-        return []
-
-    f.blockends.append(ExceptBlockEnd(BLOCK_FINALLY,to,f.stack.offset,extra_code=add_nones))
-    f.stack.conditional_jump(to,EXCEPT_VALUES)
     return []
-
-@hasoffset
-def omitted(f,to):
-    f.blockends.append(OmittedExceptBlockEnd(BLOCK_FINALLY,to))
-
-_op_SETUP_FINALLY.omitted = omitted
 
 def pop_handler_block(f,type):
     def block_mismatch():
-        return NCCompileError(
-            'There is a POP_EXCEPT instruction not correctly matched with a SETUP_EXCEPT instruction'
-                if type == BLOCK_EXCEPT else
-            'There is an END_FINALLY instruction not correctly matched with a SETUP_FINALLY instruction')
+        raise NCCompileError(
+            '{0} instruction not correctly matched with {1}'.format(*([
+                ('POP_EXCEPT','SETUP_EXCEPT'),
+                ('END_FINALLY','SETUP_FINALLY'),
+                ('CLEANUP_WITH','SETUP_WITH')][type-BLOCK_EXCEPT])))
 
     if not f.handler_blocks:
         raise block_mismatch()
@@ -2360,16 +2380,26 @@ def pop_handler_block(f,type):
         if f.stack.offset is not None:
             if f.stack.offset + f.stack.tos_in_eax != block.stack:
                 raise NCCompileError(
-                    'Incorrect stack size at POP_EXCEPT instruction'
-                        if type == BLOCK_EXCEPT else
-                    'Incorrect stack size at END_FINALLY instruction')
+                    'Incorrect stack size at {} instruction'.format(
+                        ['POP_EXCEPT','END_FINALLY','CLEANUP_WITH'][type-BLOCK_EXCEPT]))
 
             # this shouldn't be possible
             assert not f.stack.tos_in_eax
 
         f.stack.protected_items.pop()
 
-    return block.has_return
+    return block
+
+@handler
+def _op_WITH_CLEANUP(f):
+    # The checks need to be done here but we let END_FINALLY do all the work so
+    # the block gets put back
+    b = pop_handler_block(f,BLOCK_WITH)
+    f.handler_blocks.append(b)
+
+    assert f.code.co_code[f.next_byte_offset] == dis.opmap['END_FINALLY']
+
+    return []
 
 @handler
 def _op_POP_EXCEPT(f):
@@ -2449,7 +2479,16 @@ def _op_END_FINALLY(f):
         f.stack.offset = None
         return r
 
-    
+
+    if f.handler_blocks and f.handler_blocks[-1].type == BLOCK_WITH:
+        # CLEANUP_WITH already called pop_handler_block (and pushed the block
+        # back on) so we don't need to do it here
+        hblock = f.handler_blocks.pop()
+        with_cleanup = True
+        r_tmp1 = f.r_pres[0]
+    else:
+        hblock = pop_handler_block(f,BLOCK_FINALLY)
+        with_cleanup = False
 
     # find the next "finally" block and the next loop block if it comes before
     # the "finally" block
@@ -2458,47 +2497,101 @@ def _op_END_FINALLY(f):
     for b in reversed(f.blockends):
         if b.type == BLOCK_LOOP:
             if not nextl: nextl = b
-        elif b.type == BLOCK_FINALLY:
+        elif is_finally(b):
             nextf = b
             break
 
-    has_return = pop_handler_block(f,BLOCK_FINALLY)
+    has_return = hblock.has_return
     has_continue = nextl and nextl.continue_offset is not None
     has_break = nextl and nextl.has_break
 
     not_long = JumpTarget()
     not_except = JumpTarget()
     err = JumpTarget()
+    end = JumpTarget()
 
     n_addr = pyinternals.raw_addresses['Py_None']
     n_fits = f.fits_imm32(n_addr)
 
-    # TODO: check if there even was a return keyword in the try block and omit
-    # the WHY_RETURN code if there wasn't
 
     r = f().mov(f.stack[0],r_tmp1)
     
     if not n_fits:
         r.mov(n_addr,f.r_pres[1])
+        n_addr = f.r_pres[1]
 
-    r.mov(f.type_of(r_tmp1),r_tmp2)
+    (r
+        .mov(f.type_of(r_tmp1),r_tmp2)
+
+        .testl(TPFLAGS_TYPE_SUBCLASS,f.type_flags_of(r_tmp2))
+        .jz(not_except)
+        .testl(TPFLAGS_BASE_EXC_SUBCLASS,f.type_flags_of(r_tmp1))
+        .jz(not_except)
+    )
+
+    arg1 = r_tmp1
+    if with_cleanup:
+        exit_fail = JumpTarget()
+        (r
+            # call the stored __exit__ function
+            .invoke('PyObject_CallFunctionObjArgs',f.stack[6],r_tmp1,f.stack[1],f.stack[2],0)
+            .test(f.r_ret,f.r_ret)
+            .jz(exit_fail)
+            .mov(f.r_ret,f.r_pres[0])
+            .invoke('PyObject_IsTrue',f.r_ret)
+            .decref(f.r_pres[0],preserve_reg=f.r_ret)
+            .test(f.r_ret,f.r_ret)
+            .if_cond[f.test_L](f()
+                (exit_fail)
+                .lea(f.stack[3],f.r_pres[0])
+                .mov(-3,f.r_scratch[0])
+                (InnerCall(f.op,f.abi,f.util_funcs.unwind_exc))
+                .goto_end(True)
+            )
+            .if_cond[f.test_G](f()
+                .lea(f.stack[3],f.r_pres[0])
+                .mov(-3,f.r_scratch[0])
+                (InnerCall(f.op,f.abi,f.util_funcs.unwind_exc))
+                .goto(end)
+            )
+        )
+        arg1 = f.stack[0]
+
+    b = r.branch()
+    (b
+        .add_to_stack(-1)
+        .pop_stack(r_tmp2)
+        .pop_stack(r_tmp3)
+
+        # PyErr_Restore steals references
+        .invoke('PyErr_Restore',arg1,r_tmp2,r_tmp3)
+        .lea(b.stack[0],f.r_pres[0])
+        .mov(0,f.r_scratch[0])
+        (InnerCall(f.op,f.abi,f.util_funcs.unwind_exc))
+        .add_to_stack(-3)
+        .goto_end(RERAISE)
+    )
+
+    r(not_except)
+
+    if with_cleanup:
+        # call the stored __exit__ function
+        r.invoke('PyObject_CallFunctionObjArgs',f.stack[6],n_addr,n_addr,n_addr,0)
+        r.check_err()
+        r.decref()
 
     if has_return or has_continue or has_break:
-        (r
-            .testl(TPFLAGS_LONG_SUBCLASS,f.type_flags_of(r_tmp2))
-            .jz(not_long)
-        )
+        if with_cleanup:
+            r.mov(f.type_of(r_tmp1),r_tmp2) # r_tmp is r_pres[0]
 
-        if nextf and not nextl:
-            if f.stack.offset != nextf.stack:
-                raise NCCompileError('Incorrect stack size')
+        r.testl(TPFLAGS_LONG_SUBCLASS,f.type_flags_of(r_tmp2))
+        r.jz(not_long)
 
-            # The value of r_tmp1 will be WHY_RETURN, WHY_CONTINUE or WHY_BREAK
-            # (WHY_SILENCED is not yet handled). Either way, just go to the next
-            # finally block.
+        if nextf and f.stack.offset == nextf.stack:
+            assert not (nextl or with_cleanup)
+            # just go to the next finally block
             r.goto(nextf.target)
         else:
-            
             check_break = JumpTarget()
             check_cont = JumpTarget()
             r.invoke('PyLong_AsLong',r_tmp1)
@@ -2509,12 +2602,10 @@ def _op_END_FINALLY(f):
 
                 if nextf:
                     f_stack_diff = f.stack.offset - nextf.stack
+                    assert f_stack_diff > 0
 
-                    # since there is at least one loop between here and the next
-                    # finally block, there should be some values to pop
-                    assert f_stack_diff
-
-                    # free the extra values and shift our values down
+                    # free the extra values (including the __exit__ function)
+                    # and shift our values down
                     for n in range(f_stack_diff):
                         r.mov(f.stack[n+EXCEPT_VALUES],f.r_ret).decref()
 
@@ -2545,18 +2636,26 @@ def _op_END_FINALLY(f):
                         .decref(f.r_ret,amount=EXCEPT_VALUES-2) # all Py_None
                         .add_to_stack(-EXCEPT_VALUES)
                     )
+
+                    # the __exit__ function, if present, will get popped off by
+                    # either unwind_handler or end_func
+
                     if f.handler_blocks: b.unwind_handler()
                     b.mov(retaddr,f.r_ret)
-                    b.goto_end()
+                    b.end_func()
 
             if has_break or has_continue:
-                loop_jump_inner = join(f().branch()
+                loop_jump_inner = (f().branch()
                     .pop_stack(f.r_scratch[0])
                     .decref(f.r_scratch[0])
                     .pop_stack(f.r_ret)
-                    .decref(amount=EXCEPT_VALUES-1) # padding
-                    .code
-                )
+                    .decref(amount=EXCEPT_VALUES-1)) # padding
+
+                if with_cleanup:
+                    # pop off __exit__ function
+                    loop_jump_inner.pop_stack(f.r_ret).decref()
+
+                loop_jump_inner = join(loop_jump_inner.code)
 
                 if has_break:
                     (r
@@ -2583,29 +2682,7 @@ def _op_END_FINALLY(f):
     (r
         (not_long)
 
-        .testl(TPFLAGS_TYPE_SUBCLASS,f.type_flags_of(r_tmp2))
-        .jz(not_except)
-        .testl(TPFLAGS_BASE_EXC_SUBCLASS,f.type_flags_of(r_tmp1))
-        .jz(not_except)
-    )
-    b = r.branch()
-    (b
-            .add_to_stack(-1)
-            .pop_stack(r_tmp2)
-            .pop_stack(r_tmp3)
-
-            # PyErr_Restore steals references
-            .invoke('PyErr_Restore',r_tmp1,r_tmp2,r_tmp3)
-            .lea(b.stack[0],f.r_pres[0])
-            .mov(0,f.r_scratch[0])
-            (InnerCall(f.op,f.abi,f.util_funcs.unwind_exc))
-            .add_to_stack(-3)
-            .goto_end(RERAISE)
-    )
-    (r
-        (not_except)
-
-        .cmp(n_addr if n_fits else f.r_pres[1],r_tmp1)
+        .cmp(n_addr,r_tmp1)
         .if_cond[f.test_NE](f()
             (err)
             .invoke('PyErr_SetString','PyExc_SystemError','BAD_EXCEPTION_MSG')
@@ -2615,11 +2692,23 @@ def _op_END_FINALLY(f):
         .decref(r_tmp1,amount=EXCEPT_VALUES) # all values are None
     )
 
-    return r.add_to_stack(-EXCEPT_VALUES)
+    r.add_to_stack(-EXCEPT_VALUES)
+    r(end)
+
+    if with_cleanup:
+        # pop off __exit__ function
+        r.pop_stack(f.r_ret).decref()
+
+    return r
 
 def omitted(f):
     if not f.last_op_is_jump:
-        pop_handler_block(f,BLOCK_FINALLY)
+        if f.handler_blocks and f.handler_blocks[-1].type == BLOCK_WITH:
+            # CLEANUP_WITH already called pop_handler_block (and pushed the
+            # block back on) so we don't need to do it here
+            f.handler_blocks.pop()
+        else:
+            pop_handler_block(f,BLOCK_FINALLY)
 
 _op_END_FINALLY.omitted = omitted
 
@@ -2722,7 +2811,7 @@ def _loop_jump(f,fblock,jmp_source,typecode):
 def _op_CONTINUE_LOOP(f,to):
     fblock = None
     for b in reversed(f.blockends):
-        if b.type == BLOCK_FINALLY and not fblock:
+        if is_finally(b) and not fblock:
             fblock = b
         elif b.type == BLOCK_LOOP:
             if b.continue_offset is None:
@@ -2748,7 +2837,7 @@ def _op_BREAK_LOOP(f):
     fblock = None
     target = None
     for b in reversed(f.blockends):
-        if b.type == BLOCK_FINALLY and not fblock:
+        if is_finally(b) and not fblock:
             fblock = b
         elif b.type == BLOCK_LOOP:
             b.has_break = True

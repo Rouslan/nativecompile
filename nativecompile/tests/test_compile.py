@@ -239,6 +239,31 @@ print(oldid == id(a))
 print(a)
 ''')
 
+    def test_with(self):
+        self.compare_exec('''
+class Thing:
+    def __enter__(self):
+        print('start')
+    def __exit__(self,exc_type,exc_value,traceback):
+        print('finish')
+        return exc_type == ZeroDivisionError
+
+with Thing():
+    print('stuff')
+
+try:
+    with Thing():
+        1/0
+except:
+    print('apples!')
+
+try:
+    with Thing() as t:
+        t.invalid_attribute
+except:
+    print('mushrooms!')
+''')
+
 
 if __name__ == '__main__':
     unittest.main()
