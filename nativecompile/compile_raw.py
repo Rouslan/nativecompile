@@ -2904,6 +2904,46 @@ def _op_DELETE_FAST(f,arg):
         .mov(0,item)
     )
 
+@handler
+def _op_BINARY_MODULO(f):
+    tos = f.stack.tos()
+    r = f()
+
+    uaddr = pyinternals.raw_addresses['PyUnicode_Type']
+    if not f.fits_imm32(uaddr):
+        r.mov(uaddr,f.r_scratch[0])
+        uaddr = f.r_scratch[0]
+
+    return (r
+        .push_tos()
+        .mov(tos,f.r_ret)
+        .mov('PyUnicode_Format',f.r_scratch[1])
+        .if_[signed(uaddr) != f.type_of(f.r_ret)](
+            join(f().mov('PyNumber_Remainder',f.r_scratch[1]).code)
+        )
+        .invoke(f.r_scratch[1],f.stack[1],f.r_ret)
+        .check_err()
+        .mov(f.stack[1],f.r_scratch[0])
+        .mov(f.r_ret,f.stack[1])
+        .decref(f.r_scratch[0])
+        .pop_stack(f.r_ret)
+        .decref()
+    )
+
+@handler
+def _op_BINARY_POWER(f):
+    tos = f.stack.tos()
+    return (f()
+        .push_tos()
+        .invoke('PyNumber_Power',f.stack[1],tos,'Py_None')
+        .check_err()
+        .mov(f.stack[1],f.r_scratch[1])
+        .mov(f.r_ret,f.stack[1])
+        .decref(f.r_scratch[1])
+        .pop_stack(f.r_ret)
+        .decref()
+    )
+
 
 def join(x):
     return b''.join(x) if isinstance(x[0],bytes) else reduce(operator.add,x)
