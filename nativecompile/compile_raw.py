@@ -2944,6 +2944,63 @@ def _op_BINARY_POWER(f):
         .decref()
     )
 
+def hasfree(func):
+    return update_wrapper(
+        (lambda f,arg: func(f,arg,f.Address(
+            (arg + f.code.co_nlocals) * f.ptr_size,
+            f.r_scratch[0]))),
+        func)
+
+@handler
+@hasfree
+def _op_LOAD_CLOSURE(f,arg,item):
+    return (f()
+        .mov(f.FAST_LOCALS,f.r_scratch[0])
+        .push_tos(True)
+        .mov(item,f.r_ret)
+        .incref()
+    )
+
+@handler
+@hasfree
+def _op_LOAD_DEREF(f,arg,item):
+    return (f()
+        .mov(f.FAST_LOCALS,f.r_scratch[0])
+        .push_tos(True)
+        .invoke('PyCell_Get',item)
+        .if_eax_is_zero(f()
+            .invoke('format_exc_unbound',address_of(f.code),arg)
+            .goto_end(True)
+        )
+    )
+
+@handler
+@hasfree
+def _op_STORE_DEREF(f,arg,item):
+     tos = f.stack.tos()
+
+     return (f()
+        .mov(f.FAST_LOCALS,f.r_scratch[0])
+        .push_tos()
+        .invoke('PyCell_Set',item,tos)
+        .pop_stack(f.r_ret)
+        .decref()
+    )
+
+@handler
+@hasfree
+def _op_DELETE_DEREF(f,arg,item):
+    return (f()
+        .mov(f.FAST_LOCALS,f.r_scratch[0])
+        .push_tos()
+        .mov(item,f.r_ret)
+        .if_[signed(f.Address(pyinternals.CELL_REF_OFFSET,f.r_ret)) == 0](f()
+            .invoke('format_exc_unbound',address_of(f.code),arg)
+            .goto_end(True)
+        )
+        .invoke('PyCell_Set',f.r_ret,0)
+    )
+
 
 def join(x):
     return b''.join(x) if isinstance(x[0],bytes) else reduce(operator.add,x)

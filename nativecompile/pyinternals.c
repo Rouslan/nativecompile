@@ -725,6 +725,28 @@ format_exc_check_arg(PyObject *exc, const char *format_str, PyObject *obj)
     return PyErr_Format(exc, format_str, obj_str);
 }
 
+static PyObject *
+format_exc_unbound(PyCodeObject *co, int oparg)
+{
+    PyObject *name;
+    if (PyErr_Occurred())
+        return NULL;
+    if (oparg < PyTuple_GET_SIZE(co->co_cellvars)) {
+        name = PyTuple_GET_ITEM(co->co_cellvars,
+                                oparg);
+        format_exc_check_arg(
+            PyExc_UnboundLocalError,
+            UNBOUNDLOCAL_ERROR_MSG,
+            name);
+    } else {
+        name = PyTuple_GET_ITEM(co->co_freevars, oparg -
+                                PyTuple_GET_SIZE(co->co_cellvars));
+        format_exc_check_arg(PyExc_NameError,
+                             UNBOUNDFREE_ERROR_MSG, name);
+    }
+    return NULL;
+}
+
 /* we store stack values in reverse order compared to how CPython stores them so
    this function is given an extra parameter to multiply the index by, which can
    be 1 or -1 */
@@ -1610,6 +1632,7 @@ PyInit_pyinternals(void) {
     ADD_INT_OFFSET("THREADSTATE_TYPE_OFFSET",PyThreadState,exc_type);
     ADD_INT_OFFSET("THREADSTATE_TRACEFUNC_OFFSET",PyThreadState,c_tracefunc);
     ADD_INT_OFFSET("THREADSTATE_TRACEOBJ_OFFSET",PyThreadState,c_traceobj);
+    ADD_INT_OFFSET("CELL_REF_OFFSET",PyCellObject,ob_ref);
     if(PyModule_AddStringConstant(m,"ARCHITECTURE",ARCHITECTURE) == -1) return NULL;
     if(PyModule_AddObject(m,"REF_DEBUG",PyBool_FromLong(REF_DEBUG_VAL)) == -1) return NULL;
     if(PyModule_AddObject(m,"COUNT_ALLOCS",PyBool_FromLong(COUNT_ALLOCS_VAL)) == -1) return NULL;
@@ -1683,10 +1706,13 @@ PyInit_pyinternals(void) {
         ADD_ADDR(PySequence_Contains),
         ADD_ADDR(PyTraceBack_Here),
         ADD_ADDR(PyUnicode_Format),
+        ADD_ADDR(PyCell_Get),
+        ADD_ADDR(PyCell_Set),
         ADD_ADDR(_EnterRecursiveCall),
         ADD_ADDR(_LeaveRecursiveCall),
         ADD_ADDR(call_function),
         ADD_ADDR(format_exc_check_arg),
+        ADD_ADDR(format_exc_unbound),
         ADD_ADDR(_make_function),
         ADD_ADDR(_unpack_iterable),
         ADD_ADDR(_exception_cmp),
