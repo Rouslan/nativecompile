@@ -392,7 +392,7 @@ def _op_addr_reg(byte1,a,b,reverse):
 def _op_imm_reg(byte1,mid,byte_alt,a,b):
     if b.code == 0:
         r = bytes([byte_alt | b.w]) + immediate_data(b.w,a)
-        if b.size == SIZE_Q: r = bytes([0b01001000]) + r
+        if b.size == SIZE_Q: r = b'\x48' + r
         return r
 
     fits = fits_in_sbyte(a)
@@ -441,7 +441,7 @@ def addl(a : int,b : Address):
 
 @multimethod
 def call(proc : Displacement):
-    return bytes([0b11101000]) + int_to_32(proc.val)
+    return b'\xE8' + int_to_32(proc.val)
 
 CALL_DISP_LEN = 5
 
@@ -454,7 +454,26 @@ def call(proc : Register):
 
 @multimethod
 def call(proc : Address):
-    return rex(None,proc,False) + bytes([0b11111111]) + proc.mod_rm_sib_disp(0b010)
+    return rex(None,proc,False) + b'\xFF' + proc.mod_rm_sib_disp(0b010)
+
+
+
+@multimethod
+def cmovcc(test : Test,a : Register,b : Register):
+    assert a.w and b.w
+
+    # unlike most, this instruction moves R/M to Reg instead of Reg to R/M
+    # (lookup the Intel machine instruction format for the nomenclature)
+    return rex(b,a) + bytes([
+        0b00001111,
+        0b01000000 | test.val,
+        0b11000000 | (b.reg << 3) | a.reg])
+
+@multimethod
+def cmovcc(test : Test,a : Address,b : Register):
+    assert b.w
+    return rex(b,a) + bytes([0b00001111,0b01000000 | test.val]) + a.mod_rm_sib_disp(b.reg)
+
 
 
 @multimethod
@@ -480,6 +499,11 @@ def cmpb(a : int,b : Address):
 @multimethod
 def cmpl(a : int,b : Address):
     return _op_imm_addr(0b10000000,0b111,a,b,True)
+
+
+
+def cpuid():
+    return b'\x0F\xA2'
 
 
 
@@ -559,35 +583,35 @@ def jmp(x : Register):
 
 @multimethod
 def jmp(x : Address):
-    return rex(None,x) + bytes([0b11111111]) + x.mod_rm_sib_disp(0b100)
+    return rex(None,x) + b'\xFF' + x.mod_rm_sib_disp(0b100)
 
 
 
 @multimethod
 def lea(a : Address,b : Register):
     assert b.w
-    return rex(b,a) + bytes([0b10001101]) + a.mod_rm_sib_disp(b.reg)
+    return rex(b,a) + b'\x8D' + a.mod_rm_sib_disp(b.reg)
 
 
 
 def leave():
-    return bytes([0b11001001])
+    return b'\xC9'
 
 
 
 @multimethod
 def loop(x : Displacement):
-    return bytes([0b11100010]) + int_to_8(x.val)
+    return b'\xE2' + int_to_8(x.val)
 
 @multimethod
 def loopz(x : Displacement):
-    return bytes([0b11100001]) + int_to_8(x.val)
+    return b'\xE1' + int_to_8(x.val)
 
 loope = loopz
     
 @multimethod
 def loopnz(x : Displacement):
-    return bytes([0b11100000]) + int_to_8(x.val)
+    return b'\xE0' + int_to_8(x.val)
 
 loopne = loopnz
 
@@ -602,7 +626,7 @@ def mov(a : Register,b : Register):
 def mov_addr_reg(a,b,forward):
     if b.reg == 0b000 and a.offset_only():
         r = bytes([0b10100000 | (forward << 1) | b.w]) + int_to_32(a.offset)
-        if b.size == SIZE_Q: r = bytes([0b01001000]) + r
+        if b.size == SIZE_Q: r = b'\x48' + r
         return r
 
     return _op_addr_reg(0b10001000,a,b,forward)
@@ -633,7 +657,24 @@ def movl(a : int,b : Address):
 
 
 def nop():
-    return bytes([0b10010000])
+    return b'\x90'
+
+
+
+@multimethod
+def not_(x : Register):
+    return rex(None,x) + bytes([0b11110110 | x.w, 0b11010000 | x.reg])
+
+def not_addr(x,w):
+    return rex(None,x) + bytes([0b11110110 | w]) + x.mod_rm_sib_disp(0b010)
+
+@multimethod
+def notb(x : Address):
+    return not_addr(x,False)
+
+@multimethod
+def notl(x : Address):
+    return not_addr(x,True)
 
 
 
@@ -643,7 +684,7 @@ def pop(x : Register):
 
 @multimethod
 def pop(x : Address):
-    return rex(None,x,False) + bytes([0b10001111]) + x.mod_rm_sib_disp(0)
+    return rex(None,x,False) + b'\x8F' + x.mod_rm_sib_disp(0)
 
 
 
@@ -653,7 +694,7 @@ def push(x : Register):
 
 @multimethod
 def push(x : Address):
-    return rex(None,x,False) + bytes([0b11111111]) + x.mod_rm_sib_disp(0b110)
+    return rex(None,x,False) + b'\xFF' + x.mod_rm_sib_disp(0b110)
 
 @multimethod
 def push(x : int):
@@ -664,11 +705,11 @@ def push(x : int):
 
 @multimethod
 def ret():
-    return bytes([0b11000011])
+    return b'\xC3'
 
 @multimethod
 def ret(pop : int):
-    return bytes([0b11000010]) + int_to_16(pop)
+    return b'\xC2' + int_to_16(pop)
 
 
 
