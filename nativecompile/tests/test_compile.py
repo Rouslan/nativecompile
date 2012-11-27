@@ -264,6 +264,20 @@ except:
     print('mushrooms!')
 ''')
 
+    def test_var_kw_func(self):
+        self.compare_exec('''
+a = [1,2,3]
+b = {'a':'A','b':'B','c':'C'}
+def f(*args,**kwds):
+  print(args)
+  print(kwds)
+
+f(*a)
+f(**b)
+f(*a,**b)
+f(0,*a,**b)
+''')
+
 
 if __name__ == '__main__':
     unittest.main()

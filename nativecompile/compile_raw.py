@@ -17,7 +17,7 @@ PRINT_STACK_OFFSET = False
 
 CALL_ALIGN_MASK = 0xf
 MAX_ARGS = 6
-DEBUG_TEMPS = 2
+DEBUG_TEMPS = 3
 SAVED_REGS = 2 # the number of registers saved *after* the base pointer
 
 
@@ -50,6 +50,9 @@ BLOCK_WITH = 4
 EXCEPT_VALUES = 6
 
 RERAISE = True + 1
+
+CALL_FLAG_VAR = 1
+CALL_FLAG_KW = 2
 
 
 class NCCompileError(SystemError):
@@ -577,6 +580,7 @@ class Frame:
         self.TEMP = next(a)
 
         if pyinternals.REF_DEBUG:
+            self.TEMP_EAX = next(a)
             self.TEMP_ECX = next(a)
             self.TEMP_EDX = next(a)
         elif pyinternals.COUNT_ALLOCS:
@@ -772,13 +776,13 @@ class Frame:
         if pyinternals.REF_DEBUG:
             # the registers that would otherwise be undisturbed, must be preserved
             return ([
-                self.op.mov(self.r_ret,self.TEMP),
+                self.op.mov(self.r_ret,self.TEMP_EAX),
                 self.op.mov(self.r_scratch[0],self.TEMP_ECX),
                 self.op.mov(self.r_scratch[1],self.TEMP_EDX)
             ] + (self.invoke('Py_IncRef',reg) * amount) + [
                 self.op.mov(self.TEMP_EDX,self.r_scratch[1]),
                 self.op.mov(self.TEMP_ECX,self.r_scratch[0]),
-                self.op.mov(self.TEMP,self.r_ret)])
+                self.op.mov(self.TEMP_EAX,self.r_ret)])
 
         return [self.add(amount,self.Address(pyinternals.REFCNT_OFFSET,reg))]
 
@@ -795,7 +799,7 @@ class Frame:
                 inv = self.mov(reg,self.TEMP_ECX) + inv + self.invoke('Py_DecRef',self.TEMP_ECX) * (amount-1)
 
             if preserve_reg:
-                inv = [self.op.mov(preserve_reg,self.TEMP_EAX)] + inv + [self.op.mov(self.TEMP_EAX,preserve_reg)]
+                inv = [self.op.mov(preserve_reg,self.TEMP)] + inv + [self.op.mov(self.TEMP,preserve_reg)]
 
             return inv
 
@@ -3075,6 +3079,61 @@ def _op_LIST_APPEND(f,arg):
 def _op_SET_ADD(f,arg):
     return _sequence_add('PySet_Add',f,arg)
 
+def call_function_var_kw(f,arg,flags):
+    assert f.stack.tos_in_eax == 1 or f.stack.tos_in_eax == 0
+
+    na = arg & 0xff
+    nk = (arg >> 8) & 0xff
+    n = na + 2 * nk + bool(flags & CALL_FLAG_VAR) + bool(flags & CALL_FLAG_KW)
+
+    not_method = JumpTarget()
+    endif = JumpTarget()
+
+    r_sp = f.stack.arg_reg(n=1)
+
+    return (f()
+        .mov('PyMethod_Type',f.r_scratch[0])
+        .mov(f.stack[n - f.stack.tos_in_eax],f.r_pres[0])
+        .push_tos(True)
+        .cmp(f.r_scratch[0],f.type_of(f.r_pres[0]))
+        .jne(not_method)
+        .mov(f.Address(pyinternals.METHOD_SELF_OFFSET,f.r_pres[0]),f.r_scratch[0])
+        .test(f.r_scratch[0],f.r_scratch[0])
+        .jz(not_method)
+            .mov(f.Address(pyinternals.METHOD_FUNC_OFFSET,f.r_pres[0]),f.r_pres[1])
+            .incref(f.r_scratch[0])
+            .mov(f.r_scratch[0],f.stack[n])
+            .incref(f.r_pres[1])
+            .decref(f.r_pres[0])
+            .push_arg(na+1,n=3)
+            .mov(f.r_pres[1],f.r_pres[0])
+            .goto(endif)
+        (not_method)
+            .push_arg(na,n=3)
+        (endif)
+        .lea(f.stack[0],r_sp)
+        .push_arg(nk,n=4)
+        .push_arg(r_sp,n=1)
+        .push_arg(f.r_pres[0],n=0)
+        .push_arg(flags,n=2)
+        .call('ext_do_call')
+        .decref(f.r_pres[0],preserve_reg=f.r_ret)
+        .add_to_stack(-n-1)
+        .check_err()
+    )
+
+@handler
+def _op_CALL_FUNCTION_VAR(f,arg):
+    return call_function_var_kw(f,arg,CALL_FLAG_VAR)
+
+@handler
+def _op_CALL_FUNCTION_KW(f,arg):
+    return call_function_var_kw(f,arg,CALL_FLAG_KW)
+
+@handler
+def _op_CALL_FUNCTION_VAR_KW(f,arg):
+    return call_function_var_kw(f,arg,CALL_FLAG_VAR|CALL_FLAG_KW)
+
 
 def join(x):
     return b''.join(x) if isinstance(x[0],bytes) else reduce(operator.add,x)
@@ -3436,9 +3495,9 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
     stack_first = 10
 
     if pyinternals.REF_DEBUG:
-        # a place to store r_scratch[0] and r_scratch[1] when increasing
+        # a place to store r_ret, r_scratch[0] and r_scratch[1] when increasing
         # reference counts (which calls a function when ref_debug is True)
-        stack_first += 2
+        stack_first += DEBUG_TEMPS
     elif pyinternals.COUNT_ALLOCS:
         # when COUNT_ALLOCS is True and REF_DEBUG is not, an extra space is
         # needed to save a temporary value

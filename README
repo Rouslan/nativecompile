@@ -6,9 +6,6 @@ bytecode can vary from version to version, it's completely hit or miss.
 The compiler supports the x86 and x86-64 instruction sets.
 
 The following bytecode instructions are not yet implemented:
-CALL_FUNCTION_KW
-CALL_FUNCTION_VAR
-CALL_FUNCTION_VAR_KW
 DUP_TOP_TWO
 INPLACE_POWER
 JUMP_IF_FALSE_OR_POP
@@ -62,9 +59,8 @@ without affecting the compiled code.
 
 
 This is a very unsophisticated compiler. The bytecode is translated into the
-equivalent machine code with no optimizations (almost; some push and pop
-instructions can be eliminated by using registers instead). However, this does
-remove the overhead of the interpreter loop and thus should result in a modest
+equivalent machine code with very little optimization. However, this does remove
+the overhead of the interpreter loop and thus should result in a modest
 performance boost.
 
 

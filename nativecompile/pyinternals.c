@@ -71,6 +71,10 @@ static PyObject *_cc_EvalCodeEx(PyObject *_co, PyObject *globals,
     int kwcount, PyObject **defs, int defcount, PyObject *kwdefs,
     PyObject *closure, int indexmult);
 static PyObject *_cc_EvalCode(PyObject *_co, PyObject *globals, PyObject *locals);
+static int call_trace(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
+                      int what, PyObject *arg);
+static int call_trace_protected(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
+                                int what, PyObject *arg);
 
 #define EXT_POP(STACK_POINTER) (*(STACK_POINTER)++)
 
@@ -79,6 +83,8 @@ static PyObject *_cc_EvalCode(PyObject *_co, PyObject *globals, PyObject *locals
                                      GETLOCAL(i) = value; \
                                      Py_XDECREF(tmp); } while (0)
 
+#define CALL_FLAG_VAR 1
+#define CALL_FLAG_KW 2
 
 
 static ternaryfunc old_func_call = NULL;
@@ -501,6 +507,39 @@ static PyObject *CompiledCode_call(CompiledCode *self,PyObject *args,PyObject *k
 
 /* The following are modified versions of functions in Python/ceval.c */
 
+#define C_TRACE(x, call) \
+if (tstate->use_tracing && tstate->c_profilefunc) { \
+    if (call_trace(tstate->c_profilefunc, \
+        tstate->c_profileobj, \
+        tstate->frame, PyTrace_C_CALL, \
+        func)) { \
+        x = NULL; \
+    } \
+    else { \
+        x = call; \
+        if (tstate->c_profilefunc != NULL) { \
+            if (x == NULL) { \
+                call_trace_protected(tstate->c_profilefunc, \
+                    tstate->c_profileobj, \
+                    tstate->frame, PyTrace_C_EXCEPTION, \
+                    func); \
+                /* XXX should pass (type, value, tb) */ \
+            } else { \
+                if (call_trace(tstate->c_profilefunc, \
+                    tstate->c_profileobj, \
+                    tstate->frame, PyTrace_C_RETURN, \
+                    func)) { \
+                    Py_DECREF(x); \
+                    x = NULL; \
+                } \
+            } \
+        } \
+    } \
+} else { \
+    x = call; \
+    }
+
+
 static PyObject *
 call_function(PyObject **pp_stack, int oparg)
 {
@@ -513,16 +552,17 @@ call_function(PyObject **pp_stack, int oparg)
 
     if (PyCFunction_Check(func) && nk == 0) {
         int flags = PyCFunction_GET_FLAGS(func);
+        PyThreadState *tstate = PyThreadState_GET();
 
         if (flags & (METH_NOARGS | METH_O)) {
             PyCFunction meth = PyCFunction_GET_FUNCTION(func);
             PyObject *self = PyCFunction_GET_SELF(func);
             if (flags & METH_NOARGS && na == 0) {
-                x = (*meth)(self,NULL);
+                C_TRACE(x, (*meth)(self,NULL));
             }
             else if (flags & METH_O && na == 1) {
                 PyObject *arg = EXT_POP(pp_stack);
-                x = (*meth)(self,arg);
+                C_TRACE(x, (*meth)(self,arg));
                 Py_DECREF(arg);
             }
             else {
@@ -533,7 +573,7 @@ call_function(PyObject **pp_stack, int oparg)
         else {
             PyObject *callargs;
             callargs = load_args(&pp_stack, na);
-            x = PyCFunction_Call(func,callargs,NULL);
+            C_TRACE(x, PyCFunction_Call(func,callargs,NULL));
             Py_XDECREF(callargs);
         }
     } else {
@@ -685,13 +725,129 @@ do_call(PyObject *func, PyObject ***pp_stack, int na, int nk)
     if (callargs == NULL)
         goto call_fail;
 
-    if (PyCFunction_Check(func))
-        result = PyCFunction_Call(func, callargs, kwdict);
+    if (PyCFunction_Check(func)) {
+        PyThreadState *tstate = PyThreadState_GET();
+        C_TRACE(result, PyCFunction_Call(func, callargs, kwdict));
+    }
     else
         result = PyObject_Call(func, callargs, kwdict);
 call_fail:
     Py_XDECREF(callargs);
     Py_XDECREF(kwdict);
+    return result;
+}
+
+static PyObject *
+update_star_args(int nstack, int nstar, PyObject *stararg,
+                 PyObject ***pp_stack)
+{
+    PyObject *callargs, *w;
+
+    callargs = PyTuple_New(nstack + nstar);
+    if (callargs == NULL) {
+        return NULL;
+    }
+    if (nstar) {
+        int i;
+        for (i = 0; i < nstar; i++) {
+            PyObject *a = PyTuple_GET_ITEM(stararg, i);
+            Py_INCREF(a);
+            PyTuple_SET_ITEM(callargs, nstack + i, a);
+        }
+    }
+    while (--nstack >= 0) {
+        w = EXT_POP(*pp_stack);
+        PyTuple_SET_ITEM(callargs, nstack, w);
+    }
+    return callargs;
+}
+
+static PyObject *
+ext_do_call(PyObject *func, PyObject **pp_stack, int flags, int na, int nk)
+{
+    int nstar = 0;
+    PyObject *callargs = NULL;
+    PyObject *stararg = NULL;
+    PyObject *kwdict = NULL;
+    PyObject *result = NULL;
+
+    PyObject **end = pp_stack + na + nk*2;
+    if(flags & CALL_FLAG_VAR) ++end;
+    if(flags & CALL_FLAG_KW) ++end;
+
+    if (flags & CALL_FLAG_KW) {
+        kwdict = EXT_POP(pp_stack);
+        if (!PyDict_Check(kwdict)) {
+            PyObject *d;
+            d = PyDict_New();
+            if (d == NULL)
+                goto ext_call_fail;
+            if (PyDict_Update(d, kwdict) != 0) {
+                Py_DECREF(d);
+                /* PyDict_Update raises attribute
+                 * error (percolated from an attempt
+                 * to get 'keys' attribute) instead of
+                 * a type error if its second argument
+                 * is not a mapping.
+                 */
+                if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+                    PyErr_Format(PyExc_TypeError,
+                                 "%.200s%.200s argument after ** "
+                                 "must be a mapping, not %.200s",
+                                 PyEval_GetFuncName(func),
+                                 PyEval_GetFuncDesc(func),
+                                 kwdict->ob_type->tp_name);
+                }
+                goto ext_call_fail;
+            }
+            Py_DECREF(kwdict);
+            kwdict = d;
+        }
+    }
+    if (flags & CALL_FLAG_VAR) {
+        stararg = EXT_POP(pp_stack);
+        if (!PyTuple_Check(stararg)) {
+            PyObject *t = NULL;
+            t = PySequence_Tuple(stararg);
+            if (t == NULL) {
+                if (PyErr_ExceptionMatches(PyExc_TypeError)) {
+                    PyErr_Format(PyExc_TypeError,
+                                 "%.200s%.200s argument after * "
+                                 "must be a sequence, not %200s",
+                                 PyEval_GetFuncName(func),
+                                 PyEval_GetFuncDesc(func),
+                                 stararg->ob_type->tp_name);
+                }
+                goto ext_call_fail;
+            }
+            Py_DECREF(stararg);
+            stararg = t;
+        }
+        nstar = PyTuple_GET_SIZE(stararg);
+    }
+    if (nk > 0) {
+        kwdict = update_keyword_args(kwdict, nk, &pp_stack, func);
+        if (kwdict == NULL)
+            goto ext_call_fail;
+    }
+    callargs = update_star_args(na, nstar, stararg, &pp_stack);
+    if (callargs == NULL)
+        goto ext_call_fail;
+
+    if (PyCFunction_Check(func)) {
+        PyThreadState *tstate = PyThreadState_GET();
+        C_TRACE(result, PyCFunction_Call(func, callargs, kwdict));
+    }
+    else
+        result = PyObject_Call(func, callargs, kwdict);
+ext_call_fail:
+    Py_XDECREF(callargs);
+    Py_XDECREF(kwdict);
+    Py_XDECREF(stararg);
+    while(pp_stack < end) {
+        PyObject *o = EXT_POP(pp_stack);
+        Py_DECREF(o);
+    }
     return result;
 }
 
@@ -1454,6 +1610,27 @@ call_trace(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
     return result;
 }
 
+static int
+call_trace_protected(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
+                     int what, PyObject *arg)
+{
+    PyObject *type, *value, *traceback;
+    int err;
+    PyErr_Fetch(&type, &value, &traceback);
+    err = call_trace(func, obj, frame, what, arg);
+    if (err == 0)
+    {
+        PyErr_Restore(type, value, traceback);
+        return 0;
+    }
+    else {
+        Py_XDECREF(type);
+        Py_XDECREF(value);
+        Py_XDECREF(traceback);
+        return -1;
+    }
+}
+
 static void
 call_exc_trace(Py_tracefunc func, PyObject *self, PyFrameObject *f)
 {
@@ -1633,6 +1810,8 @@ PyInit_pyinternals(void) {
     ADD_INT_OFFSET("THREADSTATE_TRACEFUNC_OFFSET",PyThreadState,c_tracefunc);
     ADD_INT_OFFSET("THREADSTATE_TRACEOBJ_OFFSET",PyThreadState,c_traceobj);
     ADD_INT_OFFSET("CELL_REF_OFFSET",PyCellObject,ob_ref);
+    ADD_INT_OFFSET("METHOD_SELF_OFFSET",PyMethodObject,im_self);
+    ADD_INT_OFFSET("METHOD_FUNC_OFFSET",PyMethodObject,im_func);
     if(PyModule_AddStringConstant(m,"ARCHITECTURE",ARCHITECTURE) == -1) return NULL;
     if(PyModule_AddObject(m,"REF_DEBUG",PyBool_FromLong(REF_DEBUG_VAL)) == -1) return NULL;
     if(PyModule_AddObject(m,"COUNT_ALLOCS",PyBool_FromLong(COUNT_ALLOCS_VAL)) == -1) return NULL;
@@ -1725,6 +1904,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR(special_lookup),
         ADD_ADDR(call_exc_trace),
         ADD_ADDR(unicode_concatenate),
+        ADD_ADDR(ext_do_call),
     
         ADD_ADDR(Py_True),
         ADD_ADDR(Py_False),
@@ -1733,6 +1913,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR_OF(PyList_Type),
         ADD_ADDR_OF(PyTuple_Type),
         ADD_ADDR_OF(PyUnicode_Type),
+        ADD_ADDR_OF(PyMethod_Type),
         ADD_ADDR(PyExc_KeyError),
         ADD_ADDR(PyExc_NameError),
         ADD_ADDR(PyExc_StopIteration),
