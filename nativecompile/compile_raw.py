@@ -1689,9 +1689,8 @@ def _op_LOAD_ATTR(f,name):
         .decref(f.r_scratch[1])
     )
 
-def _op_pop_jump_if_(f,to,state):
+def _op_pop_jump_if_(f,to,jop1,jop2):
     dont_jump = JumpTarget()
-    jop1,jop2 = (f.jz,f.jg) if state else (f.jg,f.jz)
     tos = f.stack.tos()
     r = (f()
         .push_tos()
@@ -1699,7 +1698,7 @@ def _op_pop_jump_if_(f,to,state):
         .pop_stack(f.r_scratch[1])
         .decref(f.r_scratch[1],f.r_ret)
         .test(f.r_ret,f.r_ret)
-        (JumpSource(jop1,f.abi,dont_jump))
+        (jop1(dont_jump))
         (f.jump_to(jop2,f.JCC_MAX_LEN,to))
         .mov(0,f.r_ret)
         .goto_end(True)
@@ -1713,13 +1712,13 @@ def _op_pop_jump_if_(f,to,state):
 
 @handler
 def _op_POP_JUMP_IF_FALSE(f,to):
-    return _op_pop_jump_if_(f,to,False)
+    return _op_pop_jump_if_(f,to,f.jg,f.jz)
 
 @handler
 def _op_POP_JUMP_IF_TRUE(f,to):
-    return _op_pop_jump_if_(f,to,True)
+    return _op_pop_jump_if_(f,to,f.jz,f.jg)
 
-def _op_BUILD_(f,items,new,item_offset,deref):
+def _op_build_(f,items,new,item_offset,deref):
     r = (f()
         .push_tos(True)
         .invoke(new,items)
@@ -1772,11 +1771,11 @@ def _op_BUILD_(f,items,new,item_offset,deref):
 
 @handler
 def _op_BUILD_LIST(f,items):
-    return _op_BUILD_(f,items,'PyList_New',pyinternals.LIST_ITEM_OFFSET,True)
+    return _op_build_(f,items,'PyList_New',pyinternals.LIST_ITEM_OFFSET,True)
 
 @handler
 def _op_BUILD_TUPLE(f,items):
-    return _op_BUILD_(f,items,'PyTuple_New',pyinternals.TUPLE_ITEM_OFFSET,False)
+    return _op_build_(f,items,'PyTuple_New',pyinternals.TUPLE_ITEM_OFFSET,False)
 
 @handler
 def _op_STORE_SUBSCR(f):
@@ -2721,6 +2720,18 @@ def _op_DUP_TOP(f):
         .incref()
     )
 
+@handler
+def _op_DUP_TOP_TWO(f):
+    tos = f.stack.tos()
+    return (f()
+        .mov(f.stack[not f.stack.tos_in_eax],f.r_scratch[0])
+        .push_tos(True)
+        .mov(tos,f.r_ret)
+        .push_stack(f.r_scratch[0])
+        .incref(f.r_scratch[0])
+        .incref(f.r_ret)
+    )
+
 def _unary_op(f,func):
     tos = f.stack.tos()
     return (f()
@@ -2921,8 +2932,7 @@ def _op_BINARY_MODULO(f):
         .del_stack_items(1)
     )
 
-@handler
-def _op_BINARY_POWER(f):
+def binary_power(func,f):
     tos = f.stack.tos()
     return (f()
         .push_tos()
@@ -2933,6 +2943,15 @@ def _op_BINARY_POWER(f):
         .decref(f.r_scratch[1])
         .del_stack_items(1)
     )
+
+@handler
+def _op_BINARY_POWER(f):
+    return binary_power('PyNumber_Power',f)
+
+@handler
+def _op_INPLACE_POWER(f):
+    return binary_power('PyNumber_InPlacePower',f)
+
 
 def hasfree(func):
     return update_wrapper(
@@ -3133,6 +3152,68 @@ def _op_CALL_FUNCTION_KW(f,arg):
 @handler
 def _op_CALL_FUNCTION_VAR_KW(f,arg):
     return call_function_var_kw(f,arg,CALL_FLAG_VAR|CALL_FLAG_KW)
+
+@handler
+def _op_ROT_TWO(f):
+    r = f()
+    if f.stack.use_tos(True):
+        r.mov(f.stack[0],f.r_scratch[0])
+        r.mov(f.r_ret,f.stack[0])
+        r.mov(f.r_scratch[0],f.r_ret)
+    else:
+        r.pop_stack(f.r_scratch[0])
+        r.mov(f.stack[0],f.r_ret)
+        r.mov(f.r_scratch[0],f.stack[0])
+
+    return r
+
+@handler
+def _op_ROT_THREE(f):
+    r = f()
+    if f.stack.use_tos(True):
+        r.mov(f.stack[1],f.r_scratch[1])
+        r.mov(f.stack[0],f.r_scratch[0])
+        r.mov(f.r_ret,f.stack[1])
+        r.mov(f.r_scratch[1],f.stack[0])
+        r.mov(f.r_scratch[0],f.r_ret)
+    else:
+        r.pop_stack(f.r_scratch[0])
+        r.mov(f.stack[1],f.r_scratch[1])
+        r.mov(f.stack[0],f.r_ret)
+        r.mov(f.r_scratch[0],f.stack[1])
+        r.mov(f.r_scratch[1],f.stack[0])
+
+    return r
+
+def _op_jump_or_pop_if(f,to,jop1,jop2):
+    tos = f.stack.tos()
+    dont_jump = JumpTarget()
+
+    r = f().push_tos()
+
+    if to > f.byte_offset:
+        f.stack.conditional_jump(to)
+
+    return (r
+        .invoke('PyObject_IsTrue',tos)
+        .test(f.r_ret,f.r_ret)
+        (jop1(dont_jump))
+        (f.jump_to(jop2,f.JCC_MAX_LEN,to))
+
+        .mov(0,f.r_ret)
+        .goto_end(True)
+
+        (dont_jump)
+        .del_stack_items(1)
+    )
+
+@handler
+def _op_JUMP_IF_FALSE_OR_POP(f,to):
+    return _op_jump_or_pop_if(f,to,f.jg,f.jz)
+
+@handler
+def _op_JUMP_IF_TRUE_OR_POP(f,to):
+    return _op_jump_or_pop_if(f,to,f.jz,f.jg)
 
 
 def join(x):
