@@ -503,6 +503,22 @@ static PyObject *CompiledCode_call(CompiledCode *self,PyObject *args,PyObject *k
 }
 
 
+PyDoc_STRVAR(read_address_doc,
+"read_address(address,length) -> bytes\n\
+\n\
+Get the contents of memory at an arbitary address. Warning: this function is\n\
+very unsafe. Improper use can easily cause a segmentation fault.");
+
+static PyObject *read_address(PyObject *self,PyObject *args) {
+    unsigned long addr;
+    Py_ssize_t length;
+
+    if(!PyArg_ParseTuple(args,"kn:read_address",&addr,&length)) return NULL;
+
+    return PyBytes_FromStringAndSize((const char*)addr,length);
+}
+
+
 
 
 /* The following are modified versions of functions in Python/ceval.c */
@@ -523,7 +539,6 @@ if (tstate->use_tracing && tstate->c_profilefunc) { \
                     tstate->c_profileobj, \
                     tstate->frame, PyTrace_C_EXCEPTION, \
                     func); \
-                /* XXX should pass (type, value, tb) */ \
             } else { \
                 if (call_trace(tstate->c_profilefunc, \
                     tstate->c_profileobj, \
@@ -1745,6 +1760,7 @@ static PyMethodDef functions[] = {
     {"cep_get_offset",cep_get_offset,METH_O,NULL},
     {"cep_set_offset",cep_set_offset,METH_VARARGS,NULL},
     {"cep_exec",cep_exec,METH_VARARGS,NULL},
+    {"read_address",read_address,METH_VARARGS,read_address_doc},
     {NULL}
 };
 
@@ -1825,6 +1841,7 @@ PyInit_pyinternals(void) {
     AddrRec addr_records[] = {
         ADD_ADDR(Py_IncRef),
         ADD_ADDR(Py_DecRef),
+        ADD_ADDR(Py_AddPendingCall),
         ADD_ADDR(PyDict_GetItem),
         ADD_ADDR(PyDict_SetItem),
         ADD_ADDR(PyDict_GetItemString),
@@ -1842,6 +1859,8 @@ PyInit_pyinternals(void) {
         ADD_ADDR(PyEval_GetGlobals),
         ADD_ADDR(PyEval_GetBuiltins),
         ADD_ADDR(PyEval_GetLocals),
+        ADD_ADDR(PyEval_AcquireThread),
+        ADD_ADDR(_PyEval_SignalAsyncExc),
         ADD_ADDR(PyErr_Occurred),
         ADD_ADDR(PyErr_ExceptionMatches),
         ADD_ADDR(PyErr_Clear),
