@@ -39,7 +39,9 @@ WHY_RETURN =    0x0008
 WHY_BREAK =     0x0010
 WHY_CONTINUE =  0x0020
 WHY_YIELD =     0x0040
-WHY_SILENCED =  0x0080 
+WHY_SILENCED =  0x0080
+
+CO_GENERATOR = 0x0020
 
 
 BLOCK_LOOP = 1
@@ -63,7 +65,6 @@ class NCCompileError(SystemError):
     but arbitrary bytecode might.
 
     """
-
 
 
 def aligned_size(x):
@@ -232,7 +233,7 @@ class StackManager:
                 if self.offset is None:
                     self.offset = off
                 elif off != self.offset:
-                    raise NCCompileError('The stack size is not consistent at a particular location depending on path taken')
+                    raise NCCompileError('The stack size is not consistent at a particular location depending on branch taken')
 
     def __getitem__(self,n):
         """Get the address of the nth stack item.
@@ -305,7 +306,7 @@ class JumpSource:
 
 
 class DelayedCompile:
-    pass
+    displacement = None
 
 
 class InnerCall(DelayedCompile):
@@ -323,7 +324,6 @@ class InnerCall(DelayedCompile):
         self.abi = abi
         self.target = target
         target.used = True
-        self.displacement = None
 
     def compile(self):
         r = self.op(self.abi.ops.Displacement(self.displacement + self.target.displacement,True))
@@ -341,7 +341,6 @@ class JumpRSource(DelayedCompile):
         self.size = size
         self.target = target
         target.used = True
-        self.displacement = None
 
     def compile(self):
         c = self.op(self.abi.ops.Displacement(self.displacement - self.target.displacement,True))
@@ -350,6 +349,26 @@ class JumpRSource(DelayedCompile):
 
     def __len__(self):
         return self.size
+
+
+class YieldMov(DelayedCompile):
+    def __init__(self,ops,yield_from,yield_to,dest):
+        #assert isinstance(dest,abi.ops.Address)
+
+        self.op = ops.movl(0,dest)
+        self.ops = ops
+        self.from_ = yield_from
+        yield_from.used = True
+        self.to = yield_to
+        yield_to.used = True
+
+    def compile(self):
+        return self.ops.with_new_imm_dword(
+            self.op,
+            self.to.displacement - self.from_.displacement)
+
+    def __len__(self):
+        return len(self.op)
 
 
 
@@ -397,6 +416,7 @@ class Tuning:
     build_seq_loop_threshhold = 5
     unpack_seq_loop_threshhold = 5
     build_set_loop_threshhold = 5
+    mem_copy_loop_threshhold = 9
 
 
 handlers = [None] * 0xFF
@@ -531,6 +551,18 @@ class OmittedExceptBlockEnd:
     def prepare(self,f):
         f.handler_blocks.append(HandlerBlock(self.type,None))
         return []
+
+
+class CType:
+    def __init__(self,abi,t,base,index=None,scale=None):
+        self.abi = abi
+        self.offsets = pyinternals.member_offsets[t]
+        self.args = base,index,(scale or abi.ptr_size)
+
+    def __getattr__(self,name):
+        offset = self.offsets.get(name)
+        if offset is None: raise AttributeError(name)
+        return self.abi.ops.Address(offset,*self.args)
     
 
 def raw_addr_if_str(x):
@@ -544,6 +576,7 @@ class UtilityFunctions:
         self.reraise_exc_handler = JumpTarget()
         self.unwind_exc = JumpTarget()
         self.unwind_finally = JumpTarget()
+        self.swap_exc_state = JumpTarget()
 
 class Frame:
     def __init__(self,op,abi,tuning,local_mem_size,code=None,util_funcs=None,entry_points=None):
@@ -553,6 +586,7 @@ class Frame:
         self.tuning = tuning
         self.stack = StackManager(op,abi,local_mem_size)
         self.end = JumpTarget()
+        self.yield_start = JumpTarget()
         self.util_funcs=util_funcs
         self.blockends = []
         self.handler_blocks = []
@@ -567,6 +601,10 @@ class Frame:
         # small optimizations between successive instructions without needing an
         # extra pass over the byte code to determine all the jump targets.
         self.rtargets = {}
+
+        # Indicates how many values tracked by Frame.stack were added as part of
+        # the function prolog. This is needed by YIELD_VALUE.
+        self.stack_prolog = None
 
 
         a = (self.Address(i,abi.r_bp) for i in
@@ -587,13 +625,13 @@ class Frame:
             self.COUNT_ALLOCS_TEMP = next(a)
 
     def type_of(self,r):
-        return self.Address(pyinternals.TYPE_OFFSET,r)
+        return self.ctype('PyObject',r).ob_type
 
     def type_flags_of(self,r):
-        return self.Address(pyinternals.TYPE_FLAGS_OFFSET,r)
+        return self.ctype('PyTypeObject',r).tp_flags
 
     def tuple_item(self,r,n):
-        return self.Address(pyinternals.TUPLE_ITEM_OFFSET + self.ptr_size*n,r)
+        return self.ctype('PyTupleObject',r).ob_item + self.ptr_size * n
 
     def current_except_or_finally(self):
         for b in reversed(self.blockends):
@@ -625,6 +663,9 @@ class Frame:
     @property
     def ptr_size(self):
         return self.abi.ptr_size
+
+    def ctype(self,*args):
+        return CType(self.abi,*args)
 
     def fits_imm32(self,x):
         """Return True if x fits in a 32-bit immediate value without
@@ -730,7 +771,9 @@ class Frame:
     def end_func(self,stack=None):
         if not stack: stack = self.stack
 
-        r = self.mov(stack.protected_items[-1] - stack.offset,self.r_pres[0])
+        to_free = -stack.offset
+        if self.stack_prolog is not None: to_free += self.stack_prolog
+        r = self.mov(to_free,self.r_pres[0])
         r.append(self.goto(self.end))
         return r
 
@@ -784,7 +827,7 @@ class Frame:
                 self.op.mov(self.TEMP_ECX,self.r_scratch[0]),
                 self.op.mov(self.TEMP_EAX,self.r_ret)])
 
-        return [self.add(amount,self.Address(pyinternals.REFCNT_OFFSET,reg))]
+        return [self.add(amount,self.ctype('PyObject',reg).ob_refcnt)]
 
     def decref(self,reg=None,preserve_reg=None,amount=1):
         """Generate instructions equivalent to Py_DECREF"""
@@ -809,14 +852,14 @@ class Frame:
             mid.append(self.op.mov(preserve_reg,self.TEMP))
 
         mid.append(self.op.mov(
-            self.Address(pyinternals.TYPE_OFFSET,reg),
+            self.ctype('PyObject',reg).ob_type,
             self.r_scratch[0]))
 
         if pyinternals.COUNT_ALLOCS:
             mid.append(self.op.mov(self.r_scratch[0],self.COUNT_ALLOCS_TEMP))
 
         mid.extend(self.invoke(
-            self.Address(pyinternals.TYPE_DEALLOC_OFFSET,self.r_scratch[0]),
+            self.ctype('PyTypeObject',self.r_scratch[0]).tp_dealloc,
             reg))
 
         if pyinternals.COUNT_ALLOCS:
@@ -830,7 +873,7 @@ class Frame:
         mid = join(mid)
         
         return [
-            self.sub(amount,self.Address(pyinternals.REFCNT_OFFSET,reg)),
+            self.sub(amount,self.ctype('PyObject',reg).ob_refcnt),
             self.jnz(self.Displacement(len(mid))),
             mid
         ]
@@ -1657,7 +1700,7 @@ def _op_FOR_ITER(f,to):
         (f.new_rtarget())
         .mov(f.stack[0],argreg)
         .mov(f.type_of(argreg),f.r_ret)
-        .mov(f.Address(pyinternals.TYPE_ITERNEXT_OFFSET,f.r_ret),f.r_ret)
+        .mov(f.ctype('PyTypeObject',f.r_ret).tp_iternext,f.r_ret)
         .invoke(f.r_ret,argreg)
         .if_eax_is_zero(f()
             .call('PyErr_Occurred')
@@ -1718,7 +1761,9 @@ def _op_POP_JUMP_IF_FALSE(f,to):
 def _op_POP_JUMP_IF_TRUE(f,to):
     return _op_pop_jump_if_(f,to,f.jz,f.jg)
 
-def _op_build_(f,items,new,item_offset,deref):
+def _op_build_(f,items,new,ctype,deref):
+    item_offset = pyinternals.member_offsets[ctype]['ob_item']
+
     r = (f()
         .push_tos(True)
         .invoke(new,items)
@@ -1771,11 +1816,11 @@ def _op_build_(f,items,new,item_offset,deref):
 
 @handler
 def _op_BUILD_LIST(f,items):
-    return _op_build_(f,items,'PyList_New',pyinternals.LIST_ITEM_OFFSET,True)
+    return _op_build_(f,items,'PyList_New','PyListObject',True)
 
 @handler
 def _op_BUILD_TUPLE(f,items):
-    return _op_build_(f,items,'PyTuple_New',pyinternals.TUPLE_ITEM_OFFSET,False)
+    return _op_build_(f,items,'PyTuple_New','PyTupleObject',False)
 
 @handler
 def _op_STORE_SUBSCR(f):
@@ -1879,13 +1924,13 @@ def _op_UNPACK_SEQUENCE(f,arg):
         .mov(f.type_of(f.r_pres[0]),f.r_scratch[1])
         .cmp(tt_addr if tt_fits else f.r_scratch[0],f.r_scratch[1])
         .jne(check_list)
-            .cmp(arg,f.Address(pyinternals.VAR_SIZE_OFFSET,f.r_pres[0]))
+            .cmp(arg,f.ctype('PyVarObject',f.r_pres[0]).ob_size)
             .jne(else_))
 
     if arg >= f.tuning.unpack_seq_loop_threshhold:
         s_top.index = f.r_ret
         body = join(f()
-            .mov(f.Address(pyinternals.TUPLE_ITEM_OFFSET-f.ptr_size,f.r_pres[0],f.r_scratch[0],f.ptr_size),f.r_scratch[1])
+            .mov(f.ctype('PyTupleObject',f.r_pres[0],f.r_scratch[0]).tp_item - f.ptr_size,f.r_scratch[1])
             .incref(f.r_scratch[1])
             .mov(f.r_scratch[1],s_top)
             .add(1,f.r_ret).code)
@@ -1911,9 +1956,9 @@ def _op_UNPACK_SEQUENCE(f,arg):
         (check_list)
         .cmp(lt_addr if lt_fits else f.r_pres[1],f.r_scratch[1])
         .jne(else_)
-            .cmp(arg,f.Address(pyinternals.VAR_SIZE_OFFSET,f.r_pres[0]))
+            .cmp(arg,f.ctype('PyVarObject',f.r_pres[0]).ob_size)
             .jne(else_)
-                .mov(f.Address(pyinternals.LIST_ITEM_OFFSET,f.r_pres[0]),f.r_scratch[1]))
+                .mov(f.ctype('PyListObject',f.r_pres[0]).ob_item,f.r_scratch[1]))
     
     if arg >= f.tuning.unpack_seq_loop_threshhold:
         s_top.index = f.r_pres[0]
@@ -2151,7 +2196,7 @@ def _op_STORE_LOCALS(f):
         .pop_stack(f.r_ret)
         .mov(f.FRAME,f.r_scratch[0])
         .mov(f.r_ret,f.LOCALS)
-        .mov(f.r_ret,f.Address(pyinternals.FRAME_LOCALS_OFFSET,f.r_scratch[0]))
+        .mov(f.r_ret,f.ctype('PyFrameObject',f.r_scratch[0]).f_locals)
     )
 
 @handler
@@ -2387,7 +2432,7 @@ def pop_handler_block(f,type):
 
 @handler
 def _op_WITH_CLEANUP(f):
-    # The checks needd to be done here but we let END_FINALLY do all the work so
+    # The checks need to be done here but we let END_FINALLY do all the work so
     # the block gets put back
     b = pop_handler_block(f,BLOCK_WITH)
     f.handler_blocks.append(b)
@@ -2403,15 +2448,17 @@ def _op_POP_EXCEPT(f):
     # if this value changes, the code here will need updating
     assert EXCEPT_VALUES == 6
 
+    tstate = f.ctype('PyThreadState',f.r_pres[1])
+
     return (f()
         .get_threadstate(f.r_pres[1])
 
         .mov(f.stack[0],f.r_pres[0])
         .mov(f.stack[1],f.r_ret)
         .mov(f.stack[2],f.r_scratch[0])
-        .mov(f.r_pres[0],f.Address(pyinternals.THREADSTATE_TYPE_OFFSET,f.r_pres[1]))
-        .mov(f.r_ret,f.Address(pyinternals.THREADSTATE_VALUE_OFFSET,f.r_pres[1]))
-        .mov(f.r_scratch[0],f.Address(pyinternals.THREADSTATE_TRACEBACK_OFFSET,f.r_pres[1]))
+        .mov(f.r_pres[0],tstate.exc_type)
+        .mov(f.r_ret,tstate.exc_value)
+        .mov(f.r_scratch[0],tstate.exc_traceback)
         .if_(f.r_scratch[0])[f.decref(f.r_scratch[0],preserve_reg=f.r_ret)]
         .if_(f.r_ret)[f.decref(f.r_ret)]
         .decref(f.r_pres[0]) # set to Py_None if NULL by prepare_exc_handler_func
@@ -3002,7 +3049,7 @@ def _op_DELETE_DEREF(f,arg,item):
         .mov(f.FAST_LOCALS,f.r_scratch[0])
         .push_tos()
         .mov(item,f.r_ret)
-        .if_(signed(f.Address(pyinternals.CELL_REF_OFFSET,f.r_ret)) == 0) [f()
+        .if_(signed(f.ctype('PyCellObject',f.r_ret).ob_ref) == 0) [f()
             .invoke('format_exc_unbound',address_of(f.code),arg)
             .goto_end(True)
         ]
@@ -3109,6 +3156,7 @@ def call_function_var_kw(f,arg,flags):
     endif = JumpTarget()
 
     r_sp = f.stack.arg_reg(n=1)
+    m_obj = f.ctype('PyMethodObject',f.r_pres[0])
 
     return (f()
         .mov('PyMethod_Type',f.r_scratch[0])
@@ -3116,10 +3164,10 @@ def call_function_var_kw(f,arg,flags):
         .push_tos(True)
         .cmp(f.r_scratch[0],f.type_of(f.r_pres[0]))
         .jne(not_method)
-        .mov(f.Address(pyinternals.METHOD_SELF_OFFSET,f.r_pres[0]),f.r_scratch[0])
+        .mov(m_obj.im_self,f.r_scratch[0])
         .test(f.r_scratch[0],f.r_scratch[0])
         .jz(not_method)
-            .mov(f.Address(pyinternals.METHOD_FUNC_OFFSET,f.r_pres[0]),f.r_pres[1])
+            .mov(m_obj.im_func,f.r_pres[1])
             .incref(f.r_scratch[0])
             .mov(f.r_scratch[0],f.stack[n])
             .incref(f.r_pres[1])
@@ -3215,12 +3263,124 @@ def _op_JUMP_IF_FALSE_OR_POP(f,to):
 def _op_JUMP_IF_TRUE_OR_POP(f,to):
     return _op_jump_or_pop_if(f,to,f.jz,f.jg)
 
+def switch_stack(f,reverse):
+    """Copy the stack to the frame's (f.r_pres[0]) f_valuestack member
+
+    The order of the items is reversed to match the order Python stores its
+    stack values.
+
+    """
+    valstack = f.stack.offset - f.stack_prolog
+    r = f().mov(f.ctype('PyFrameObject',f.r_pres[0]).f_valuestack,f.r_scratch[0])
+
+    if valstack >= f.tuning.mem_copy_loop_threshhold:
+        r.mov(0,f.r_pres[1])
+        src = f.stack[valstack - 1]
+        src.index = f.r_pres[1]
+        src.scale = f.ptr_size
+
+        dest = f.Address(base=f.r_scratch[0])
+        if reverse: src,dest = dest,src
+
+        r.do [join(f()
+            .mov(src,f.r_scratch[1])
+            .sub(1,f.r_pres[1])
+            .mov(f.r_scratch[1],dest)
+            .add(f.ptr_size,f.r_scratch[0])
+        .code)] .while_(signed(f.r_pres[1]) > -valstack)
+    else:
+        for i in range(valstack):
+            src = f.stack[i]
+            dest = f.Address((valstack - 1 - i) * f.ptr_size,f.r_scratch[0])
+            if reverse: src,dest = dest,src
+
+            r.mov(src,f.r_pres[1])
+            r.mov(f.r_pres[1],dest)
+        r.add(valstack * f.ptr_size,f.r_scratch[0])
+
+    return r
+
+@handler
+def _op_YIELD_VALUE(f):
+    # Currently, all the values that are part of the Python stack are copied
+    # back and forth between our stack and the frame's f_valuestack member
+    # (where the interpreter would store them) when suspending and resuming from
+    # a generator. It might be better to have those values stored in
+    # f_valuestack in the first place and everything else on the actual stack
+    # (ideally we would just store everything in f_valuestack, but there isn't
+    # enough room).
+
+    assert f.stack_prolog is not None and f.stack_prolog <= f.stack.offset
+
+    r = f()
+    if not f.stack.use_tos():
+        r.pop_stack(f.r_ret)
+
+    r.mov(f.FRAME,f.r_pres[0])
+    f_obj = f.ctype('PyFrameObject',f.r_pres[0])
+    
+    valstack = f.stack.offset - f.stack_prolog
+    if valstack:
+        r += switch_stack(f,False)
+        r.mov(f.r_scratch[0],f_obj.f_stacktop)
+
+    yield_point = JumpTarget()
+    r(YieldMov(f.op,f.yield_start,yield_point,f_obj.f_lasti))
+
+    if f.handler_blocks:
+        r.get_threadstate(f.r_scratch[0])
+        r(InnerCall(f.op,f.abi,f.util_funcs.swap_exc_state))
+
+    r.mov(0,f.r_pres[0])
+    r.goto(f.end)
+    r(yield_point)
+
+
+    # the generator will resume here:
+
+    # an item gets pushed onto the stack when a generator is resumed
+    f.stack.offset += 1
+
+    r.mov(f.FRAME,f.r_pres[0])
+    r += switch_stack(f,True)
+    r.mov(-1,f_obj.f_lasti)
+    return r.mov(0,f_obj.f_stacktop)
+
 
 def join(x):
     return b''.join(x) if isinstance(x[0],bytes) else reduce(operator.add,x)
 
+
+class Function:
+    def __init__(self,code,padding,address=0,entry_point=None):
+        self.code = code
+        self.padding = padding
+        self.address = address
+
+        # This is basically a modified Python code object. See
+        # CodeObjectWithCCode and create_compiled_entry_point in pyinternals.c
+        # for information about what this is exactly.
+        self.entry_point = entry_point
+
+    def __len__(self):
+        return len(self.code)
+
+
+class CompilationUnit:
+    def __init__(self,functions):
+        self.functions = functions
+
+    def __len__(self):
+        return sum(map(len,self.functions))
+
+    def write(self,out):
+        for f in self.functions:
+            out.write(f.code)
+
+
 def resolve_jumps(op,chunks,end_targets=()):
     displacement = 0
+    pad_size = 0
     
     for i in range(len(chunks)-1,-1,-1):
         if isinstance(chunks[i],JumpTarget):
@@ -3249,7 +3409,7 @@ def resolve_jumps(op,chunks,end_targets=()):
     for et in end_targets:
         et.displacement += displacement
 
-    return code
+    return Function(code,pad_size)
 
 
 def local_name_func(op,abi,tuning):
@@ -3337,14 +3497,15 @@ def prepare_exc_handler_func_head(op,abi,tuning):
 
     r_tmp1 = f.stack.arg_reg(f.r_scratch[0],0)
     r_tmp2 = f.stack.arg_reg(f.r_scratch[1],1)
+    tstate = f.ctype('PyThreadState',f.r_pres[1])
     return (f()
         .comment('exc_handler function:')
         .sub(stack_ptr_shift,abi.r_sp)
         .push_stack(f.r_scratch[0])
         .get_threadstate(f.r_pres[1])
         .invoke('PyTraceBack_Here',f.FRAME)
-        .mov(f.Address(pyinternals.THREADSTATE_TRACEFUNC_OFFSET,f.r_pres[1]),r_tmp1)
-        .mov(f.Address(pyinternals.THREADSTATE_TRACEOBJ_OFFSET,f.r_pres[1]),r_tmp2)
+        .mov(tstate.c_tracefunc,r_tmp1)
+        .mov(tstate.c_traceobj,r_tmp2)
         .if_(r_tmp1) [
             join(f.invoke('call_exc_trace',r_tmp1,r_tmp2))
         ]
@@ -3372,13 +3533,15 @@ def prepare_exc_handler_func_tail(op,abi,tuning):
     val_old = f.Address(-abi.ptr_size*2,f.r_pres[0])
     tb_old = f.Address(-abi.ptr_size,f.r_pres[0])
 
+    tstate = f.ctype('PyThreadState',f.r_pres[1])
+
     r = (f()
         .clean_stack(addr=f.Address(base=f.r_pres[0]),index=f.r_scratch[0])
 
         .get_threadstate(f.r_pres[1])
-        .mov(f.Address(pyinternals.THREADSTATE_TRACEBACK_OFFSET,f.r_pres[1]),f.r_scratch[0])
-        .mov(f.Address(pyinternals.THREADSTATE_VALUE_OFFSET,f.r_pres[1]),f.r_scratch[1])
-        .mov(f.Address(pyinternals.THREADSTATE_TYPE_OFFSET,f.r_pres[1]),f.r_ret)
+        .mov(tstate.exc_traceback,f.r_scratch[0])
+        .mov(tstate.exc_value,f.r_scratch[1])
+        .mov(tstate.exc_type,f.r_ret)
         .mov(f.r_scratch[0],tb_old)
         .mov(f.r_scratch[1],val_old)
         .if_eax_is_zero(f()
@@ -3413,10 +3576,10 @@ def prepare_exc_handler_func_tail(op,abi,tuning):
         .if_(signed(f.r_scratch[1]) == 0) [
             f().mov('Py_None',f.r_scratch[1])
         ]
-        .mov(f.r_ret,f.Address(pyinternals.THREADSTATE_TYPE_OFFSET,f.r_pres[1]))
-        .mov(f.r_scratch[0],f.Address(pyinternals.THREADSTATE_TYPE_OFFSET,f.r_pres[1]))
+        .mov(f.r_ret,tstate.exc_type)
+        .mov(f.r_scratch[0],tstate.exc_value)
         .incref(f.r_scratch[1])
-        .mov(f.r_scratch[1],f.Address(pyinternals.THREADSTATE_TYPE_OFFSET,f.r_pres[1]))
+        .mov(f.r_scratch[1],tstate.exc_traceback)
         .add(stack_ptr_shift,abi.r_sp)
         .ret()
     )
@@ -3475,9 +3638,7 @@ def unwind_exc_func_tail(op,abi,tuning):
     exc = f.Address(0,f.r_pres[0])
     val = f.Address(abi.ptr_size,f.r_pres[0])
     tb = f.Address(abi.ptr_size*2,f.r_pres[0])
-    t_exc = f.Address(pyinternals.THREADSTATE_TYPE_OFFSET,f.r_pres[1])
-    t_val = f.Address(pyinternals.THREADSTATE_VALUE_OFFSET,f.r_pres[1])
-    t_tb = f.Address(pyinternals.THREADSTATE_TRACEBACK_OFFSET,f.r_pres[1])
+    tstate = f.ctype('PyThreadState',f.r_pres[1])
 
     r = (f()
         .clean_stack(addr=f.Address(base=f.r_pres[0]),index=f.r_scratch[0])
@@ -3489,17 +3650,17 @@ def unwind_exc_func_tail(op,abi,tuning):
     del exc, val, tb # no longer valid
     (r
         # swap the values
-        .xor(f.r_scratch[0],t_exc)
-        .xor(f.r_scratch[1],t_val)
-        .xor(f.r_pres[0],t_tb)
-        .xor(t_exc,f.r_scratch[0])
-        .xor(t_val,f.r_scratch[1])
-        .xor(t_tb,f.r_pres[0])
-        .xor(f.r_scratch[0],t_exc)
-        .xor(f.r_scratch[1],t_val)
-        .xor(f.r_pres[0],t_tb)
+        .xor(f.r_scratch[0],tstate.exc_type)
+        .xor(f.r_scratch[1],tstate.exc_value)
+        .xor(f.r_pres[0],tstate.exc_traceback)
+        .xor(tstate.exc_type,f.r_scratch[0])
+        .xor(tstate.exc_value,f.r_scratch[1])
+        .xor(tstate.exc_traceback,f.r_pres[0])
+        .xor(f.r_scratch[0],tstate.exc_type)
+        .xor(f.r_scratch[1],tstate.exc_value)
+        .xor(f.r_pres[0],tstate.exc_traceback)
     )
-    del t_exc, t_val, t_tb
+    del tstate
     return (r
         .decref(f.r_scratch[0],preserve_reg=f.r_scratch[1]) # set to Py_None if NULL by prepare_exc_handler_func
         .if_(f.r_scratch[1])[f.decref(f.r_scratch[1])]
@@ -3555,9 +3716,31 @@ def unwind_finally_func(op,abi,tuning,unwind_exc_tail):
         .ret()
     )
 
+def swap_exc_state_func(op,abi,tuning):
+    # this function uses an ad hoc calling convention and is only callable from
+    # the code generated by this module
+
+    # TODO: have just one copy shared by all compiled modules
+
+    # r_pres[0] is expected to be the frame object
+    # r_scratch[0] is expected to be the thread state object
+
+    f_obj = CType(abi,'PyFrameObject',abi.r_pres[0])
+    tstate = CType(abi,'PyThreadState',abi.r_scratch[0])
+    r = []
+    for m in ['exc_type','exc_value','exc_traceback']:
+        a = f_obj.__getattr__('f_'+m)
+        b = tstate.__getattr__(m)
+
+        r.append(op.mov(a,abi.r_scratch[1]))
+        r.append(op.mov(b,abi.r_pres[1]))
+        r.append(op.mov(abi.r_scratch[1],b))
+        r.append(op.mov(abi.r_pres[1],a))
+
+    return r
 
 def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
-    """Generate a function equivalent to PyEval_EvalFrame called with f.code"""
+    """Generate a function equivalent to PyEval_EvalFrameEx called with f.code"""
 
     # the stack will have following items:
     #     - return address
@@ -3610,6 +3793,9 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
         .sub(stack_ptr_shift,abi.r_sp)
     )
 
+    f_obj = f.ctype('PyFrameObject',f.r_pres[0])
+    tstate = f.ctype('PyThreadState',f.r_scratch[0])
+
     argreg = f.stack.arg_reg(n=0)
     (opcodes
         .mov(f.stack.func_arg(0),f.r_pres[0])
@@ -3620,24 +3806,77 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
 
         .get_threadstate(f.r_scratch[0])
 
-        .mov(f.Address(pyinternals.FRAME_GLOBALS_OFFSET,f.r_pres[0]),f.r_scratch[1])
-        .mov(f.Address(pyinternals.FRAME_BUILTINS_OFFSET,f.r_pres[0]),f.r_ret)
+        .mov(f_obj.f_globals,f.r_scratch[1])
+        .mov(f_obj.f_builtins,f.r_ret)
 
         .push_stack(f.r_pres[0])
         .push_stack(f.r_scratch[1])
         .push_stack(f.r_ret)
 
-        .mov(f.Address(pyinternals.FRAME_LOCALS_OFFSET,f.r_pres[0]),f.r_scratch[1])
-        .lea(f.Address(pyinternals.FRAME_LOCALSPLUS_OFFSET,f.r_pres[0]),f.r_ret)
+        .mov(f_obj.f_locals,f.r_scratch[1])
+        .lea(f_obj.f_localsplus,f.r_ret)
 
         .push_stack(f.r_scratch[1])
         .push_stack(f.r_ret)
 
-        .mov(f.r_pres[0],f.Address(pyinternals.THREADSTATE_FRAME_OFFSET,f.r_scratch[0]))
+        .mov(f.r_pres[0],tstate.frame)
     )
 
+    if f.code.co_flags & CO_GENERATOR:
+        not_in_handler = JumpTarget()
+        endif = JumpTarget()
+
+        naddr = pyinternals.raw_addresses['Py_None']
+        if not f.fits_imm32(naddr):
+            opcodes.mov(naddr,f.r_ret)
+            naddr = f.r_ret
+
+        jdispatch = f()
+        rip = getattr(f.abi.ops,'rip',None)
+        if rip:
+            jdispatch.lea(f.Address(0,rip),f.r_ret)(f.yield_start)
+        else:
+            jdispatch.call(f.Displacement(0))(f.yield_start).pop(f.r_ret)
+
+        jdispatch.add(f.r_ret,f.r_scratch[0]).jmp(f.r_scratch[0])
+
+        (opcodes
+            .mov(f_obj.f_exc_type,f.r_scratch[1])
+            .test(f.r_scratch[1],f.r_scratch[1])
+            .jz(not_in_handler)
+            .cmp(naddr,f.r_scratch[1])
+            .je(not_in_handler)
+                (InnerCall(f.op,f.abi,f.util_funcs.swap_exc_state))
+                .goto(endif)
+            (not_in_handler)
+                .mov(tstate.exc_type,f.r_ret)
+                .mov(tstate.exc_value,f.r_pres[1])
+                .mov(tstate.exc_traceback,f.r_scratch[1])
+
+                .if_(f.r_ret) [ join(f.incref(f.r_ret)) ]
+                .if_(f.r_pres[1]) [ join(f.incref(f.r_pres[1])) ]
+                .if_(f.r_scratch[1]) [ join(f.incref(f.r_scratch[1])) ]
+
+                .mov(f_obj.f_exc_type,f.r_scratch[0])
+                .mov(f.r_ret,f_obj.f_exc_type)
+                .mov(f_obj.f_exc_value,f.r_ret)
+                .mov(f.r_pres[1],f_obj.f_exc_value)
+                .mov(f_obj.f_exc_traceback,f.r_pres[1])
+                .mov(f.r_scratch[1],f_obj.f_exc_traceback)
+
+                .if_(f.r_scratch[0]) [ join(f.decref(f.r_scratch[0],preserve_reg=f.r_ret)) ]
+                .if_(f.r_ret) [ join(f.decref(f.r_ret)) ]
+                .if_(f.r_pres[1]) [ join(f.decref(f.r_pres[1])) ]
+            (endif)
+            .mov(f_obj.f_lasti,f.r_scratch[0])
+            .if_(signed(f.r_scratch[0]) == -1) [ jdispatch ]
+        )
+
+    del f_obj
+    del tstate
+
     f.stack.offset = stack_first    
-    stack_prolog = f.stack.offset
+    f.stack_prolog = f.stack.offset
     f.stack.protected_items.append(f.stack.offset)
     
     i = 0
@@ -3665,11 +3904,11 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
             f.byte_offset = i
     
     
-    if f.stack.offset is not None and f.stack.offset != stack_prolog:
+    if f.stack.offset is not None and f.stack.offset != f.stack_prolog:
         raise NCCompileError(
             'stack.offset should be {0}, but is {1}'
-            .format(stack_prolog,f.stack.offset))
-    f.stack.offset = stack_prolog
+            .format(f.stack_prolog,f.stack.offset))
+    f.stack.offset = f.stack_prolog
     f.stack.protected_items.pop()
     assert len(f.stack.protected_items) == 1
 
@@ -3690,16 +3929,16 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
         .add(stack_ptr_shift,abi.r_sp)
         .pop(f.r_pres[1])
         .pop(f.r_pres[0])
-        .mov(f.Address(pyinternals.FRAME_BACK_OFFSET,f.r_scratch[1]),f.r_scratch[1])
+        .mov(f.ctype('PyFrameObject',f.r_scratch[1]).f_back,f.r_scratch[1])
         .pop(abi.r_bp)
-        .mov(f.r_scratch[1],f.Address(pyinternals.THREADSTATE_FRAME_OFFSET,f.r_scratch[0]))
+        .mov(f.r_scratch[1],f.ctype('PyThreadState',f.r_scratch[0]).frame)
         .ret()
     )
 
     return opcodes
 
 
-def compile_raw(_code,abi,binary = True,tuning=Tuning()):
+def compile_raw(_code,abi,binary=True,tuning=Tuning()):
     assert len(abi.r_scratch) >= 2 and len(abi.r_pres) >= 2
 
     if isinstance(_code,types.CodeType):
@@ -3741,8 +3980,11 @@ def compile_raw(_code,abi,binary = True,tuning=Tuning()):
         target.displacement = 0
         functions.insert(
             0,
-            resolve_jumps(op,body(op,abi,tuning,*extra_args).code,end_targets))
+            resolve_jumps(op,destitch(body(op,abi,tuning,*extra_args)),end_targets))
         end_targets.append(target)
+
+    if ufuncs.swap_exc_state.used:
+        add_util_func(ufuncs.swap_exc_state,swap_exc_state_func)
 
     if ufuncs.unwind_exc.used or ufuncs.unwind_finally.used:
         add_util_func(unwind_exc_tail,unwind_exc_func_tail)
@@ -3774,12 +4016,17 @@ def compile_raw(_code,abi,binary = True,tuning=Tuning()):
         functions.insert(0,resolve_jumps(op,func.code,end_targets))
 
     offset = 0
-    for epf,func in zip(entry_points,functions):
-        pyinternals.cep_set_offset(epf[0],offset)
+    for epf,func in itertools.zip_longest(entry_points,functions):
+        if epf:
+            pyinternals.cep_set_offset(epf[0],offset)
+            func.entry_point = epf[0]
+        func.address = offset
         offset += len(func)
 
     if not binary:
-        functions = join(functions)
+        functions = join(f.code for f in functions)
+    else:
+        functions = CompilationUnit(functions)
     
     return functions,[ep for ep,func in entry_points]
 

@@ -7,9 +7,17 @@
 #if defined(__linux__) || defined(__linux) || defined(linux)
     #include <sys/mman.h>
     #include <unistd.h>
-    #include <fcntl.h>
+    #include <stdlib.h>
     
-    #define USE_MMAP 1
+    #define USE_POSIX 1
+#elif defined(_WIN32) || defined(__WIN32__) || defined(__TOS_WIN__) || defined(__WINDOWS__)
+    #include <Windows.h>
+
+    #define USE_WIN 1
+#endif
+
+#if defined(__GNUC__) && !defined(NDEBUG)
+#define GDB_JIT_SUPPORT 1
 #endif
 
 
@@ -88,21 +96,105 @@ static int call_trace_protected(Py_tracefunc func, PyObject *obj, PyFrameObject 
 
 
 static ternaryfunc old_func_call = NULL;
+static PyCFunction old_gen_send = NULL;
+static PyCFunction old_gen_throw = NULL;
+static PyCFunction old_gen_close = NULL;
+static iternextfunc old_gen_iternext = NULL;
 
 
-typedef PyObject *(*entry_type)(PyFrameObject *);
+#ifdef GDB_JIT_SUPPORT
+
+#include <stdint.h>
+
+typedef enum {
+    JIT_NOACTION = 0,
+    JIT_REGISTER_FN,
+    JIT_UNREGISTER_FN
+} jit_actions_t;
+
+struct jit_code_entry {
+    struct jit_code_entry *next_entry;
+    struct jit_code_entry *prev_entry;
+    const void *symfile_addr;
+    uint64_t symfile_size;
+};
+
+typedef struct {
+    uint32_t version;
+    uint32_t action_flag;
+    struct jit_code_entry *relevant_entry;
+    struct jit_code_entry *first_entry;
+} jit_descriptor;
+
+void __attribute__((noinline)) __jit_debug_register_code(void) {};
+
+jit_descriptor __jit_debug_descriptor = {1,0,0,0};
+
+int register_gdb(const void *addr,size_t size) {
+    struct jit_code_entry *entry = PyMem_Malloc(sizeof(struct jit_code_entry));
+    if(!entry) {
+        PyErr_NoMemory();
+        return -1;
+    }
+
+    entry->next_entry = __jit_debug_descriptor.first_entry;
+    entry->prev_entry = NULL;
+    entry->symfile_addr = addr;
+    entry->symfile_size = size;
+
+    if(__jit_debug_descriptor.first_entry)
+        __jit_debug_descriptor.first_entry->prev_entry = entry;
+
+    __jit_debug_descriptor.first_entry = entry;
+    __jit_debug_descriptor.relevant_entry = entry;
+    __jit_debug_descriptor.action_flag = JIT_REGISTER_FN;
+
+    __jit_debug_register_code();
+
+    return 0;
+}
+
+void unregister_gdb(const void *addr) {
+    struct jit_code_entry *entry;
+    for(entry = __jit_debug_descriptor.first_entry; entry; entry = entry->next_entry) {
+        if(entry->symfile_addr == addr) {
+            if(entry->next_entry) entry->next_entry->prev_entry = entry->prev_entry;
+
+            if(entry->prev_entry) entry->prev_entry->next_entry = entry->next_entry;
+            else __jit_debug_descriptor.first_entry = entry->next_entry;
+
+            entry->next_entry = NULL;
+            entry->prev_entry = NULL;
+
+            __jit_debug_descriptor.relevant_entry = entry;
+            __jit_debug_descriptor.action_flag = JIT_UNREGISTER_FN;
+            __jit_debug_register_code();
+
+            PyMem_Free(entry);
+            return;
+        }
+    }
+    assert(0);
+}
+
+#endif
+
+
+typedef PyObject *(*entry_type)(PyFrameObject *,int);
 
 typedef struct {
     PyObject_HEAD
 
     entry_type entry;
+#ifdef USE_POSIX
+    size_t size; /* needed by munmap */
+#endif
 
     /* a tuple of CodeObjectWithCCode objects */
     PyObject *entry_points;
 
-#ifdef USE_MMAP
-    int fd;
-    size_t len;
+#ifdef GDB_JIT_SUPPORT
+    unsigned char gdb_reg;
 #endif
 } CompiledCode;
 
@@ -169,8 +261,8 @@ static PyTypeObject CompiledCodeType = {
 
 
 /* Since PyCodeObject cannot be subclassed, to support extra fields, we copy a
- * PyCodeObject to this surrogate and identify it using a bit in co_flags not
- * used by CPython */
+   PyCodeObject to this surrogate and identify it using a bit in co_flags not
+   used by CPython */
 typedef struct {
     PyObject_HEAD
     int co_argcount;
@@ -199,6 +291,14 @@ typedef struct {
     unsigned int offset;
 } CodeObjectWithCCode;
 
+static inline PyObject *call_ccode_or_evalframe(PyObject *obj,PyFrameObject *frame,int exc) {
+    if(HAS_CCODE(obj)) {
+        /* ternary operator not used so a breakpoint can be placed here: */
+        return GET_CCODE_FUNC(obj)(frame,exc);
+    } else return PyEval_EvalFrameEx(frame,exc);
+
+    /* return HAS_CCODE(obj) ? GET_CCODE_FUNC(obj)(frame,exc) : PyEval_EvalFrameEx(frame,exc); */
+}
 
 static PyObject *create_compiled_entry_point(PyObject *self,PyObject *_arg) {
     CodeObjectWithCCode *ep;
@@ -358,41 +458,70 @@ static void CompiledCode_dealloc(CompiledCode *self) {
         }
         Py_DECREF(self->entry_points);
     }
+
     if(self->entry) {
-#ifdef USE_MMAP
-        munmap(self->entry,self->len);
-        close(self->fd);
+#ifdef GDB_JIT_SUPPORT
+        if(self->gdb_reg) unregister_gdb(self->entry);
+#endif
+
+#ifdef USE_POSIX
+        munmap(self->entry,self->size);
+#elif USE_WIN
+        VirtualFree(self->entry,0,MEM_RELEASE);
 #else
         PyMem_Free(self->entry);
 #endif
     }
 }
 
+static int alloc_for_func(CompiledCode *self,long size) {
+    assert(size >= 0);
+
+    if(!size) {
+        PyErr_SetString(PyExc_ValueError,"parts cannot be empty");
+        return -1;
+    }
+        
+#ifdef USE_POSIX
+    if((self->entry = mmap(0,size,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANON,-1,0)) == MAP_FAILED) {
+    /*if(posix_memalign((void**)&self->entry,sysconf(_SC_PAGESIZE),size)) {*/
+        self->entry = NULL;
+        PyErr_NoMemory();
+        return -1;
+    }
+    self->size = size;
+#elif defined(USE_WIN)
+    if(!(self->entry = VirtualAlloc(0,size,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE))) {
+        PyErr_NoMemory();
+        return -1;
+    }
+#else
+    if(!(self->entry = PyMem_Malloc(size))) {
+        PyErr_NoMemory();
+        return -1;
+    }
+#endif
+    return 0;
+}
+
 static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kwds) {
     CompiledCode *self;
-    PyObject *filename_o;
-    const char *filename_s;
+    long size;
+    PyObject *parts;
     PyObject *entry_points;
-    int i;
+    Py_ssize_t i;
+    PyObject *lparts = NULL;
     PyObject *item;
 
-#ifdef USE_MMAP
-    off_t slen;
-    void *mem;
-#else
-    FILE *f;
-    long len;
-    size_t read;
+#ifdef GDB_JIT_SUPPORT
+    Py_buffer buff = {0};
 #endif
 
-    static char *kwlist[] = {"filename","entry_points",NULL};
+    static char *kwlist[] = {"parts","entry_points",NULL};
 
-    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O&O",kwlist,
-        PyUnicode_FSConverter,
-        &filename_o,
+    if(!PyArg_ParseTupleAndKeywords(args,kwds,"OO",kwlist,
+        &parts,
         &entry_points)) return NULL;
-
-    filename_s = PyBytes_AS_STRING(filename_o);
     
     self = (CompiledCode*)type->tp_alloc(type,0);
     if(self) {
@@ -403,14 +532,14 @@ static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kw
             entry_points,NULL);
         if(!self->entry_points) goto error;
 
-        i = PyTuple_Size(self->entry_points);
-        if(PyErr_Occurred()) goto error;
-        if(i < 1) {
+        i = PyTuple_GET_SIZE(self->entry_points);
+
+        if(PyTuple_GET_SIZE(self->entry_points) < 1) {
             PyErr_SetString(PyExc_ValueError,"entry_points needs to have at least one entry");
             goto error;
         }
 
-        while(--i >= 0) {
+        for(i=0; i<PyTuple_GET_SIZE(self->entry_points); ++i) {
             item = PyTuple_GET_ITEM(self->entry_points,i);
 
             if(!(PyCode_Check(item) && ((PyCodeObject*)item)->co_flags & CO_COMPILED)) {
@@ -426,62 +555,93 @@ static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kw
                CodeObjectWithCCode) */
             ((CodeObjectWithCCode*)item)->compiled_code = self;
         }
-        
-#ifdef USE_MMAP
-        /* use mmap to create an executable region of memory (merely using
-           mprotect is not enough because some security-conscious systems don't
-           allow marking allocated memory executable unless it was already
-           executable) */
 
-        if((self->fd = open(filename_s,O_RDONLY)) == -1) goto io_error;
-        
-        /* get the file length */
-        if((slen = lseek(self->fd,0,SEEK_END)) == -1 || lseek(self->fd,0,SEEK_SET) == -1) {
-            close(self->fd);
-            goto io_error;
+#ifdef GDB_JIT_SUPPORT
+        if(PyObject_HasAttrString(parts,"rebase")) {
+            int err;
+            PyObject *buffobj;
+
+            if(!(item = PyObject_GetAttrString(parts,"buff"))) goto error;
+
+            buffobj = PyObject_CallMethod(item,"getbuffer",NULL);
+            Py_DECREF(item);
+            if(!buffobj) goto error;
+
+            err = PyObject_GetBuffer(buffobj,&buff,PyBUF_SIMPLE);
+            Py_DECREF(buffobj);
+            if(err) goto error;
+
+            if(alloc_for_func(self,buff.len)) goto error;
+
+            if(!(item = PyObject_CallMethod(parts,"rebase","k",self->entry))) goto error;
+            Py_DECREF(item);
+
+            size = buff.len;
+            memcpy(self->entry,buff.buf,(size_t)size);
+
+            if(register_gdb(self->entry,size)) goto error;
+            self->gdb_reg = 1;
+        } else
+#endif
+        if(PyBytes_Check(parts)) {
+            size = PyBytes_GET_SIZE(parts);
+            if(alloc_for_func(self,size)) goto error;
+            memcpy(self->entry,PyBytes_AS_STRING(parts),(size_t)size);
+        } else {
+            char *dest;
+
+            lparts = PyObject_CallFunctionObjArgs((PyObject*)&PyList_Type,parts,NULL);
+            if(!lparts) goto error;
+
+            size = 0;
+            for(i=0; i < PyList_GET_SIZE(lparts); ++i) {
+                item = PyList_GET_ITEM(lparts,i);
+                if(!PyBytes_Check(item)) {
+                    PyErr_SetString(PyExc_TypeError,"an item in parts is not a bytes object");
+                    goto error;
+                }
+                size += PyBytes_GET_SIZE(item);
+            }
+
+            if(alloc_for_func(self,size)) goto error;
+
+            dest = (char*)self->entry;
+            for(i=0; i < PyList_GET_SIZE(lparts); ++i) {
+                item = PyList_GET_ITEM(lparts,i);
+                memcpy(dest,PyBytes_AS_STRING(item),PyBytes_GET_SIZE(item));
+                dest += PyBytes_GET_SIZE(item);
+            }
         }
-        self->len = (size_t)slen;
-        
-        if((mem = mmap(0,self->len,PROT_READ|PROT_EXEC,MAP_PRIVATE,self->fd,0)) == MAP_FAILED) {
-            close(self->fd);
+
+#ifdef USE_POSIX
+        if(mprotect(self->entry,size,PROT_READ|PROT_EXEC)) {
             PyErr_SetFromErrno(PyExc_OSError);
             goto error;
         }
-        self->entry = (entry_type)mem;
-
-#else
-        /* just load the file contents into memory */
-
-        if((f = fopen(filename_s,"rb")) == NULL) goto io_error;
-        
-        /* get the file length */
-        if(fseek(f,0,SEEK_END) || (len = ftell(f)) == -1 || fseek(f,0,SEEK_SET)) {
-            fclose(f);
-            goto io_error;
-        }
-        
-        if((self->entry = (entry_type)PyMem_Malloc(len)) == NULL) {
-            fclose(f);
+    #ifdef __GNUC__
+        __builtin___clear_cache(self->entry,(char*)self->entry + size);
+    #else
+        #warning "Don't know how to flush instruction cache on this compiler and OS"
+    #endif
+#elif defined(USE_WIN)
+        if(!VirtualProtect(self->entry,size,PAGE_EXECUTE_READ)) {
+            PyErr_SetFromWindowsErr(0);
             goto error;
         }
-        
-        read = fread(self->entry,1,len,f);
-        fclose(f);
-        if(read < (size_t)len) goto io_error;
-
+        FlushInstructionCache(GetCurrentProcess(),self->entry,size);
 #endif
+
         goto end; /* skip over the error handling code */
-        
-    io_error:
-        PyErr_SetFromErrnoWithFilename(PyExc_IOError,filename_s);
     error:
         Py_DECREF(self);
         self = NULL;
+    end:
+        Py_XDECREF(lparts);
+#ifdef GDB_JIT_SUPPORT
+        if(buff.obj) PyBuffer_Release(&buff);
+#endif
     }
-end:
-    
-    Py_DECREF(filename_o);
-    
+        
     return (PyObject*)self;
 }
 
@@ -650,7 +810,7 @@ fast_function(PyObject *func, PyObject ***pp_stack, int n, int na, int nk)
             fastlocals[i] = *stack--;
         }
 
-        retval = HAS_CCODE(co) ? GET_CCODE_FUNC(co)(f) : PyEval_EvalFrameEx(f,0);
+        retval = call_ccode_or_evalframe((PyObject*)co,f,0);
 
         ++tstate->recursion_depth;
         Py_DECREF(f);
@@ -1153,15 +1313,7 @@ _cc_EvalCodeEx(PyObject *_co, PyObject *globals, PyObject *locals,
         return PyGen_New(f);
     }
 
-    /* retval = HAS_CCODE(co) ? GET_CCODE_FUNC(co)(f) : PyEval_EvalFrameEx(f,0); */
-    /* this way, a breakpoint can be placed right before run-time generated code
-       is run: */
-    if(HAS_CCODE(co)) {
-        entry_type func = GET_CCODE_FUNC(co);
-        retval = func(f);
-    } else {
-        retval = PyEval_EvalFrameEx(f,0);
-    }
+    retval = call_ccode_or_evalframe(_co,f,0);
 
 fail:
 
@@ -1736,6 +1888,156 @@ unicode_concatenate(PyObject *v, PyObject *w, PyFrameObject *f,
 }
 
 
+/* The following are modified functions from Objects/genobject.c: */
+
+static PyObject *gen_send_ex(PyGenObject *gen, PyObject *arg, int exc)
+{
+    PyThreadState *tstate = PyThreadState_GET();
+    PyFrameObject *f = gen->gi_frame;
+    PyObject *result;
+
+    if (gen->gi_running) {
+        PyErr_SetString(PyExc_ValueError,
+                        "generator already executing");
+        return NULL;
+    }
+    if (f==NULL || f->f_stacktop == NULL) {
+        if (arg && !exc)
+            PyErr_SetNone(PyExc_StopIteration);
+        return NULL;
+    }
+
+    if (f->f_lasti == -1) {
+        if (arg && arg != Py_None) {
+            PyErr_SetString(PyExc_TypeError,
+                            "can't send non-None value to a "
+                            "just-started generator");
+            return NULL;
+        }
+    } else {
+        result = arg ? arg : Py_None;
+        Py_INCREF(result);
+        *(f->f_stacktop++) = result;
+    }
+
+    Py_XINCREF(tstate->frame);
+    assert(f->f_back == NULL);
+    f->f_back = tstate->frame;
+
+    gen->gi_running = 1;
+    result = call_ccode_or_evalframe(gen->gi_code,f,exc);
+    gen->gi_running = 0;
+
+    assert(f->f_back == tstate->frame);
+    Py_CLEAR(f->f_back);
+
+    if (result == Py_None && f->f_stacktop == NULL) {
+        Py_DECREF(result);
+        result = NULL;
+        if (arg)
+            PyErr_SetNone(PyExc_StopIteration);
+    }
+
+    if (!result || f->f_stacktop == NULL) {
+        Py_DECREF(f);
+        gen->gi_frame = NULL;
+    }
+
+    return result;
+}
+
+static PyObject *
+gen_send(PyGenObject *gen, PyObject *arg)
+{
+    return gen_send_ex(gen, arg, 0);
+}
+
+static PyObject *
+gen_close(PyGenObject *gen, PyObject *args)
+{
+    PyObject *retval;
+    PyErr_SetNone(PyExc_GeneratorExit);
+    retval = gen_send_ex(gen, Py_None, 1);
+    if (retval) {
+        Py_DECREF(retval);
+        PyErr_SetString(PyExc_RuntimeError,
+                        "generator ignored GeneratorExit");
+        return NULL;
+    }
+    if (PyErr_ExceptionMatches(PyExc_StopIteration)
+        || PyErr_ExceptionMatches(PyExc_GeneratorExit))
+    {
+        PyErr_Clear();
+        Py_INCREF(Py_None);
+        return Py_None;
+    }
+    return NULL;
+}
+
+static PyObject *
+gen_throw(PyGenObject *gen, PyObject *args)
+{
+    PyObject *typ;
+    PyObject *tb = NULL;
+    PyObject *val = NULL;
+
+    if (!PyArg_UnpackTuple(args, "throw", 1, 3, &typ, &val, &tb))
+        return NULL;
+
+    if (tb == Py_None)
+        tb = NULL;
+    else if (tb != NULL && !PyTraceBack_Check(tb)) {
+        PyErr_SetString(PyExc_TypeError,
+            "throw() third argument must be a traceback object");
+        return NULL;
+    }
+
+    Py_INCREF(typ);
+    Py_XINCREF(val);
+    Py_XINCREF(tb);
+
+    if (PyExceptionClass_Check(typ)) {
+        PyErr_NormalizeException(&typ, &val, &tb);
+    }
+
+    else if (PyExceptionInstance_Check(typ)) {
+        if (val && val != Py_None) {
+            PyErr_SetString(PyExc_TypeError,
+              "instance exception may not have a separate value");
+            goto failed_throw;
+        }
+        else {
+            Py_XDECREF(val);
+            val = typ;
+            typ = PyExceptionInstance_Class(typ);
+            Py_INCREF(typ);
+        }
+    }
+    else {
+        PyErr_Format(PyExc_TypeError,
+                     "exceptions must be classes or instances "
+                     "deriving from BaseException, not %s",
+                     typ->ob_type->tp_name);
+            goto failed_throw;
+    }
+
+    PyErr_Restore(typ, val, tb);
+    return gen_send_ex(gen, Py_None, 1);
+
+failed_throw:
+    Py_DECREF(typ);
+    Py_XDECREF(val);
+    Py_XDECREF(tb);
+    return NULL;
+}
+
+static PyObject *
+gen_iternext(PyGenObject *gen)
+{
+    return gen_send_ex(gen, NULL, 0);
+}
+
+
 
 static PyObject *exit_cache = NULL;
 static PyObject *enter_cache = NULL;
@@ -1767,6 +2069,10 @@ static PyMethodDef functions[] = {
 static void free_module(void *_) {
     assert(old_func_call);
     PyFunction_Type.tp_call = old_func_call;
+    PyGen_Type.tp_methods[0].ml_meth = old_gen_send;
+    PyGen_Type.tp_methods[1].ml_meth = old_gen_throw;
+    PyGen_Type.tp_methods[2].ml_meth = old_gen_close;
+    PyGen_Type.tp_iternext = old_gen_iternext;
 }
 
 static struct PyModuleDef this_module = {
@@ -1794,11 +2100,66 @@ typedef struct {
     unsigned long addr;
 } AddrRec;
 
+
+#define M_OFFSET(type,member) {#member,offsetof(type,member)}
+
+typedef struct {
+    const char *name;
+    int offset;
+} OffsetMember;
+
+typedef struct {
+    const char *name;
+    OffsetMember *members;
+} OffsetStruct;
+
+static OffsetStruct member_offsets[] = {
+    {"PyObject",(OffsetMember[]){
+            M_OFFSET(PyObject,ob_refcnt),
+            M_OFFSET(PyObject,ob_type),
+            {NULL}}},
+    {"PyVarObject",(OffsetMember[]){M_OFFSET(PyVarObject,ob_size),{NULL}}},
+    {"PyTypeObject",(OffsetMember[]){
+            M_OFFSET(PyTypeObject,tp_dealloc),
+            M_OFFSET(PyTypeObject,tp_iternext),
+            M_OFFSET(PyTypeObject,tp_flags),
+            {NULL}}},
+    {"PyListObject",(OffsetMember[]){M_OFFSET(PyListObject,ob_item),{NULL}}},
+    {"PyTupleObject",(OffsetMember[]){M_OFFSET(PyTupleObject,ob_item),{NULL}}},
+    {"PyFrameObject",(OffsetMember[]){
+            M_OFFSET(PyFrameObject,f_back),
+            M_OFFSET(PyFrameObject,f_builtins),
+            M_OFFSET(PyFrameObject,f_globals),
+            M_OFFSET(PyFrameObject,f_locals),
+            M_OFFSET(PyFrameObject,f_localsplus),
+            M_OFFSET(PyFrameObject,f_valuestack),
+            M_OFFSET(PyFrameObject,f_stacktop),
+            M_OFFSET(PyFrameObject,f_exc_type),
+            M_OFFSET(PyFrameObject,f_exc_value),
+            M_OFFSET(PyFrameObject,f_exc_traceback),
+            M_OFFSET(PyFrameObject,f_lasti),
+            {NULL}}},
+    {"PyThreadState",(OffsetMember[]){
+            M_OFFSET(PyThreadState,frame),
+            M_OFFSET(PyThreadState,exc_traceback),
+            M_OFFSET(PyThreadState,exc_value),
+            M_OFFSET(PyThreadState,exc_type),
+            M_OFFSET(PyThreadState,c_tracefunc),
+            M_OFFSET(PyThreadState,c_traceobj),
+            {NULL}}},
+    {"PyCellObject",(OffsetMember[]){M_OFFSET(PyCellObject,ob_ref),{NULL}}},
+    {"PyMethodObject",(OffsetMember[]){
+            M_OFFSET(PyMethodObject,im_self),
+            M_OFFSET(PyMethodObject,im_func),
+            {NULL}}},
+    {NULL}
+};
+
 PyMODINIT_FUNC
 PyInit_pyinternals(void) {
-    PyObject *m;
-    PyObject *addrs;
-    PyObject *tmp;
+    PyObject *m, *addrs, *m_offsets, *m_dict, *tmp;
+    OffsetStruct *structs;
+    OffsetMember *members;
     int ret, i;
     
     if(PyType_Ready(&CompiledCodeType) < 0) return NULL;
@@ -1806,36 +2167,34 @@ PyInit_pyinternals(void) {
     m = PyModule_Create(&this_module);
     if(!m) return NULL;
 
-    ADD_INT_OFFSET("REFCNT_OFFSET",PyObject,ob_refcnt);
-    ADD_INT_OFFSET("TYPE_OFFSET",PyObject,ob_type);
-    ADD_INT_OFFSET("VAR_SIZE_OFFSET",PyVarObject,ob_size);
-    ADD_INT_OFFSET("TYPE_DEALLOC_OFFSET",PyTypeObject,tp_dealloc);
-    ADD_INT_OFFSET("TYPE_ITERNEXT_OFFSET",PyTypeObject,tp_iternext);
-    ADD_INT_OFFSET("TYPE_FLAGS_OFFSET",PyTypeObject,tp_flags);
-    ADD_INT_OFFSET("LIST_ITEM_OFFSET",PyListObject,ob_item);
-    ADD_INT_OFFSET("TUPLE_ITEM_OFFSET",PyTupleObject,ob_item);
-    ADD_INT_OFFSET("FRAME_BACK_OFFSET",PyFrameObject,f_back);
-    ADD_INT_OFFSET("FRAME_BUILTINS_OFFSET",PyFrameObject,f_builtins);
-    ADD_INT_OFFSET("FRAME_GLOBALS_OFFSET",PyFrameObject,f_globals);
-    ADD_INT_OFFSET("FRAME_LOCALS_OFFSET",PyFrameObject,f_locals);
-    ADD_INT_OFFSET("FRAME_LOCALSPLUS_OFFSET",PyFrameObject,f_localsplus);
-    ADD_INT_OFFSET("THREADSTATE_FRAME_OFFSET",PyThreadState,frame);
-    ADD_INT_OFFSET("THREADSTATE_TRACEBACK_OFFSET",PyThreadState,exc_traceback);
-    ADD_INT_OFFSET("THREADSTATE_VALUE_OFFSET",PyThreadState,exc_value);
-    ADD_INT_OFFSET("THREADSTATE_TYPE_OFFSET",PyThreadState,exc_type);
-    ADD_INT_OFFSET("THREADSTATE_TRACEFUNC_OFFSET",PyThreadState,c_tracefunc);
-    ADD_INT_OFFSET("THREADSTATE_TRACEOBJ_OFFSET",PyThreadState,c_traceobj);
-    ADD_INT_OFFSET("CELL_REF_OFFSET",PyCellObject,ob_ref);
-    ADD_INT_OFFSET("METHOD_SELF_OFFSET",PyMethodObject,im_self);
-    ADD_INT_OFFSET("METHOD_FUNC_OFFSET",PyMethodObject,im_func);
     if(PyModule_AddStringConstant(m,"ARCHITECTURE",ARCHITECTURE) == -1) return NULL;
     if(PyModule_AddObject(m,"REF_DEBUG",PyBool_FromLong(REF_DEBUG_VAL)) == -1) return NULL;
     if(PyModule_AddObject(m,"COUNT_ALLOCS",PyBool_FromLong(COUNT_ALLOCS_VAL)) == -1) return NULL;
+#ifdef GDB_JIT_SUPPORT
+    Py_INCREF(Py_True);
+    if(PyModule_AddObject(m,"GDB_JIT_SUPPORT",Py_True) == -1) return NULL;
+#endif
+
+
+    if(!(m_offsets = PyDict_New())) return NULL;
+    if(PyModule_AddObject(m,"member_offsets",m_offsets) == -1) return NULL;
+
+    for(structs = member_offsets; structs->name; ++structs) {
+        if(!(m_dict = PyDict_New())) return NULL;
+        ret = PyDict_SetItemString(m_offsets,structs->name,m_dict);
+        Py_DECREF(m_dict);
+        if(ret == -1) return NULL;
+
+        for(members = structs->members; members->name; ++members) {
+            if(!(tmp = PyLong_FromLong(members->offset))) return NULL;
+            ret = PyDict_SetItemString(m_dict,members->name,tmp);
+            Py_DECREF(tmp);
+            if(ret == -1) return NULL;
+        }
+    }
 
     
-    addrs = PyDict_New();
-    if(!addrs) return NULL;
-    
+    if(!(addrs = PyDict_New())) return NULL;
     if(PyModule_AddObject(m,"raw_addresses",addrs) == -1) return NULL;
 
     AddrRec addr_records[] = {
@@ -1961,7 +2320,7 @@ PyInit_pyinternals(void) {
     };
 
     for(i=0; i<sizeof(addr_records)/sizeof(AddrRec); ++i) {
-        tmp = PyLong_FromUnsignedLong(addr_records[i].addr);
+        if(!(tmp = PyLong_FromUnsignedLong(addr_records[i].addr))) return NULL;
         ret = PyDict_SetItemString(addrs,addr_records[i].name,tmp);
         Py_DECREF(tmp);
         if(ret == -1) return NULL;
@@ -1971,8 +2330,14 @@ PyInit_pyinternals(void) {
     if(PyModule_AddObject(m,"CompiledCode",(PyObject*)&CompiledCodeType) == -1) return NULL;
 
     assert(!old_func_call);
-    old_func_call = PyFunction_Type.tp_call;
-    PyFunction_Type.tp_call = _function_call;
+
+#define backup_and_set(old,new,store) old = store; store = new
+
+    backup_and_set(old_func_call,_function_call,PyFunction_Type.tp_call);
+    backup_and_set(old_gen_send,(PyCFunction)gen_send,PyGen_Type.tp_methods[0].ml_meth);
+    backup_and_set(old_gen_throw,(PyCFunction)gen_throw,PyGen_Type.tp_methods[1].ml_meth);
+    backup_and_set(old_gen_close,(PyCFunction)gen_close,PyGen_Type.tp_methods[2].ml_meth);
+    backup_and_set(old_gen_iternext,(iternextfunc)gen_iternext,PyGen_Type.tp_iternext);
     
     return m;
 }

@@ -331,6 +331,11 @@ class Assembly:
     def comment(self,comm):
         return AsmSequence([(b'','$COMMENT$',comm)])
 
+    def with_new_imm_dword(self,op,imm):
+        assert len(op.ops) == 1
+        bin,name,args = op.ops[0]
+        return AsmSequence([new_immediate_dword(bin,imm),name,(offset,args[1])])
+
 
 
 al = Register(SIZE_B,0b000)
@@ -377,6 +382,15 @@ test_G = Test(0b1111)
 
 
 
+def with_new_imm_dword(op,imm):
+    """Returns the same instruction as 'op' but with the immediate value 'imm'
+    instead.
+
+    The immediate value is assumed to be 4 bytes long. No checking is done to
+    make sure 'op' has an immediate value or if it's the correct size.
+
+    """
+    return op[0:-4] + immediate_data(True,imm)
 
 
 

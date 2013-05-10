@@ -9,7 +9,7 @@ from .x86_ops import (
     jmp,lea,leave,loop,loopz,loope,loopnz,loopne,mov,movb,movl,nop,pop,ret,shl,
     shlb,shll,shr,shrb,shrl,sub,subb,subl,test,testb,testl,xor,xorb,xorl,
     CALL_DISP_LEN,JMP_DISP_MIN_LEN,JMP_DISP_MAX_LEN,LOOP_LEN,SIZE_B,SIZE_D,
-    SIZE_Q
+    SIZE_Q,with_new_imm_dword
 )
 
 
