@@ -61,12 +61,16 @@ class Register:
         
         return NotImplemented
 
-    def __str__(self):
+    @property
+    def name(self):
         assert (not self.ext) and self.size < SIZE_Q
-        return '%' + [
+        return [
             ['al','cl','dl','bl','ah','ch','dh','bh'],
             ['eax','ecx','edx','ebx','esp','ebp','esi','edi']
         ][self.size][self.reg]
+
+    def __str__(self):
+        return '%' + self.name
 
 Register.__mmtype__ = Register
 

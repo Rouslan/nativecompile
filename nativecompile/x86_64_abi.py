@@ -1,8 +1,13 @@
 
 from . import x86_64_ops as _ops
 
+class X86_64Abi:
+    char_size = 1
+    short_size = 2
+    int_size = 4
+    long_size = 8
 
-class SystemVAbi:
+class SystemVAbi(X86_64Abi):
     shadow = 0
     ops = _ops
     r_ret = _ops.rax
@@ -14,7 +19,7 @@ class SystemVAbi:
     ptr_size = 8
 
 
-class MicrosoftX64Abi:
+class MicrosoftX64Abi(X86_64Abi):
     shadow = 32
     ops = _ops
     r_ret = _ops.rax

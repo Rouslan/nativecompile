@@ -181,8 +181,9 @@ class RelocBuffer:
                 b[pos:pos+len(addr)] = addr
 
 class NonRelocWrapper:
-    def __init__(self,dest):
+    def __init__(self,dest,addr_size):
         self.dest = dest
+        self.addr_size = addr_size
 
     def seek(self,*args):
         return self.dest.seek(*args)
@@ -191,7 +192,7 @@ class NonRelocWrapper:
         return self.dest.tell()
 
     def write(self,data):
-        self.dest.write(bytes(data) if isinstance(data,RelocAddress) else data)
+        self.dest.write(data.get(self.addr_size) if isinstance(data,RelocAddress) else data)
 
 
 def write_shared_object(mode,out,sections):
@@ -200,7 +201,7 @@ def write_shared_object(mode,out,sections):
     s_pos = []
 
     if not isinstance(out,(RelocBuffer,NonRelocWrapper)):
-        out = NonRelocWrapper(out)
+        out = NonRelocWrapper(out,mode//8)
 
     # section indices 0 and 0xff00-0xffff have special meaning (and higher
     # indices can't be used because e_shnum of the ELF header is a 16-bit field)

@@ -19,8 +19,9 @@ def immediate_data(w,data):
 
 
 class Register(x86_ops.Register):
-    def __str__(self):
-        return '%' + [
+    @property
+    def name(self):
+        return [
             ['al','cl','dl','bl','spl','bpl','sil','dil',
              'r8b','r9b','r10b','r11b','r12b','r13b','r14b','r15b'],
             ['eax','ecx','edx','ebx','esp','ebp','esi','edi',
@@ -152,8 +153,8 @@ def push(x : Address):
 
 @multimethod
 def push(x : int):
-    # note that this is code is different from x86_ops.push because
-    # immediate_data is redefined
+    # this code is different from x86_ops.push because immediate_data is
+    # redefined
 
     byte = x86_ops.fits_in_sbyte(x)
     return bytes([0b01101000 | (byte << 1)]) + immediate_data(not byte,x)

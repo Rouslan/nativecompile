@@ -11,3 +11,7 @@ class CdeclAbi:
     r_bp = x86_ops.ebp
     r_arg = []
     ptr_size = 4
+    char_size = 1
+    short_size = 2
+    int_size = 4
+    long_size = 4
