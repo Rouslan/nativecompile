@@ -11,7 +11,7 @@ from functools import partial
 from .multimethod import multimethod
 
 
-SIZE_B = 0
+SIZE_B = 0 # SIZE_B must evaluate to False
 # SIZE_W not used
 SIZE_D = 1
 SIZE_Q = 2
@@ -184,7 +184,10 @@ def fits_in_sbyte(x):
     if isinstance(x,Displacement):
         if x.force_full_size: return False
         x = x.val
-    return -128 <= x <= 127
+    return -0x80 <= x <= 0x7f
+
+def fits_in_sdword(x):
+    return -0x80000000 <= x <= 0x7fffffff
 
 
 def rex(reg,rm,need_w=True):
@@ -195,32 +198,26 @@ def rex(reg,rm,need_w=True):
     string.
 
     """
-    assert reg is None or isinstance(reg,Register)
-    assert rm is None or isinstance(rm,(Register,Address))
-
     rxb = 0
     w = None
 
-    if reg:
+    if isinstance(reg,Register):
         w = reg.size == SIZE_Q
         rxb |= reg.ext << 2
+    elif reg is not None:
+        assert isinstance(reg,int) and isinstance(rm,Address)
+        w = reg == SIZE_Q
+    else:
+        assert isinstance(rm,Register)
 
-    if rm:
-        if isinstance(rm,Address):
-            assert not (w is None and rm.size is None)
-            if rm.size:
-                assert w is None or w == (rm.size == SIZE_Q)
-                w = rm.size == SIZE_Q
-
-            if rm.index and rm.index.ext: rxb |= 0b10
-            if rm.base and rm.base.ext: rxb |= 1
-        else:
-            assert rm.size is not None
-            assert w is None or w == (rm.size == SIZE_Q)
-            w = rm.size == SIZE_Q
-            rxb |= rm.ext
-
-    assert w is not None
+    if isinstance(rm,Address):
+        if rm.index and rm.index.ext: rxb |= 0b10
+        if rm.base and rm.base.ext: rxb |= 1
+    elif rm is not None:
+        assert isinstance(rm,Register)
+        assert w is None or w == (rm.size == SIZE_Q)
+        w = rm.size == SIZE_Q
+        rxb |= rm.ext
 
     return bytes([0b01000000 | (w << 3) | rxb]) if ((w and need_w) or rxb) else b''
 
@@ -338,7 +335,7 @@ class Assembly:
     def with_new_imm_dword(self,op,imm):
         assert len(op.ops) == 1
         bin,name,args = op.ops[0]
-        return AsmSequence([new_immediate_dword(bin,imm),name,(offset,args[1])])
+        return AsmSequence([(with_new_imm_dword(bin,imm),name,(imm,args[1]))])
 
 
 
@@ -418,9 +415,9 @@ def _op_imm_reg(byte1,mid,byte_alt,a,b):
         byte1 | (fits << 1) | b.w,
         0b11000000 | (mid << 3) | b.reg]) + immediate_data(not fits,a)
 
-def _op_imm_addr(byte1,mid,a,b,w):
+def _op_imm_addr(byte1,mid,a,b,size):
     fits = fits_in_sbyte(a)
-    return rex(None,b) + bytes([byte1 | (fits << 1) | w]) + b.mod_rm_sib_disp(mid) + immediate_data(not fits,a)
+    return rex(size,b) + bytes([byte1 | (fits << 1) | bool(size)]) + b.mod_rm_sib_disp(mid) + immediate_data(not fits,a)
 
 
 
@@ -444,16 +441,16 @@ def add(a : Register,b : Address):
 def add(a : int,b : Register):
     return _op_imm_reg(0b10000000,0,0b00000100,a,b)
 
-def add_imm_addr(a,b,w):
-    return _op_imm_addr(0b10000000,0,a,b,w)
+def add_imm_addr(a,b,size):
+    return _op_imm_addr(0b10000000,0,a,b,size)
 
 @multimethod
 def addb(a : int,b : Address):
-    return add_imm_addr(a,b,False)
+    return add_imm_addr(a,b,SIZE_B)
 
 @multimethod
 def addl(a : int,b : Address):
-    return add_imm_addr(a,b,True)
+    return add_imm_addr(a,b,SIZE_D)
 
 
 
@@ -472,7 +469,7 @@ def call(proc : Register):
 
 @multimethod
 def call(proc : Address):
-    return rex(None,proc,False) + b'\xFF' + proc.mod_rm_sib_disp(0b010)
+    return rex(SIZE_D,proc,False) + b'\xFF' + proc.mod_rm_sib_disp(0b010)
 
 
 
@@ -510,13 +507,16 @@ def cmp(a : Register,b : Address):
 def cmp(a : int,b : Register):
     return _op_imm_reg(0b10000000,0b111,0b00111100,a,b)
 
+def cmp_imm_addr(a,b,size):
+    return _op_imm_addr(0b10000000,0b111,a,b,size)
+
 @multimethod
 def cmpb(a : int,b : Address):
-    return _op_imm_addr(0b10000000,0b111,a,b,False)
+    return cmp_imm_addr(a,b,SIZE_B)
 
 @multimethod
 def cmpl(a : int,b : Address):
-    return _op_imm_addr(0b10000000,0b111,a,b,True)
+    return cmp_imm_addr(a,b,SIZE_D)
 
 
 
@@ -535,16 +535,16 @@ def dec(x : Register):
             0b11111110,
             0b11001000 | x.reg])
 
-def dec_addr(x,w):
-    return rex(None,x) + bytes([0b11111110 | w]) + x.mod_rm_sib_disp(0b001)
+def dec_addr(x,size):
+    return rex(size,x) + bytes([0b11111110 | bool(size)]) + x.mod_rm_sib_disp(0b001)
 
 @multimethod
 def decb(x : Address):
-    return dec_addr(x,False)
+    return dec_addr(x,SIZE_B)
 
 @multimethod
 def decl(x : Address):
-    return dec_addr(x,True)
+    return dec_addr(x,SIZE_D)
 
 
 
@@ -558,16 +558,16 @@ def inc(x : Register):
             0b11111110,
             0b11000000 | x.reg])
 
-def inc_addr(x,w):
-    return rex(None,x) + bytes([0b11111110 | w]) + x.mod_rm_sib_disp(0)
+def inc_addr(x,size):
+    return rex(size,x) + bytes([0b11111110 | bool(size)]) + x.mod_rm_sib_disp(0)
 
 @multimethod
 def incb(x : Address):
-    return inc_addr(x,False)
+    return inc_addr(x,SIZE_B)
 
 @multimethod
 def incl(x : Address):
-    return inc_addr(x,True)
+    return inc_addr(x,SIZE_D)
 
 
 
@@ -661,16 +661,16 @@ def mov(a : Register,b : Address):
 def mov(a : int,b : Register):
     return rex(None,b) + bytes([0b10110000 | (b.w << 3) | b.reg]) + immediate_data(b.w,a)
 
-def mov_imm_addr(a,b,w):
-    return rex(None,b) + bytes([0b11000110 | w]) + b.mod_rm_sib_disp(0) + immediate_data(w,a)
+def mov_imm_addr(a,b,size):
+    return rex(size,b) + bytes([0b11000110 | bool(size)]) + b.mod_rm_sib_disp(0) + immediate_data(bool(size),a)
 
 @multimethod
 def movb(a : int,b : Address):
-    return mov_imm_addr(a,b,False)
+    return mov_imm_addr(a,b,SIZE_B)
 
 @multimethod
 def movl(a : int,b : Address):
-    return mov_imm_addr(a,b,True)
+    return mov_imm_addr(a,b,SIZE_D)
 
 
 
@@ -683,16 +683,16 @@ def nop():
 def not_(x : Register):
     return rex(None,x) + bytes([0b11110110 | x.w, 0b11010000 | x.reg])
 
-def not_addr(x,w):
-    return rex(None,x) + bytes([0b11110110 | w]) + x.mod_rm_sib_disp(0b010)
+def not_addr(x,size):
+    return rex(size,x) + bytes([0b11110110 | bool(size)]) + x.mod_rm_sib_disp(0b010)
 
 @multimethod
 def notb(x : Address):
-    return not_addr(x,False)
+    return not_addr(x,SIZE_B)
 
 @multimethod
 def notl(x : Address):
-    return not_addr(x,True)
+    return not_addr(x,SIZE_D)
 
 
 
@@ -750,18 +750,18 @@ def shx_reg_reg(amount,x,shiftright):
         0b11010010 | x.w,
         0b11100000 | (shiftright << 3) | x.reg])
 
-def shx_imm_addr(amount,x,w,shiftright):
-    r = rex(None,x)
+def shx_imm_addr(amount,x,size,shiftright):
+    r = rex(size,x)
     rmsd = x.mod_rm_sib_disp(0b100 | shiftright)
     if amount == 1:
-        return r + bytes([0b11010000 | w]) + rmsd
+        return r + bytes([0b11010000 | bool(size)]) + rmsd
     
-    return r + bytes([0b11000000 | w]) + rmsd + immediate_data(False,amount)
+    return r + bytes([0b11000000 | bool(size)]) + rmsd + immediate_data(False,amount)
 
-def shx_reg_addr(amount,x,w,shiftright):
+def shx_reg_addr(amount,x,size,shiftright):
     assert amount == cl
     
-    return rex(None,x) + bytes([0b11010010 | w]) + x.mod_rm_sib_disp(0b100 | shiftright)
+    return rex(size,x) + bytes([0b11010010 | bool(size)]) + x.mod_rm_sib_disp(0b100 | shiftright)
 
 
 @multimethod
@@ -774,19 +774,19 @@ def shl(amount : Register,x : Register):
 
 @multimethod
 def shlb(amount : int,x : Address):
-    return shx_imm_addr(amount,x,False,False)
+    return shx_imm_addr(amount,x,SIZE_B,False)
 
 @multimethod
 def shll(amount : int,x : Address):
-    return shx_imm_addr(amount,x,True,False)
+    return shx_imm_addr(amount,x,SIZE_D,False)
 
 @multimethod
 def shlb(amount : Register,x : Address):
-    return shx_reg_addr(amount,x,False,False)
+    return shx_reg_addr(amount,x,SIZE_B,False)
 
 @multimethod
 def shll(amount : Register,x : Address):
-    return shx_reg_addr(amount,x,True,False)
+    return shx_reg_addr(amount,x,SIZE_D,False)
 
 
 
@@ -800,19 +800,19 @@ def shr(amount : Register,x : Register):
 
 @multimethod
 def shrb(amount : int,x : Address):
-    return shx_imm_addr(amount,x,False,True)
+    return shx_imm_addr(amount,x,SIZE_B,True)
 
 @multimethod
 def shrl(amount : int,x : Address):
-    return shx_imm_addr(amount,x,True,True)
+    return shx_imm_addr(amount,x,SIZE_D,True)
 
 @multimethod
 def shrb(amount : Register,x : Address):
-    return shx_reg_addr(amount,x,False,True)
+    return shx_reg_addr(amount,x,SIZE_B,True)
 
 @multimethod
 def shrl(amount : Register,x : Address):
-    return shx_reg_addr(amount,x,True,True)
+    return shx_reg_addr(amount,x,SIZE_D,True)
 
 
 
@@ -832,13 +832,16 @@ def sub(a : Register,b : Address):
 def sub(a : int,b : Register):
     return _op_imm_reg(0b10000000,0b101,0b00101100,a,b)
 
+def sub_imm_addr(a,b,size):
+    return _op_imm_addr(0b10000000,0b101,a,b,size)
+
 @multimethod
 def subb(a : int,b : Address):
-    return _op_imm_addr(0b10000000,0b101,a,b,False)
+    return sub_imm_addr(a,b,SIZE_B)
 
 @multimethod
 def subl(a : int,b : Address):
-    return _op_imm_addr(0b10000000,0b101,a,b,True)
+    return sub_imm_addr(a,b,SIZE_D)
 
 
 
@@ -854,16 +857,16 @@ def test(a : Address,b : Register):
 def test(a : int,b : Register):
     return _op_imm_reg(0b11110110,0,0b10101000,a,b)
 
-def test_imm_addr(a,b,w):
-    return rex(None,b) + bytes([0b11110110 | w]) + b.mod_rm_sib_disp(0) + immediate_data(w,a)
+def test_imm_addr(a,b,size):
+    return rex(size,b) + bytes([0b11110110 | bool(size)]) + b.mod_rm_sib_disp(0) + immediate_data(bool(size),a)
 
 @multimethod
 def testb(a : int,b : Address):
-    return test_imm_addr(a,b,False)
+    return test_imm_addr(a,b,SIZE_B)
 
 @multimethod
 def testl(a : int,b : Address):
-    return test_imm_addr(a,b,True)
+    return test_imm_addr(a,b,SIZE_D)
 
 
 
@@ -883,10 +886,13 @@ def xor(a : Address,b : Register):
 def xor(a : int,b : Register):
     return _op_imm_reg(0b10000000,0b110,0b00110100,a,b)
 
+def xor_imm_addr(a,b,size):
+    return _op_imm_addr(0b10000000,0b110,a,b,size)
+
 @multimethod
 def xorb(a : int,b : Address):
-    return _op_imm_addr(0b10000000,0b110,a,b,False)
+    return xor_imm_addr(a,b,SIZE_B)
 
 @multimethod
 def xorl(a : int,b : Address):
-    return _op_imm_addr(0b10000000,0b110,a,b,True)
+    return xor_imm_addr(a,b,SIZE_D)

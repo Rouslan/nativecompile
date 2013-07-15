@@ -83,6 +83,8 @@ class Address(x86_ops.Address):
             assert index is None
             self.rip = True
             base = None
+            
+        assert (base is None or base.size == SIZE_Q) and (index is None or index.size == SIZE_Q)
 
         super().__init__(offset,base,index,scale)
 
@@ -100,8 +102,10 @@ class Assembly(x86_ops.Assembly):
 
 
 @multimethod
-def call(proc : Displacement):
-    return x86_ops.call(proc)
+def addq(a : int,b : Address):
+    return x86_ops.add_imm_addr(a,b,SIZE_Q)
+
+
 
 @multimethod
 def call(proc : Register):
@@ -111,7 +115,15 @@ def call(proc : Register):
 @multimethod
 def call(proc : Address):
     assert proc.size is None or proc.size == SIZE_Q
-    return x86_ops.call(proc)
+    return x86_ops.rex(SIZE_Q,proc,False) + b'\xFF' + proc.mod_rm_sib_disp(0b010)
+
+call.inherit(x86_ops.call)
+
+
+
+@multimethod
+def cmpq(a : int,b : Address):
+    return x86_ops.cmp_imm_addr(a,b,SIZE_Q)
 
 
 
@@ -121,6 +133,10 @@ def dec(x : Register):
         0b11111110 | x.w,
         0b11001000 | x.reg])
 
+@multimethod
+def decq(x : Address):
+    return x86_ops.dec_addr(x,SIZE_Q)
+
 
 
 @multimethod
@@ -128,6 +144,10 @@ def inc(x : Register):
     return x86_ops.rex(None,x) + bytes([
         0b11111110 | x.w,
         0b11000000 | x.reg])
+
+@multimethod
+def incq(x : Address):
+    return x86_ops.inc_addr(x,SIZE_Q)
 
 
 
@@ -139,6 +159,17 @@ def mov(a : int,b : Register):
     return x86_ops.mov(a,b)
 
 mov.inherit(x86_ops.mov)
+
+@multimethod
+def movq(a : int,b : Address):
+    return x86_ops.mov_imm_addr(a,b,SIZE_Q)
+
+
+
+@multimethod
+def notq(x : Address):
+    return x86_ops.not_addr(x,SIZE_Q)
+
 
 
 @multimethod
@@ -158,3 +189,41 @@ def push(x : int):
 
     byte = x86_ops.fits_in_sbyte(x)
     return bytes([0b01101000 | (byte << 1)]) + immediate_data(not byte,x)
+
+
+
+@multimethod
+def shlq(amount : int,x : Address):
+    return x86_ops.shx_imm_addr(amount,x,SIZE_Q,False)
+
+@multimethod
+def shlq(amount : Register,x : Address):
+    return x86_ops.shx_reg_addr(amount,x,SIZE_Q,False)
+
+
+
+@multimethod
+def shrq(amount : int,x : Address):
+    return x86_ops.shx_imm_addr(amount,x,SIZE_Q,True)
+
+@multimethod
+def shrq(amount : Register,x : Address):
+    return x86_ops.shx_reg_addr(amount,x,SIZE_Q,True)
+
+
+
+@multimethod
+def subq(a : int,b : Address):
+    return x86_ops.sub_imm_addr(a,b,SIZE_Q)
+
+
+
+@multimethod
+def testq(a : int,b : Address):
+    return x86_ops.test_imm_addr(a,b,SIZE_Q)
+
+
+
+@multimethod
+def xorq(a : int,b : Address):
+    return x86_ops.xor_imm_addr(a,b,SIZE_Q)

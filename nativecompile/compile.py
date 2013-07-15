@@ -47,5 +47,5 @@ def compile(code):
 
 def compile_asm(code):
     """Compile code and return the assembly representation"""
-    return ''.join(f.dump() for f in compile_raw(code,Abi,op=Abi.ops.Assembly)[0].functions)
+    return '\n'.join(f.code.dump() for f in compile_raw(code,Abi,op=Abi.ops.Assembly())[0].functions)
 

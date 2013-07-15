@@ -278,6 +278,53 @@ f(*a,**b)
 f(0,*a,**b)
 ''')
 
+    def test_yield(self):
+        self.compare_exec('''
+import sys
+
+def gentest(x):
+    try:
+        yield 1
+    except:
+        print(sys.exc_info()[0])
+        raise
+
+    a = yield 2
+    b = yield 2 * a
+    for y in range(1):
+        yield b
+        yield x * y
+
+    try:
+        1/0
+    except:
+        print(sys.exc_info()[0])
+        yield 9
+        print(sys.exc_info()[0])
+
+g = gentest(5)
+print(next(g))
+print(g.send(9))
+print(g.send('yam'))
+print(next(g))
+print(next(g))
+
+print(sys.exc_info()[0])
+print(next(g))
+print(sys.exc_info()[0])
+try:
+    next(g)
+except StopIteration:
+    print('almost done')
+
+g = gentest(8)
+print(next(g))
+try:
+    g.throw(ValueError,'hi')
+except ValueError:
+    print('done')
+''')
+
 
 if __name__ == '__main__':
     unittest.main()

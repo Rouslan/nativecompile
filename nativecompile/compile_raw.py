@@ -10,7 +10,7 @@ from functools import partial, reduce, update_wrapper, wraps
 
 from . import pyinternals
 from . import debug
-from .x86_ops import TEST_MNEMONICS, fits_in_sbyte
+from .x86_ops import TEST_MNEMONICS, fits_in_sbyte, fits_in_sdword
 
 
 PRINT_STACK_OFFSET = False
@@ -385,7 +385,9 @@ class YieldMov(DelayedCompile):
     def compile(self):
         return self.ops.with_new_imm_dword(
             self.op,
-            self.to.displacement - self.from_.displacement)
+            # displacement is relative to the end of the code, so we subtract
+            # the destination from the source
+            self.from_.displacement - self.to.displacement)
 
     def __len__(self):
         return len(self.op)
@@ -623,6 +625,11 @@ class Frame:
         # Indicates how many values tracked by Frame.stack were added as part of
         # the function prolog. This is needed by YIELD_VALUE.
         self.stack_prolog = None
+        
+        # The address where the throw flag is stored. This is used upon
+        # resumption into YIELD_VALUE (or at the start if the generator just
+        # started) and is invalid afterwards
+        self.throw_flag_store = None
 
 
         a = (self.Address(i,abi.r_bp) for i in
@@ -684,6 +691,9 @@ class Frame:
 
     def ctype(self,*args):
         return CType(self.abi,*args)
+    
+    def dword(self,r):
+        return self.Register(self.abi.ops.SIZE_D,r.code)
 
     def fits_imm32(self,x):
         """Return True if x fits in a 32-bit immediate value without
@@ -696,15 +706,13 @@ class Frame:
 
         """
         if self.ptr_size == 8:
-            return -0x80000000 <= x <= 0x7fffffff
+            return fits_in_sdword(x)
 
         return True
     
     def check_err(self,inverted=False):
         if inverted:
-            return self.if_eax_is_not_zero(
-                [self.op.xor(self.r_ret,self.r_ret)] + 
-                self.goto_end(True))
+            return self.if_eax_is_not_zero(self.goto_end(True))
 
         return self.if_eax_is_zero(self.goto_end(True))
 
@@ -818,7 +826,7 @@ class Frame:
 
             if exception:
                 r.append(self.op.lea(stack[extra],self.r_pres[0]))
-                r.extend(self.mov(-extra,self.r_scratch[0]))
+                r += self.mov(-extra,self.r_scratch[0])
                 r.append(InnerCall(
                     self.op,
                     self.abi,
@@ -828,7 +836,8 @@ class Frame:
 
             r.append(self.goto(block.target))
         else:
-            r.extend(self.end_func(stack))
+            if exception: r += self.mov(0,self.r_ret)
+            r += self.end_func(stack)
 
         return r
 
@@ -980,7 +989,7 @@ class Frame:
             return self.op.inc(b)
 
         if isinstance(a,int) and isinstance(b,self.Address):
-            return self.op.addl(a,b)
+            return (self.op.addq if self.ptr_size == 8 else self.op.addl)(a,b)
         return self.op.add(a,b)
 
     def sub(self,a,b):
@@ -990,7 +999,7 @@ class Frame:
             return self.op.dec(b)
 
         if isinstance(a,int) and isinstance(b,self.Address):
-            return self.op.subl(a,b)
+            return (self.op.subq if self.ptr_size == 8 else self.op.subl)(a,b)
         return self.op.sub(a,b)
 
     # Note: this function assumes little-endian format
@@ -1000,6 +1009,8 @@ class Frame:
                 return [self.op.xor(b,b)]
             if isinstance(a,int) and isinstance(b,self.Address):
                 if self.ptr_size == 8:
+                    if fits_in_sdword(a):
+                        return [self.op.movq(a,b)]
                     return [self.op.movl(a & 0xffffffff,b),self.op.movl(a >> 32,b+4)]
                 return [self.op.movl(a,b)]
             return [self.op.mov(a,b)]
@@ -1010,7 +1021,7 @@ class Frame:
         assert (not isinstance(a,int)) or self.fits_imm32(a)
 
         if isinstance(a,int) and isinstance(b,self.Address):
-            return self.op.cmpl(a,b)
+            return (self.op.cmpq if self.ptr_size == 8 else self.op.cmpl)(a,b)
         return self.op.cmp(a,b)
 
     def get_threadstate(self,reg):
@@ -1713,13 +1724,13 @@ def _op_RETURN_VALUE(f):
     else:
         r.end_func()
 
-    r.set_stack(None)
-
     for b in f.blockends:
         if isinstance(b,ExceptBlockEnd):
             b.has_return = True
 
-    return r.end_branch()
+    r.end_branch()
+    r.use_tos()
+    return r.set_stack(None)
 
 @handler
 @hasoffset
@@ -1796,7 +1807,6 @@ def _op_pop_jump_if_(f,to,jop1,jop2):
         .test(f.r_ret,f.r_ret)
         (jop1(dont_jump))
         (f.jump_to(jop2,f.JCC_MAX_LEN,to))
-        .mov(0,f.r_ret)
         .goto_end(True)
         (dont_jump)
     )
@@ -1855,7 +1865,7 @@ def _op_build_(f,items,new,ctype,deref):
                 .mov(items,f.r_scratch[0])
                 (lbody)
                 .loop(f.Displacement(-len(lbody) - f.LOOP_LEN))
-                .add_to_offset(-items))
+                .add_to_stack(-items))
         else:
             if deref:
                 r.mov(f.Address(item_offset,f.r_ret),f.r_pres[0])
@@ -2048,9 +2058,9 @@ def _op_UNPACK_SEQUENCE(f,arg):
         (else_)
             .lea(f.stack[-arg],p3)
             .invoke('_unpack_iterable',f.r_pres[0],arg,-1,p3)
-            .add_to_offset(arg)
+            .add_to_stack(arg)
             .if_eax_is_zero(f()
-                .decref(f.r_pres[0],preserve_reg=0)
+                .decref(f.r_pres[0])
                 .goto_end(True)
             )
         (done)
@@ -2071,7 +2081,7 @@ def _op_UNPACK_EX(f,arg):
     return (r
         .lea(f.stack[-totalargs],argreg)
         .invoke('_unpack_iterable',f.r_pres[0],arg & 0xff,arg >> 8,argreg)
-        .add_to_offset(totalargs)
+        .add_to_stack(totalargs)
         .decref(f.r_pres[0],preserve_reg=f.r_ret)
         .check_err()
     )
@@ -2097,7 +2107,7 @@ def _op_COMPARE_OP(f,arg):
         outcome_a,outcome_b = false_true_addr(op == 'is not')
 
         r = f()
-        if not r.use_tos(True):
+        if not r.use_tos():
             r.pop_stack(f.r_ret)
 
         return (r
@@ -2109,6 +2119,7 @@ def _op_COMPARE_OP(f,arg):
             .pop_stack(f.r_ret)
             .decref(f.r_ret)
             .mov(f.r_pres[0],f.r_ret)
+            .set_tos()
             .incref(f.r_pres[0])
         )
 
@@ -2120,7 +2131,6 @@ def _op_COMPARE_OP(f,arg):
             .push_tos()
             .invoke('PySequence_Contains',tos,f.stack[1])
             .if_(signed(f.r_ret) < 0) [f()
-                .mov(0,f.r_ret)
                 .goto_end(True)
             ]
             .mov(outcome_a,f.r_ret)
@@ -2170,36 +2180,30 @@ def _op_RAISE_VARARGS(f,arg):
             p1 = f.stack.arg_reg(tempreg=f.r_ret,n=1)
             r.pop_stack(p1)
 
-        (r
-            .pop_stack(p0)
-            .push_arg(p1,n=1)
-            .push_arg(p0,n=0)
-        )
+        r.pop_stack(p0)
+        r.push_arg(p1,n=1)
+        r.push_arg(p0,n=0)
     elif arg == 1:
         p0 = f.r_ret
         if not r.use_tos():
             p0 = f.stack.arg_reg(n=0)
             r.pop_stack(p0)
 
-        (r
-            .push_arg(0,n=1)
-            .push_arg(p0,n=0)
-        )
+        r.push_arg(0,n=1)
+        r.push_arg(p0,n=0)
     elif arg == 0:
-        (r
-            .push_tos()
-            .push_arg(0)
-            .push_arg(0)
-        )
+        r.push_tos()
+        r.push_arg(0)
+        r.push_arg(0)
     else:
         raise SystemError("bad RAISE_VARARGS oparg")
 
     # We don't have to worry about decrementing the reference counts. _do_raise
-    # does that for us.
+    # does that for us. It also returns 0 unconditionally.
     return (r
         .call('_do_raise')
         .goto_end(True)
-    )
+        .set_stack(None))
 
 @handler
 def _op_BUILD_MAP(f,arg):
@@ -2234,7 +2238,6 @@ def _op_LOAD_BUILD_CLASS(f):
         .invoke('PyDict_GetItemString',f.BUILTINS,'__build_class__')
         .if_eax_is_zero(f()
             .invoke('PyErr_SetString','PyExc_ImportError','BUILD_CLASS_ERROR_MSG')
-            .mov(0,f.r_ret)
             .goto_end(True)
         )
         .set_tos()
@@ -2265,7 +2268,6 @@ def _op_STORE_ATTR(f,name):
         .mov(f.r_ret,f.r_pres[0])
         .del_stack_items(2)
         .if_(f.r_pres[0]) [f()
-            .mov(0,f.r_ret)
             .goto_end(True)
         ]
     )
@@ -2281,7 +2283,6 @@ def _op_IMPORT_FROM(f,name):
             .invoke('PyErr_ExceptionMatches','PyExc_AttributeError')
             .if_eax_is_not_zero(join(f()
                .invoke('PyErr_Format','CANNOT_IMPORT_MSG',address_of(name))
-               .mov(0,f.r_ret)
             .code))
             .goto_end(True)
         )
@@ -2326,7 +2327,6 @@ def _op_IMPORT_NAME(f,name):
         .invoke('PyDict_GetItemString',f.BUILTINS,'__import__')
         .if_eax_is_zero(f()
             .invoke('PyErr_SetString','PyExc_ImportError','IMPORT_NOT_FOUND_MSG')
-            .mov(0,f.r_ret)
             .goto_end(True)
         )
         .mov(f.r_ret,r_imp)
@@ -2353,12 +2353,10 @@ def _op_IMPORT_NAME(f,name):
         .del_stack_items(2)
         .if_(signed(r_args) == 0) [f()
             .decref(r_imp)
-            .mov(0,f.r_ret)
             .goto_end(True)
         ]
 
-        # TODO: have this be able to call compiled code
-        .invoke('PyObject_Call',r_imp,f.r_ret,0)
+        .invoke('PyObject_Call',r_imp,r_args,0)
 
         .push_stack(f.r_ret)
         .decref(r_imp)
@@ -2434,7 +2432,7 @@ def _op_SETUP_WITH(f,to):
     return (r
         .invoke('special_lookup',f.r_pres[0],'__exit__','exit_cache')
         .if_eax_is_zero(f()
-            .decref(f.r_pres[0],preserve_reg=0)
+            .decref(f.r_pres[0])
             .goto_end(True)
         )
         .push_stack(f.r_ret)
@@ -2573,7 +2571,6 @@ def _op_END_FINALLY(f):
 
             (err)
             .invoke('PyErr_SetString','PyExc_SystemError','BAD_EXCEPTION_MSG')
-            .mov(0,f.r_ret)
             .goto_end(True)
             .set_stack(None)
         )
@@ -2663,7 +2660,7 @@ def _op_END_FINALLY(f):
 
         # PyErr_Restore steals references
         .invoke('PyErr_Restore',arg1,r_tmp2,r_tmp3)
-        .lea(b.stack[0],f.r_pres[0])
+        .lea(r.stack[0],f.r_pres[0])
         .mov(0,f.r_scratch[0])
         (InnerCall(f.op,f.abi,f.util_funcs.unwind_exc))
         .add_to_stack(-3)
@@ -2757,29 +2754,23 @@ def _op_END_FINALLY(f):
                     # pop off __exit__ function
                     loop_jump_inner.pop_stack(f.r_ret).decref()
 
-                loop_jump_inner = join(loop_jump_inner.code)
-
                 if has_break:
-                    (r
-                        (check_break)
-                        .cmp(WHY_BREAK,f.r_ret)
-                        .jne(check_cont if has_continue else err)
-                        (loop_jump_inner)
-                        .goto(nextl.target)
-                    )
+                    r(check_break)
+                    r.cmp(WHY_BREAK,f.r_ret)
+                    r.jne(check_cont if has_continue else err)
+                    r += loop_jump_inner
+                    r.goto(nextl.target)
 
                 if has_continue:
-                    (r
-                        (check_cont)
-                        .cmp(WHY_CONTINUE,f.r_ret)
-                        .jne(err)
-                        (loop_jump_inner)
-                        (JumpRSource(
+                    r(check_cont)
+                    r.cmp(WHY_CONTINUE,f.r_ret)
+                    r.jne(err)
+                    r += loop_jump_inner
+                    r(JumpRSource(
                             f.op.jmp,
                             f.abi,
                             f.JMP_DISP_MAX_LEN,
                             f.reverse_target(nextl.continue_offset)))
-                    )
 
     (r
         (not_long)
@@ -2788,7 +2779,6 @@ def _op_END_FINALLY(f):
         .if_cond(f.test_NE) [f()
             (err)
             .invoke('PyErr_SetString','PyExc_SystemError','BAD_EXCEPTION_MSG')
-            .mov(0,f.r_ret)
             .goto_end(True)
         ]
         .decref(r_tmp1,amount=EXCEPT_VALUES) # all values are None
@@ -2885,7 +2875,6 @@ def _op_UNARY_NOT(f):
             .mov('Py_False',f.r_ret)
             .goto(endif)
         (else_)
-            .mov(0,f.r_ret)
             .goto_end(True)
         (endif)
         .set_tos()
@@ -3141,7 +3130,6 @@ def _op_BUILD_SLICE(f,arg):
 @handler
 def _op_BUILD_SET(f,arg):
     err = JumpTarget()
-    err2 = JumpTarget()
     r = (f()
         .push_tos()
         .invoke('PySet_New',0)
@@ -3153,7 +3141,7 @@ def _op_BUILD_SET(f,arg):
     r.test(f.r_ret,f.r_ret)
 
     if arg < f.tuning.build_set_loop_threshhold:
-        r.jz(err2)
+        r.jz(err)
         r.mov(f.r_ret,f.r_pres[0])
         for i in range(arg-1):
             r.invoke('PySet_Add',f.r_pres[0],f.stack[i])
@@ -3163,8 +3151,6 @@ def _op_BUILD_SET(f,arg):
         r.invoke('PySet_Add',f.stack[arg-1])
         r.if_eax_is_not_zero(f()
             (err)
-            .mov(0,f.r_ret)
-            (err2)
             .goto_end(True)
         )
         r.del_stack_items(arg)
@@ -3317,7 +3303,6 @@ def _op_jump_or_pop_if(f,to,jop1,jop2):
         (jop1(dont_jump))
         (f.jump_to(jop2,f.JCC_MAX_LEN,to))
 
-        .mov(0,f.r_ret)
         .goto_end(True)
 
         (dont_jump)
@@ -3391,7 +3376,9 @@ def _op_YIELD_VALUE(f):
     valstack = f.stack.offset - f.stack_prolog
     if valstack:
         r += switch_stack(f,False)
-        r.mov(f.r_scratch[0],f_obj.f_stacktop)
+    else:
+        r.mov(f_obj.f_valuestack,f.r_scratch[0])
+    r.mov(f.r_scratch[0],f_obj.f_stacktop)
 
     yield_point = JumpTarget()
     r(YieldMov(f.op,f.yield_start,yield_point,f_obj.f_lasti))
@@ -3405,15 +3392,24 @@ def _op_YIELD_VALUE(f):
     r(yield_point)
 
 
-    # the generator will resume here:
+    #*** the generator will resume here: ***
+    
+    # Note: don't use f.TEMP here because if the throw flag was passed to us
+    # using a register, it was moved to f.TEMP (ie: f.throw_flag_store will
+    # equal to f.TEMP).
 
     # an item gets pushed onto the stack when a generator is resumed
     r.add_to_stack(1)
 
     r.mov(f.FRAME,f.r_pres[0])
     r += switch_stack(f,True)
-    r.mov(-1,f_obj.f_lasti)
-    return r.mov(0,f_obj.f_stacktop)
+    r.movl(-1,f_obj.f_lasti)
+    r.mov(0,f_obj.f_stacktop)
+    r.cmpl(0,f.throw_flag_store)
+    r.if_cond(f.test_NE) [f()
+        .goto_end(True)
+    ]
+    return r
 
 
 def join(x):
@@ -3667,13 +3663,14 @@ def prepare_exc_handler_func_tail(op,abi,tuning):
         .mov(tb,f.r_scratch[1])
         .incref(f.r_ret)
         .incref(f.r_scratch[0])
-        .if_(signed(f.r_scratch[1]) == 0) [
-            f().mov('Py_None',f.r_scratch[1])
+        .if_(signed(f.r_scratch[1]) == 0) [f()
+            .mov('Py_None',f.r_scratch[1])
         ]
         .mov(f.r_ret,tstate.exc_type)
         .mov(f.r_scratch[0],tstate.exc_value)
         .incref(f.r_scratch[1])
         .mov(f.r_scratch[1],tstate.exc_traceback)
+        .mov(0,f.r_ret)
         .add(stack_ptr_shift,abi.r_sp)
         .ret()
     )
@@ -3830,6 +3827,7 @@ def swap_exc_state_func(op,abi,tuning):
         r.append(op.mov(b,abi.r_pres[1]))
         r.append(op.mov(abi.r_scratch[1],b))
         r.append(op.mov(abi.r_pres[1],a))
+    r.append(op.ret())
 
     return r
 
@@ -3879,6 +3877,21 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
 
     s_offset = pre_stack + SAVED_REGS
     stack_ptr_shift = local_stack_size - s_offset * abi.ptr_size
+    
+    f.throw_flag_store = f.stack.func_arg(1)
+    move_throw_flag = isinstance(f.throw_flag_store,f.Register)
+    
+    if move_throw_flag:
+        # we use f.TEMP to use the throw flag and temporarily use another
+        # address (the address where the first Python stack value will go) as
+        # our temporary store
+        f.throw_flag_store = f.TEMP
+        f.TEMP = f.stack[-stack_first-1]
+        
+    # at the epilogue, GLOBALS is no longer used and we use its space as a
+    # temporary store for the return value
+    ret_temp_store = f.GLOBALS
+    fast_end = JumpTarget()
 
     opcodes = (f()
         .comment('prologue')
@@ -3893,6 +3906,9 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
 
     f_obj = f.ctype('PyFrameObject',f.r_pres[0])
     tstate = f.ctype('PyThreadState',f.r_scratch[0])
+
+    if move_throw_flag:
+        opcodes.mov(f.dword(f.stack.func_arg(1)),f.throw_flag_store)
 
     argreg = f.stack.arg_reg(n=0)
     (opcodes
@@ -3966,12 +3982,21 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
                 .if_(f.r_ret) [ join(f.decref(f.r_ret)) ]
                 .if_(f.r_pres[1]) [ join(f.decref(f.r_pres[1])) ]
             (endif)
-            .mov(f_obj.f_lasti,f.r_scratch[0])
-            .if_(signed(f.r_scratch[0]) == -1) [ jdispatch ]
+            .mov(f_obj.f_lasti,f.dword(f.r_scratch[0]))
+            .if_(signed(f.dword(f.r_scratch[0])) != -1) [ jdispatch ]
+            .cmpl(0,f.throw_flag_store)
+            .if_cond(f.test_NE) [f()
+                .mov(0,ret_temp_store)
+                .goto(fast_end)
+            ]
         )
 
     del f_obj
     del tstate
+    
+    if move_throw_flag:
+        # use the original address for TEMP again
+        f.TEMP = f.throw_flag_store
 
     opcodes.set_stack(stack_first,debug.PYTHON_STACK_START)    
     f.stack_prolog = stack_first
@@ -4018,10 +4043,11 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
     (opcodes
         (f.end)
         .comment('epilogue')
-        .mov(f.r_ret,f.stack[0])
+        .mov(f.r_ret,ret_temp_store)
         .clean_stack()
+        (fast_end)
         .call('_LeaveRecursiveCall')
-        .mov(f.stack[0],f.r_ret)
+        .mov(ret_temp_store,f.r_ret)
         .get_threadstate(f.r_scratch[0])
         .mov(f.FRAME,f.r_scratch[1])
         .add(stack_ptr_shift,abi.r_sp)
