@@ -1888,6 +1888,35 @@ unicode_concatenate(PyObject *v, PyObject *w, PyFrameObject *f,
 }
 
 
+static int _print_expr(PyObject *expr) {
+    PyObject *args, *hook, *eval_ret;
+    int ret = 0;
+    
+    if(!(hook = PySys_GetObject("displayhook"))) {
+        PyErr_SetString(PyExc_RuntimeError,"lost sys.displayhook");
+        ret = -1;
+        goto err1;
+    }
+
+    if(!(args = PyTuple_Pack(1, expr))) {
+        ret = -1;
+        goto err1;
+    }
+
+    if(!(eval_ret = PyEval_CallObject(hook, args))) {
+        ret = -1;
+        goto err2;
+    }
+    
+    Py_DECREF(eval_ret);
+err2:
+    Py_DECREF(args);
+err1:
+    Py_DECREF(expr);
+    return ret;
+}
+
+
 /* The following are modified functions from Objects/genobject.c: */
 
 static PyObject *gen_send_ex(PyGenObject *gen, PyObject *arg, int exc)
@@ -2292,6 +2321,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR(call_exc_trace),
         ADD_ADDR(unicode_concatenate),
         ADD_ADDR(ext_do_call),
+        ADD_ADDR(_print_expr),
     
         ADD_ADDR(Py_True),
         ADD_ADDR(Py_False),

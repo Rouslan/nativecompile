@@ -1,12 +1,8 @@
 Experimental bytecode to machine code compiler
 
-CPython 3.2 is required. Support for CPython 3.3 will be added after all the
-instructions from 3.2 are implemented.
+CPython 3.2 is required. Support for CPython 3.3 is not yet implemented.
 
 The compiler supports the x86 and x86-64 instruction sets.
-
-The following bytecode instructions are not yet implemented:
-PRINT_EXPR
 
 
 Basic Usage:

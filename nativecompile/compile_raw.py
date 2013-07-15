@@ -3411,6 +3411,19 @@ def _op_YIELD_VALUE(f):
     ]
     return r
 
+@handler
+def _op_PRINT_EXPR(f):
+    tos = f.stack.tos()
+
+    r = f().invoke('_print_expr',tos)
+    
+    # _print_expr steals a reference
+    if not r.use_tos():
+        r.add_to_stack(-1)
+    
+    return r.check_err(True)
+
+
 
 def join(x):
     # for lists of bytes objects, b''.join is about 30 times faster
