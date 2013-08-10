@@ -146,7 +146,7 @@ class CLASS_string(FORM): pass
 
 def form(name,base,index,encode):
     return type('FORM_'+name,(base,),{'index':index,'encode':encode})
-    
+
 def make_form(*args):
     f = form(*args)
     globals()[f.__name__] = f
@@ -188,22 +188,39 @@ make_form('ref4',CLASS_reference,0x13,(lambda self,d: d.mode.enc_int(get_ref(sel
 make_form('ref8',CLASS_reference,0x14,(lambda self,d: d.mode.enc_int(get_ref(self,d),8)))
 make_form('ref_udata',CLASS_reference,0x15,(lambda self,d: enc_uleb128(get_ref(self,d))))
 
-SEC_OFFSET_CLASSES = (CLASS_lineptr,CLASS_loclistptr,CLASS_macptr,CLASS_rangelistptr)
-def FORM_sec_offset_variant(i):
-    class FORM_sec_offset(SEC_OFFSET_CLASSES[i]):
-        index = 0x17
-        sec_offset_index = i
-        def __init__(self,val):
-            self.val = val
-            
-        def encode(self,d):
-            return d.mode.enc_int(d.sec_offset_maps[i][self],d.mode.ref_size)
-        
-    return FORM_sec_offset
 
-SEC_OFFSET_FORMS = tuple(map(FORM_sec_offset_variant,range(len(SEC_OFFSET_CLASSES))))    
-FORM_line_offset,FORM_loclist_offset,FORM_mac_offset,FORM_rangelist_offset = SEC_OFFSET_FORMS
-    
+SEC_OFFSET_CLASSES = CLASS_lineptr,CLASS_loclistptr,CLASS_macptr,CLASS_rangelistptr
+
+class FORM_sec_offset():
+    index = 0x17
+
+    def __init__(self,val):
+        self.val = val
+
+    def encode(self,d):
+        return d.mode.enc_int(d.sec_offset_maps[self.sec_offset_index][self],d.mode.ref_size)
+
+class FORM_line_offset(FORM_sec_offset,CLASS_lineptr):
+    def __init__(self,val):
+        assert False,'Not implemented'
+
+class FORM_loclist_offset(FORM_sec_offset,CLASS_loclistptr):
+    def values(self,op):
+        return self.val(op)
+
+class FORM_mac_offset(FORM_sec_offset,CLASS_macptr):
+    def __init__(self,val):
+        assert False,'Not implemented'
+
+class FORM_rangelist_offset(FORM_sec_offset,CLASS_rangelistptr):
+    def values(self):
+        return self.val()
+
+SEC_OFFSET_FORMS = FORM_line_offset,FORM_loclist_offset,FORM_mac_offset,FORM_rangelist_offset
+for i,sof in enumerate(SEC_OFFSET_FORMS):
+    sof.sec_offset_index = i
+
+
 make_form('exprloc',CLASS_exprloc,0x18,enc_block)
 
 # special case: no value
@@ -222,7 +239,7 @@ def smallest_block_form(val):
     if len(val) == 4: return FORM_block4(val)
     if len(val) == 8: return FORM_block8(val)
     return FORM_block(val)
-        
+
 
 class ATE(Enum,FORM_data1):
     __init__ = Enum.__init__
@@ -358,7 +375,7 @@ def op_method(code,enc1=None,enc2=None):
 
 def enc_reg(reg):
     return enc_uleb128(int(reg) if isinstance(reg,Register) else reg)
-    
+
 def op_constant(code,size,signed):
     code = bytes((code,))
     return lambda self,val: code + self.mode.enc_int(val,size,signed)
@@ -407,7 +424,7 @@ class OP:
     not_ = op_method(0x20)
     or_ = op_method(0x21)
     plus = op_method(0x22)
-    plus_uconst = op_method(0x23,enc_uleb128) 
+    plus_uconst = op_method(0x23,enc_uleb128)
     shl = op_method(0x24)
     shr = op_method(0x25)
     shra = op_method(0x26)
@@ -437,7 +454,7 @@ class OP:
         if isinstance(index,Register): index = int(index)
         assert 0 <= index <= 31
         return bytes((0x70 + index,)) + enc_sleb128(offset)
-        
+
     regx = op_method(0x90,enc_reg)
     fbreg = op_method(0x91,enc_sleb128)
     bregx = op_method(0x92,enc_reg,enc_sleb128)
@@ -455,15 +472,15 @@ class OP:
     implicit_value = op_method(0x9e,enc_block)
     stack_value = op_method(0x9f)
 
-    
+
     # helper methods:
-        
+
     def const_int(self,val):
         """Return the most compact representation of the constant 'val'."""
         # actually, some values can probably be represented more compactly
         # using leb128 instead of the smallest fitting const- method, but that
         # would add encoding and decoding overhead anyway
-        
+
         if 0 <= val <= 31:
             return self.lit(val)
 
@@ -487,24 +504,24 @@ class OP:
 class CFA:
     def __init__(self,mode):
         self.mode = mode
-        
+
     @staticmethod
     def advance_loc(val):
         assert 0 <= val < (1<<6)
         return bytes(((1<<6) | val,))
-        
+
     @staticmethod
     def offset(reg,offset):
         reg = int(reg)
         assert 0 <= reg < (1<<6)
         return bytes(((2<<6) | reg,)) + enc_uleb128(offset)
-    
+
     @staticmethod
     def restore(reg):
         reg = int(reg)
         assert 0 <= reg < (1<<6)
         return bytes(((3<<6) | reg,))
-    
+
     nop = op_method(0x00)
     set_loc = op_native_val(0x01)
     advance_loc1 = op_constant(0x02,1,False)
@@ -515,8 +532,8 @@ class CFA:
     undefined = op_method(0x07,enc_reg)
     same_value = op_method(0x08,enc_reg)
     register = op_method(0x09,enc_reg,enc_reg)
-    remember_state = op_method(0x0a) 
-    restore_state = op_method(0x0b) 
+    remember_state = op_method(0x0a)
+    restore_state = op_method(0x0b)
     def_cfa = op_method(0x0c,enc_reg,enc_uleb128)
     def_cfa_register = op_method(0x0d,enc_reg)
     def_cfa_offset = op_method(0x0e,enc_uleb128)
@@ -528,9 +545,9 @@ class CFA:
     val_offset = op_method(0x14,enc_uleb128,enc_uleb128)
     val_offset_sf = op_method(0x15,enc_uleb128,enc_sleb128)
     val_expression = op_method(0x16,enc_uleb128,enc_block)
-    
+
     # helper methods:
-    
+
     def advance_loc_smallest(self,amount):
         if amount < (1 << 6):
             return self.advance_loc(amount)
@@ -540,7 +557,7 @@ class CFA:
             return self.advance_loc2(amount)
         if amount <= 0xffffffff:
             return self.advance_loc4(amount)
-        
+
         r = b''
         while amount > 0xffffffff:
             r += b'\x04\xff\xff\xff\xff'
@@ -628,14 +645,14 @@ class StringTable:
 
 class DIE:
     """A DWARF debugging information entry."""
-    
+
     def __init__(self,tag,**attrvals):
         if isinstance(tag,str):
             try:
                 tag = getattr(TAG,tag)
             except AttributeError:
                 raise ValueError('"{}" is not a DWARF tag'.format(tag))
-                
+
         self.__dict__['tag'] = tag
         self.__dict__['children'] = []
         self.__dict__['attr'] = {}
@@ -684,7 +701,7 @@ class Mode:
         if size is None: size = self.ptr_size
         return x.to_bytes(size,byteorder=self.byteorder,signed=signed)
 
-  
+
 def sized_section(f):
     def inner(self,out,*args,**kwds):
         unit_size = COMP_UNIT_SIZE_64_FMT if self.mode.mode == MODE_64 else COMP_UNIT_SIZE_32_FMT
@@ -707,7 +724,7 @@ def sized_section(f):
             out.write(COMP_UNIT_SIZE_32_FMT.pack(size))
 
         out.seek(end)
-        
+
     return inner
 
 class TypeData:
@@ -736,17 +753,17 @@ class DebugInfo:
                 self.types[s] = ti
             elif die.children:
                 ti.has_child = True
-                
+
             for a in die.attr.values():
                 if isinstance(a,SEC_OFFSET_FORMS):
                     # the offset is set to None for now and is given a value
                     # in one of the write_debug_- methods
                     self.sec_offset_maps[a.sec_offset_index][a] = None
-            
+
             for c in die.children: get_types(c)
 
         get_types(data)
-        
+
     loclist = property(lambda self: self.sec_offset_maps[FORM_loclist_offset.sec_offset_index])
     rangelist = property(lambda self: self.sec_offset_maps[FORM_rangelist_offset.sec_offset_index])
 
@@ -756,12 +773,12 @@ class DebugInfo:
             COMP_UNIT_HEADER_64_FMT
                 if self.mode.mode == MODE_64 else
             COMP_UNIT_HEADER_32_FMT)
-            
+
         out.write(unit_header.pack(DWARF_VERSION,0,self.mode.ptr_size))
 
         def write_die(die):
             self.refmap[id(die)] = out.tell() - start
-            
+
             ti = self.types.get(die.signature())
             assert ti is not None
             out.write(enc_uleb128(ti.index))
@@ -773,7 +790,7 @@ class DebugInfo:
                 out.write(b'\0')
 
         write_die(self.data)
-        
+
     def write_debug_info(self,out):
         self._write_debug_info(out,out.tell())
 
@@ -782,13 +799,13 @@ class DebugInfo:
             out.write(enc_uleb128(ti.index))
             out.write(enc_uleb128(int(ti.tag)))
             out.write(CHILDREN_yes if ti.has_child else CHILDREN_no)
-            
+
             for name,form in ti.attr:
                 out.write(enc_uleb128(int(name)))
                 out.write(enc_uleb128(form))
             out.write(b'\0\0')
         out.write(b'\0')
-            
+
     #@sized_section
     #def write_debug_aranges(self,out):
     #    head = (
@@ -802,29 +819,29 @@ class DebugInfo:
     def write_debug_ranges(self,out):
         baseloc = out.tell()
         mapping = self.rangelist
-        
+
         for ar in mapping:
             mapping[ar] = out.tell() - baseloc
-            
-            for addr,size in ar.val():
+
+            for addr,size in ar.values():
                 out.write(elf.RelocAddress(addr))
                 out.write(elf.RelocAddress(size))
             out.write(b'\0' * (self.mode.ptr_size * 2))
-            
+
     def write_debug_loclist(self,out):
         baseloc = out.tell()
         mapping = self.loclist
         op = OP(self.mode)
-        
+
         for ll in mapping:
             mapping[ll] = out.tell() - baseloc
-            
-            for start,end,expr in ll.val(op):
+
+            for start,end,expr in ll.values(op):
                 # these addresses are not supposed to be absolute addresses
                 # even in an in-memory object file
                 out.write(self.mode.enc_int(start))
                 out.write(self.mode.enc_int(end))
-                
+
                 if len(expr) > 0xffff:
                     raise ValueError(
                         'The location description at {:x}-{:x} is too long (65535 bytes is the maximum).'
@@ -832,12 +849,12 @@ class DebugInfo:
                 out.write(self.mode.enc_int(len(expr),2))
                 out.write(expr)
             out.write(b'\0' * (self.mode.ptr_size * 2))
-            
+
     def _cf_pad(self,out,body_size):
         pad = (body_size + (12 if self.mode.mode == MODE_64 else 4)) % self.mode.ptr_size
         if pad != self.mode.ptr_size:
             out.write(b'\0' * pad)
-            
+
     @sized_section
     def cie(self,out):
         cfa = CFA(self.mode)
@@ -851,7 +868,7 @@ class DebugInfo:
             + cfa.offset(r.RA,1))
         for pr in self.pres_regs:
             body += cfa.same_value(pr)
-            
+
         out.write(body)
         self._cf_pad(out,len(body))
 
@@ -863,7 +880,7 @@ class DebugInfo:
         out.write(self.mode.enc_int(range))
         out.write(instr)
         self._cf_pad(out,out.tell() - start)
-        
+
     def write_debug_frame(self,out):
         self.cie(out)
         assert self.call_frames is not None
@@ -873,12 +890,12 @@ class DebugInfo:
 
 class DebugSection(elf.Section):
     type = elf.SHT_PROGBITS
-    
+
     def __init__(self,suffix,callback,align=0):
         self.name = b'.debug_' + suffix
         self.callback = callback
         self.align = align
-        
+
     def write(self,out):
         self.callback(out)
 
@@ -887,7 +904,7 @@ def elf_sections(mode,data,strings=None,callframes=None,pres_regs=None):
     info = DebugInfo(mode,data,callframes,pres_regs)
     r = [DebugSection(b'info',info.write_debug_info),
         DebugSection(b'abbrev',info.write_debug_abbrev)]
-    
+
     if info.loclist:
         r.insert(0,DebugSection(b'loc',info.write_debug_loclist))
     if info.rangelist:

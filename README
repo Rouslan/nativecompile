@@ -1,8 +1,10 @@
 Experimental bytecode to machine code compiler
 
-CPython 3.2 is required. Support for CPython 3.3 is not yet implemented.
+CPython 3.3 is required. Higher versions are unlikely to work.
 
 The compiler supports the x86 and x86-64 instruction sets.
+
+The YIELD_FROM instruction is not yet implemented.
 
 
 Basic Usage:

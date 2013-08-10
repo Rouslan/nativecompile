@@ -52,8 +52,6 @@ BLOCK_WITH = 4
 
 EXCEPT_VALUES = 6
 
-RERAISE = True + 1
-
 CALL_FLAG_VAR = 1
 CALL_FLAG_KW = 2
 
@@ -75,7 +73,7 @@ def aligned_size(x):
 class StackManager:
     """Keeps track of values stored on the stack.
 
-    values are laid out as follows, where s=STACK_ITEM_SIZE, 
+    values are laid out as follows, where s=STACK_ITEM_SIZE,
     m=self.local_mem_size and n=self.offset (the number of stack values):
 
         %esp + m - s        last stack item
@@ -118,12 +116,17 @@ class StackManager:
         # this is a stack so nested blocks can have finer restrictions
         self.protected_items = [0]
 
+        # indicates what the value of _offset was before reserve_stack was
+        # called
+        self._unreserved_offset = None
+
     def copy(self):
         r = StackManager(self.op,self.abi,self.local_mem_size)
         r._offset = self._offset
         r._tos_in_r_ret = self._tos_in_r_ret
         r.resets = self.resets[:]
         r.protected_items = self.protected_items[:]
+        r._unreserved_offset = self._unreserved_offset
         return r
 
     def check_stack_space(self):
@@ -153,9 +156,9 @@ class StackManager:
 
     def annotate(self,descr=None):
         return debug.annotate(self.offset,self._tos_in_r_ret,descr)
-    
-    def push_stack(self,x):
-        ann = self.set_offset(self.offset + 1)
+
+    def push_stack(self,x,descr=None):
+        ann = self.set_offset(self.offset + 1,descr)
         return [self.op.mov(x,self[0])] + ann
 
     def pop_stack(self,x):
@@ -171,6 +174,8 @@ class StackManager:
         return self.abi.r_arg[n] if n < len(self.abi.r_arg) else self._stack_arg_at(n)
 
     def push_arg(self,x,tempreg = None,n = None):
+        assert self._unreserved_offset is not None, "reserve_stack must be called first"
+
         if not tempreg: tempreg = self.abi.r_scratch[0]
 
         if n is None:
@@ -198,21 +203,21 @@ class StackManager:
         if n == self.args: self.args += 1
         self.check_stack_space()
         return r
-    
+
     def push_tos(self):
-        """r_ret is needed right now so if the TOS item hasn't been pushed onto 
+        """r_ret is needed right now so if the TOS item hasn't been pushed onto
         the stack, do it now."""
         if self._tos_in_r_ret:
             self._tos_in_r_ret = False
             return self.push_stack(self.abi.r_ret)
-            
+
         return []
-    
+
     def use_tos(self):
         if self._tos_in_r_ret:
             self._tos_in_r_ret = False
             return True,self.annotate()
-            
+
         return False,[]
 
     def set_tos(self):
@@ -225,8 +230,8 @@ class StackManager:
         return self.abi.r_ret if self._tos_in_r_ret else self[0]
 
     def conditional_jump(self,target,stack_extra=0):
-        # I'm not sure if a new reset will ever need to be added anywhere except
-        # the front
+        # I'm not sure if a new reset will ever need to be added anywhere
+        # except the front
         offset = self.offset + stack_extra
         for i,r in enumerate(self.resets):
             if target == r[0]:
@@ -282,6 +287,8 @@ class StackManager:
         return addr
 
     def call(self,func):
+        assert self._unreserved_offset is not None, "reserve_stack must be called first"
+
         self.args = 0
         if isinstance(func,str):
             return [
@@ -294,17 +301,56 @@ class StackManager:
         """If the nth argument is stored in a register, return that register.
         Otherwise, return tempreg.
 
-        Since push_arg will emit nothing when the source and destination are the
-        same, this can be used to eliminate an extra push with opcodes that
-        require a register destination. If the given function argument is stored
-        in a register, arg_reg will return that register and when passed to
-        push_arg, push_arg will emit nothing. If not, tempreg will be returned
-        and push_arg will emit the appropriate MOV instruction.
+        Since push_arg will emit nothing when the source and destination are
+        the same, this can be used to eliminate an extra push with opcodes that
+        require a register destination. If the given function argument is
+        stored in a register, arg_reg will return that register and when passed
+        to push_arg, push_arg will emit nothing. If not, tempreg will be
+        returned and push_arg will emit the appropriate MOV instruction.
 
         """
         if n is None: n = self.args
-        return (self.abi.r_arg[n] if n < len(self.abi.r_arg) 
+        return (self.abi.r_arg[n] if n < len(self.abi.r_arg)
                 else (tempreg or self.abi.r_scratch[0]))
+
+    def reserve_stack(self,move_sp=True):
+        """Advance the stack pointer so that self.local_mem_size bytes are
+        reserved and annotate it.
+
+        This function assumes the stack pointer has already been moved by
+        self.offset * self.abi.ptr_size bytes and only moves the stack by the
+        difference.
+
+        If move_sp is False, no instructions are emitted, but an annotation is
+        still created.
+
+        """
+        assert self._unreserved_offset is None and self._offset is not None
+
+        self._unreserved_offset = self._offset
+        r= []
+        if move_sp:
+            r.append(self.op.sub(
+                self.local_mem_size - self._offset * self.abi.ptr_size,
+                self.abi.r_sp))
+
+        return r + self.annotate(
+                debug.PrologEnd(self.local_mem_size // self.abi.ptr_size))
+
+    def release_stack(self):
+        """Revert the stack pointer and self.offset to what they were before
+        reserve_stack was called."""
+
+        assert self._unreserved_offset is not None
+
+        old_o = self._unreserved_offset
+        self._unreserved_offset = None
+
+        return [
+            self.op.add(
+                self.local_mem_size - old_o * self.abi.ptr_size,
+                self.abi.r_sp)
+        ] + self.set_offset(old_o,debug.EPILOG_START)
 
 
 
@@ -319,7 +365,7 @@ class JumpSource:
         self.abi = abi
         self.target = target
         target.used = True
-    
+
     def compile(self,displacement):
         dis = displacement - self.target.displacement
         return self.op(self.abi.ops.Displacement(dis)) if dis else b'' #optimize away useless jumps
@@ -333,9 +379,9 @@ class InnerCall(DelayedCompile):
     """A function call with a relative target
 
     This is just like JumpSource, except the target is a different function and
-    the exact offset depends on how much padding is needed between this source's
-    function and the target function, which cannot be determined until the
-    length of the entire source function is determined.
+    the exact offset depends on how much padding is needed between this
+    source's function and the target function, which cannot be determined until
+    the length of the entire source function is determined.
 
     """
     def __init__(self,opset,abi,target,jump_instead=False):
@@ -430,7 +476,7 @@ def interleave_ops(regs,steps):
         for p in pending:
             items.extend(p)
         return items
-        
+
 
 
 class Tuning:
@@ -449,7 +495,7 @@ def handler(func,name = None):
     def inner(f,*extra):
         r = f()
 
-        
+
         if f.forward_targets and f.forward_targets[0][0] <= f.byte_offset:
             pos,t,pop = f.forward_targets.pop(0)
             if pos != f.byte_offset:
@@ -583,7 +629,7 @@ class CType:
         offset = self.offsets.get(name)
         if offset is None: raise AttributeError(name)
         return self.abi.ops.Address(offset,*self.args)
-    
+
 
 def raw_addr_if_str(x):
     return pyinternals.raw_addresses[x] if isinstance(x,str) else x
@@ -592,6 +638,7 @@ def raw_addr_if_str(x):
 class UtilityFunctions:
     def __init__(self):
         self.local_name = JumpTarget()
+        self.global_name = JumpTarget()
         self.prepare_exc_handler = JumpTarget()
         self.reraise_exc_handler = JumpTarget()
         self.unwind_exc = JumpTarget()
@@ -618,14 +665,14 @@ class Frame:
 
         # Although JUMP_ABSOLUTE could jump to any instruction, we assume
         # compiled Python code only uses it in certain cases. Thus, we can make
-        # small optimizations between successive instructions without needing an
-        # extra pass over the byte code to determine all the jump targets.
+        # small optimizations between successive instructions without needing
+        # an extra pass over the byte code to determine all the jump targets.
         self.rtargets = {}
 
-        # Indicates how many values tracked by Frame.stack were added as part of
-        # the function prolog. This is needed by YIELD_VALUE.
+        # Indicates how many values tracked by Frame.stack were added as part
+        # of the function prolog. This is needed by YIELD_VALUE.
         self.stack_prolog = None
-        
+
         # The address where the throw flag is stored. This is used upon
         # resumption into YIELD_VALUE (or at the start if the generator just
         # started) and is invalid afterwards
@@ -691,7 +738,7 @@ class Frame:
 
     def ctype(self,*args):
         return CType(self.abi,*args)
-    
+
     def dword(self,r):
         return self.Register(self.abi.ops.SIZE_D,r.code)
 
@@ -699,8 +746,8 @@ class Frame:
         """Return True if x fits in a 32-bit immediate value without
         sign-extend.
 
-        32-bit immediate values are interpreted as signed. In 64-bit mode, these
-        values get sign-extended to 64 bits and thus have their binary
+        32-bit immediate values are interpreted as signed. In 64-bit mode,
+        these values get sign-extended to 64 bits and thus have their binary
         representation altered, which can make a difference when comparing
         addresses.
 
@@ -709,12 +756,12 @@ class Frame:
             return fits_in_sdword(x)
 
         return True
-    
+
     def check_err(self,inverted=False):
         if inverted:
-            return self.if_eax_is_not_zero(self.goto_end(True))
+            return self.if_eax_is_not_zero(self.exc_goto_end())
 
-        return self.if_eax_is_zero(self.goto_end(True))
+        return self.if_eax_is_zero(self.exc_goto_end())
 
     def invoke(self,func,*args,stack=None):
         if not stack: stack = self.stack
@@ -726,7 +773,7 @@ class Frame:
                 self.op.test(self.r_ret,self.r_ret),
                 self.jcc(~test,self.Displacement(len(opcodes))),
                 opcodes]
-                
+
         after = JumpTarget()
         return [
             self.op.test(self.r_ret,self.r_ret),
@@ -780,32 +827,35 @@ class Frame:
             stack.protected_items.pop()
 
             h_free = stack.offset - hblock.stack
-            
+
             r.append(self.op.lea(stack[h_free],self.r_pres[0]))
             r += self.mov(-h_free,self.r_scratch[0])
             r.append(InnerCall(
                 self.op,
                 self.abi,
                 self.util_funcs.unwind_exc
-                    if is_exc else 
+                    if is_exc else
                 self.util_funcs.unwind_finally))
             h_free += 3 if is_exc else 6
             r += stack.set_offset(stack.offset - h_free)
 
         return r
 
-    def end_func(self,stack=None):
+    def end_func(self,exception=False,stack=None):
         if not stack: stack = self.stack
 
         to_free = -stack.offset
         if self.stack_prolog is not None: to_free += self.stack_prolog
+
         r = self.mov(to_free,self.r_pres[0])
+        if exception: r += self.mov(0,self.r_ret)
         r.append(self.goto(self.end))
+
         return r
 
-    def goto_end(self,exception=False,stack=None):
-        """Go to the inner most finally block, or except block if exception is
-        True, or the end of the function if there isn't an appropriate block.
+    def exc_goto_end(self,reraise=False,stack=None):
+        """Go to the inner most handler block or the end of the function if
+        there isn't an appropriate block.
 
         stack defaults to self.stack and is not altered.
 
@@ -813,38 +863,38 @@ class Frame:
         stack = (stack or self.stack).copy()
 
         pre_stack = 0
-        block = self.current_except_or_finally() if exception else self.current_finally()
+        block = self.current_except_or_finally()
         if block:
-            pre_stack = block.stack
-            if exception: pre_stack -= EXCEPT_VALUES
+            pre_stack = block.stack - EXCEPT_VALUES
 
         r = self.unwind_handler(pre_stack,stack)
-        
+
         if block:
             extra = stack.offset - pre_stack
-            assert extra >= 0 if exception else extra == 0
+            assert extra >= 0
 
-            if exception:
-                r.append(self.op.lea(stack[extra],self.r_pres[0]))
-                r += self.mov(-extra,self.r_scratch[0])
-                r.append(InnerCall(
-                    self.op,
-                    self.abi,
-                    self.util_funcs.reraise_exc_handler
-                        if exception == RERAISE else
-                    self.util_funcs.prepare_exc_handler))
+            r.append(self.op.lea(stack[extra],self.r_pres[0]))
+            r += self.mov(-extra,self.r_scratch[0])
+            r.append(InnerCall(
+                self.op,
+                self.abi,
+                self.util_funcs.reraise_exc_handler
+                    if reraise else
+                self.util_funcs.prepare_exc_handler))
 
             r.append(self.goto(block.target))
         else:
-            if exception: r += self.mov(0,self.r_ret)
-            r += self.end_func(stack)
+            r += self.end_func(True,stack)
 
         return r
 
     def incref(self,reg=None,amount=1):
+        """Generate instructions equivalent to Py_INCREF"""
+
         if reg is None: reg = self.r_ret
         if pyinternals.REF_DEBUG:
-            # the registers that would otherwise be undisturbed, must be preserved
+            # the registers that would otherwise be undisturbed, must be
+            # preserved
             return ([
                 self.op.mov(self.r_ret,self.TEMP_EAX),
                 self.op.mov(self.r_scratch[0],self.TEMP_ECX),
@@ -874,7 +924,7 @@ class Frame:
             return inv
 
         mid = []
-        
+
         if preserve_reg:
             mid.append(self.op.mov(preserve_reg,self.TEMP))
 
@@ -891,19 +941,18 @@ class Frame:
 
         if pyinternals.COUNT_ALLOCS:
             mid.extend(self.invoke('inc_count',self.COUNT_ALLOCS_TEMP))
-        
+
         if preserve_reg:
             mid.append(self.op.mov(self.TEMP,preserve_reg))
         elif preserve_reg == 0:
             mid.extend(self.mov(0,self.r_ret))
-        
+
         mid = join(mid)
-        
+
         return [
             self.sub(amount,self.ctype('PyObject',reg).ob_refcnt),
             self.jnz(self.Displacement(len(mid))),
-            mid
-        ]
+            mid]
 
     def new_rtarget(self):
         t = JumpTarget()
@@ -1231,7 +1280,7 @@ class Stitch:
     def add_to_stack(self,n,descr=None):
         self._code += self.stack.set_offset(self.stack.offset + n,descr)
         return self
-    
+
     def set_stack(self,n,descr=None):
         self._code += self.stack.set_offset(n,descr)
         return self
@@ -1297,10 +1346,10 @@ class Stitch:
         if isinstance(self.f.op,self.f.abi.ops.Assembly):
             self._code.append(self.f.op.comment(c))
         return self
-    
+
     def save_reg(self,r):
         return self.push(r).add_to_stack(1,debug.SaveReg(r))
-    
+
     def restore_reg(self,r):
         return self.pop(r).add_to_stack(-1,debug.RestoreReg(r))
 
@@ -1312,15 +1361,15 @@ class Stitch:
 
     def __add__(self,b):
         assert len(self.stacks) == 1
-        
+
         if isinstance(b,Stitch):
             assert self.f is b.f
             return Stitch(self.f,self._code+b._code)
         if isinstance(b,list):
             return Stitch(self.f,self._code+b)
-            
+
         return NotImplemented
-    
+
     def __iadd__(self,b):
         if isinstance(b,Stitch):
             assert self.f is b.f
@@ -1329,7 +1378,7 @@ class Stitch:
         if isinstance(b,list):
             self._code += b
             return self
-        
+
         return NotImplemented
 
     def __getattr__(self,name):
@@ -1356,11 +1405,13 @@ for func in [
     'set_tos',
     'push_stack',
     'pop_stack',
-    'call']:
+    'call',
+    'reserve_stack',
+    'release_stack']:
     setattr(Stitch,func,_forward_stack_func(getattr(StackManager,func)))
 
 Stitch.set_stack = _forward_stack_func(StackManager.set_offset)
-    
+
 def _forward_list_func(func):
     def inner(self,*args,**kwds):
         self._code += func(self.f,*args,**kwds)
@@ -1382,7 +1433,7 @@ def _forward_list_func(func):
 
 for func in [
     'invoke',
-    'goto_end',
+    'exc_goto_end',
     'unwind_handler',
     'end_func']:
     setattr(Stitch,func,_forward_list_func(getattr(Frame,func)))
@@ -1463,7 +1514,7 @@ def _op_add(f,func):
             .invoke(func,r_arg1,r_arg2)
             .if_eax_is_zero(f()
                 (err)
-                .goto_end(True)
+                .exc_goto_end()
             )
             .mov(f.stack[1],f.r_scratch[0])
             .mov(f.r_ret,f.stack[1])
@@ -1556,16 +1607,19 @@ def _op_POP_TOP(f):
         r.pop_stack(f.r_ret)
     return r.decref()
 
-@handler
-@hasname
-def _op_LOAD_NAME(f,name):
+def _op_load_name(func,f,name):
     return (f()
         .push_tos()
         .mov(address_of(name),f.r_pres[0])
-        (InnerCall(f.op,f.abi,f.util_funcs.local_name))
+        (InnerCall(f.op,f.abi,func))
         .check_err()
         .set_tos()
     )
+
+@handler
+@hasname
+def _op_LOAD_NAME(f,name):
+    return _op_load_name(f.util_funcs.local_name,f,name)
 
 @handler
 @hasname
@@ -1588,7 +1642,7 @@ def _op_STORE_NAME(f,name):
         .if_eax_is_zero(f()
             .clear_args()
             .invoke('PyErr_Format','PyExc_SystemError','NO_LOCALS_STORE_MSG')
-            .goto_end(True)
+            .exc_goto_end()
         )
         .mov('PyObject_SetItem',f.r_scratch[0])
         .push_arg(f.r_ret,n=0)
@@ -1611,7 +1665,7 @@ def _op_DELETE_NAME(f,name):
                 'PyExc_SystemError',
                 'NO_LOCALS_DELETE_MSG',
                 address_of(name))
-            .goto_end(True)
+            .exc_goto_end()
         )
         .invoke('PyObject_DelItem',f.r_ret,address_of(name))
         .if_eax_is_not_zero(f()
@@ -1619,29 +1673,14 @@ def _op_DELETE_NAME(f,name):
                 'PyExc_NameError',
                 'NAME_ERROR_MSG',
                 address_of(name))
-            .goto_end(True)
+            .exc_goto_end()
         )
     )
 
 @handler
 @hasname
 def _op_LOAD_GLOBAL(f,name):
-    return (f()
-        .push_tos()
-        .invoke('PyDict_GetItem',f.GLOBALS,address_of(name))
-        .if_eax_is_zero(f()
-            .invoke('PyDict_GetItem',f.BUILTINS,address_of(name))
-            .if_eax_is_zero(f()
-                .invoke('format_exc_check_arg',
-                    'PyExc_NameError',
-                    'GLOBAL_NAME_ERROR_MSG',
-                    address_of(name))
-                .goto_end(True)
-            )
-        )
-        .set_tos()
-        .incref()
-    )
+    return _op_load_name(f.util_funcs.global_name,f,name)
 
 @handler
 @hasname
@@ -1702,7 +1741,7 @@ def _op_RETURN_VALUE(f):
         r.mov(valaddr,f.r_ret)
     elif not r.use_tos():
         r.pop_stack(f.r_ret)
-    
+
     if block:
         r.mov('Py_None',f.r_scratch[0])
         r.add_to_stack(EXCEPT_VALUES-2)
@@ -1713,8 +1752,8 @@ def _op_RETURN_VALUE(f):
 
         r.incref(f.r_scratch[0],EXCEPT_VALUES-2)
 
-        # CPython keeps an array of pre-allocated integer objects between -5 and
-        # 256. For values in that range, this function never raises an
+        # CPython keeps an array of pre-allocated integer objects between -5
+        # and 256. For values in that range, this function never raises an
         # exception, thus no error checking is done here.
         r.invoke('PyLong_FromLong',WHY_RETURN)
         r.push_stack(f.r_ret)
@@ -1807,7 +1846,7 @@ def _op_pop_jump_if_(f,to,jop1,jop2):
         .test(f.r_ret,f.r_ret)
         (jop1(dont_jump))
         (f.jump_to(jop2,f.JCC_MAX_LEN,to))
-        .goto_end(True)
+        .exc_goto_end()
         (dont_jump)
     )
 
@@ -1898,17 +1937,18 @@ def _op_STORE_SUBSCR(f):
 def _op_make_callable(f,arg,closure):
     annotations = (arg >> 16) & 0x7fff
 
-    # +1 for the code object
-    sitems = (arg & 0xff) + ((arg >> 8) & 0xff) * 2 + annotations + 1
+    # +2 for the name and code object
+    sitems = (arg & 0xff) + ((arg >> 8) & 0xff) * 2 + annotations + 2
 
     if closure: sitems += 1
     if annotations: sitems += 1
 
-    argreg = f.stack.arg_reg(n=2)
+    arg3reg = f.stack.arg_reg(n=2)
+
     return (f()
         .push_tos()
-        .lea(f.stack[0],argreg)
-        .invoke('_make_function',int(bool(closure)),arg,argreg)
+        .lea(f.stack[0],arg3reg)
+        .invoke('_make_function',int(bool(closure)),arg,arg3reg)
         .add_to_stack(-sitems)
         .check_err()
         .set_tos()
@@ -1933,7 +1973,7 @@ def _op_LOAD_FAST(f,arg):
                 'PyExc_UnboundLocalError',
                 'UNBOUNDLOCAL_ERROR_MSG',
                 address_of(f.code.co_varnames[arg]))
-            .goto_end(True)
+            .exc_goto_end()
         )
         .set_tos()
         .incref()
@@ -2024,7 +2064,7 @@ def _op_UNPACK_SEQUENCE(f,arg):
             .cmp(arg,f.ctype('PyVarObject',f.r_pres[0]).ob_size)
             .jne(else_)
                 .mov(f.ctype('PyListObject',f.r_pres[0]).ob_item,f.r_scratch[1]))
-    
+
     if arg >= f.tuning.unpack_seq_loop_threshhold:
         s_top.index = f.r_pres[0]
         body = join(f()
@@ -2061,7 +2101,7 @@ def _op_UNPACK_SEQUENCE(f,arg):
             .add_to_stack(arg)
             .if_eax_is_zero(f()
                 .decref(f.r_pres[0])
-                .goto_end(True)
+                .exc_goto_end()
             )
         (done)
         .decref(f.r_pres[0]))
@@ -2131,7 +2171,7 @@ def _op_COMPARE_OP(f,arg):
             .push_tos()
             .invoke('PySequence_Contains',tos,f.stack[1])
             .if_(signed(f.r_ret) < 0) [f()
-                .goto_end(True)
+                .exc_goto_end()
             ]
             .mov(outcome_a,f.r_ret)
             .if_cond(f.test_NZ) [
@@ -2172,7 +2212,7 @@ def _op_RAISE_VARARGS(f,arg):
     # calling _do_raise and prepare_exc_handler_func
 
     r = f()
-    
+
     if arg == 2:
         p0 = f.stack.arg_reg(tempreg=f.r_scratch[1],n=0)
         p1 = f.r_ret
@@ -2202,7 +2242,7 @@ def _op_RAISE_VARARGS(f,arg):
     # does that for us. It also returns 0 unconditionally.
     return (r
         .call('_do_raise')
-        .goto_end(True)
+        .exc_goto_end()
         .set_stack(None))
 
 @handler
@@ -2235,13 +2275,9 @@ def _op_MAP_ADD(f,arg):
 def _op_LOAD_BUILD_CLASS(f):
     return (f()
         .push_tos()
-        .invoke('PyDict_GetItemString',f.BUILTINS,'__build_class__')
-        .if_eax_is_zero(f()
-            .invoke('PyErr_SetString','PyExc_ImportError','BUILD_CLASS_ERROR_MSG')
-            .goto_end(True)
-        )
+        .invoke('_load_build_class',f.BUILTINS)
+        .check_err()
         .set_tos()
-        .incref()
    )
 
 @handler
@@ -2268,7 +2304,7 @@ def _op_STORE_ATTR(f,name):
         .mov(f.r_ret,f.r_pres[0])
         .del_stack_items(2)
         .if_(f.r_pres[0]) [f()
-            .goto_end(True)
+            .exc_goto_end()
         ]
     )
 
@@ -2284,7 +2320,7 @@ def _op_IMPORT_FROM(f,name):
             .if_eax_is_not_zero(join(f()
                .invoke('PyErr_Format','CANNOT_IMPORT_MSG',address_of(name))
             .code))
-            .goto_end(True)
+            .exc_goto_end()
         )
         .set_tos()
     )
@@ -2324,10 +2360,10 @@ def _op_IMPORT_NAME(f,name):
 
     r = (f()
         .push_tos()
-        .invoke('PyDict_GetItemString',f.BUILTINS,'__import__')
+        .invoke('_PyDict_GetItemId',f.BUILTINS,'PyId___import__')
         .if_eax_is_zero(f()
             .invoke('PyErr_SetString','PyExc_ImportError','IMPORT_NOT_FOUND_MSG')
-            .goto_end(True)
+            .exc_goto_end()
         )
         .mov(f.r_ret,r_imp)
         .incref()
@@ -2353,7 +2389,7 @@ def _op_IMPORT_NAME(f,name):
         .del_stack_items(2)
         .if_(signed(r_args) == 0) [f()
             .decref(r_imp)
-            .goto_end(True)
+            .exc_goto_end()
         ]
 
         .invoke('PyObject_Call',r_imp,r_args,0)
@@ -2364,7 +2400,7 @@ def _op_IMPORT_NAME(f,name):
         .mov(f.stack[0],f.r_ret)
         .if_eax_is_zero(f()
             .add_to_stack(-1)
-            .goto_end(True)
+            .exc_goto_end()
             .add_to_stack(1)
         )
     )
@@ -2430,13 +2466,13 @@ def _op_SETUP_WITH(f,to):
         r.pop_stack(f.r_pres[0])
 
     return (r
-        .invoke('special_lookup',f.r_pres[0],'__exit__','exit_cache')
+        .invoke('special_lookup',f.r_pres[0],'PyId___exit__')
         .if_eax_is_zero(f()
             .decref(f.r_pres[0])
-            .goto_end(True)
+            .exc_goto_end()
         )
         .push_stack(f.r_ret)
-        .invoke('special_lookup',f.r_pres[0],'__enter__','enter_cache')
+        .invoke('special_lookup',f.r_pres[0],'PyId___enter__')
         .decref(f.r_pres[0],preserve_reg=f.r_ret)
         .mov(f.r_ret,f.r_pres[0])
         .check_err()
@@ -2501,32 +2537,16 @@ def _op_WITH_CLEANUP(f):
 def _op_POP_EXCEPT(f):
     pop_handler_block(f,BLOCK_EXCEPT)
 
-    # if this value changes, the code here will need updating
-    assert EXCEPT_VALUES == 6
-
-    tstate = f.ctype('PyThreadState',f.r_pres[1])
-
     return (f()
-        .get_threadstate(f.r_pres[1])
-
-        .mov(f.stack[0],f.r_pres[0])
-        .mov(f.stack[1],f.r_ret)
-        .mov(f.stack[2],f.r_scratch[0])
-        .mov(f.r_pres[0],tstate.exc_type)
-        .mov(f.r_ret,tstate.exc_value)
-        .mov(f.r_scratch[0],tstate.exc_traceback)
-        .if_(f.r_scratch[0])[f.decref(f.r_scratch[0],preserve_reg=f.r_ret)]
-        .if_(f.r_ret)[f.decref(f.r_ret)]
-        .decref(f.r_pres[0]) # set to Py_None if NULL by prepare_exc_handler_func
-        .add_to_stack(-3)
-    )
+        .mov(0,f.r_scratch[0])
+        .lea(f.stack[0],f.r_pres[0])
+        (InnerCall(f.op,f.abi,f.util_funcs.unwind_exc))
+        .add_to_stack(-3))
 
 _op_POP_EXCEPT.omitted = lambda f: pop_handler_block(f,BLOCK_EXCEPT)
 
 @handler
 def _op_END_FINALLY(f):
-    # WHY_SILENCED not yet handled
-
     # if this value changes, the code here will need updating
     assert EXCEPT_VALUES == 6
 
@@ -2534,12 +2554,12 @@ def _op_END_FINALLY(f):
     r_tmp2 = f.stack.arg_reg(f.r_scratch[1],1)
     r_tmp3 = f.stack.arg_reg(f.r_ret,2)
 
-    # In addition to ending actual "finally" blocks, CPython uses END_FINALLY to
-    # reraise exceptions in exception handlers when the exception doesn't match
-    # any of the types that the "except" blocks handle. In such a case, there
-    # will be a JUMP_FORWARD instruction right before END_FINALLY, to skip
-    # END_FINALLY when the exception is handled. Since there is no reason to
-    # skip that instruction in a genuine "finally" block, checking if the
+    # In addition to ending actual "finally" blocks, CPython uses END_FINALLY
+    # to reraise exceptions in exception handlers when the exception doesn't
+    # match any of the types that the "except" blocks handle. In such a case
+    # there will be a JUMP_FORWARD instruction right before END_FINALLY, to
+    # skip END_FINALLY when the exception is handled. Since there is no reason
+    # to skip that instruction in a genuine "finally" block, checking if the
     # previous instruction was JUMP_FORWARD should be a reliable way to
     # determine which is the case.
     if f.last_op_is_jump:
@@ -2554,7 +2574,7 @@ def _op_END_FINALLY(f):
             .jz(err)
             .testl(TPFLAGS_BASE_EXC_SUBCLASS,f.type_flags_of(r_tmp1))
             .jz(err)
-            
+
             .branch()
                 .add_to_stack(-1)
                 .pop_stack(r_tmp2)
@@ -2566,12 +2586,12 @@ def _op_END_FINALLY(f):
                 .mov(0,f.r_scratch[0])
                 (InnerCall(f.op,f.abi,f.util_funcs.unwind_exc))
                 .add_to_stack(-3)
-                .goto_end(RERAISE)
+                .exc_goto_end(True)
             .end_branch()
 
             (err)
             .invoke('PyErr_SetString','PyExc_SystemError','BAD_EXCEPTION_MSG')
-            .goto_end(True)
+            .exc_goto_end()
             .set_stack(None)
         )
 
@@ -2611,7 +2631,7 @@ def _op_END_FINALLY(f):
 
 
     r = f().mov(f.stack[0],r_tmp1)
-    
+
     if not n_fits:
         r.mov(n_addr,f.r_pres[1])
         n_addr = f.r_pres[1]
@@ -2642,7 +2662,7 @@ def _op_END_FINALLY(f):
                 .lea(f.stack[3],f.r_pres[0])
                 .mov(-3,f.r_scratch[0])
                 (InnerCall(f.op,f.abi,f.util_funcs.unwind_exc))
-                .goto_end(True)
+                .exc_goto_end()
             ]
             .if_cond(f.test_G) [f()
                 .lea(f.stack[3],f.r_pres[0])
@@ -2664,8 +2684,8 @@ def _op_END_FINALLY(f):
         .mov(0,f.r_scratch[0])
         (InnerCall(f.op,f.abi,f.util_funcs.unwind_exc))
         .add_to_stack(-3)
-        .goto_end(RERAISE)
-        
+        .exc_goto_end(True)
+
     .end_branch())
 
     r(not_except)
@@ -2713,8 +2733,8 @@ def _op_END_FINALLY(f):
                         .mov(f.r_scratch[0],f.stack[1+f_stack_diff])
                     )
 
-                    # padding (if f_stack_diff is between 1 and 3 then that many
-                    # stack items will already be Py_None)
+                    # padding (if f_stack_diff is between 1 and 3 then that
+                    # many stack items will already be Py_None)
                     for n in range(max(4-f_stack_diff,0),4):
                         r.mov(f.r_scratch[1],f.stack[2+n])
 
@@ -2736,10 +2756,10 @@ def _op_END_FINALLY(f):
 
                     if f.handler_blocks:
                         r.unwind_handler()
-                        
+
                     r.mov(retaddr,f.r_ret)
                     r.end_func()
-                    
+
                     r.end_branch()
 
             if has_break or has_continue:
@@ -2779,7 +2799,7 @@ def _op_END_FINALLY(f):
         .if_cond(f.test_NE) [f()
             (err)
             .invoke('PyErr_SetString','PyExc_SystemError','BAD_EXCEPTION_MSG')
-            .goto_end(True)
+            .exc_goto_end()
         ]
         .decref(r_tmp1,amount=EXCEPT_VALUES) # all values are None
     )
@@ -2875,7 +2895,7 @@ def _op_UNARY_NOT(f):
             .mov('Py_False',f.r_ret)
             .goto(endif)
         (else_)
-            .goto_end(True)
+            .exc_goto_end()
         (endif)
         .set_tos()
         .incref()
@@ -2901,8 +2921,8 @@ def _loop_jump(f,fblock,jmp_source,typecode):
 
         r.incref(f.r_scratch[0],EXCEPT_VALUES-1)
 
-        # CPython keeps an array of pre-allocated integer objects between -5 and
-        # 256. For values in that range, this function never raises an
+        # CPython keeps an array of pre-allocated integer objects between -5
+        # and 256. For values in that range, this function never raises an
         # exception, thus no error checking is done here.
         r.invoke('PyLong_FromLong',typecode)
         r.push_stack(f.r_ret)
@@ -2986,7 +3006,7 @@ def _op_DELETE_GLOBAL(f,name):
                 'PyExc_NameError',
                 'GLOBAL_NAME_ERROR_MSG',
                 address_of(name))
-            .goto_end(True)
+            .exc_goto_end()
         )
     )
 
@@ -3001,7 +3021,7 @@ def _op_DELETE_FAST(f,arg):
                 'PyExc_UnboundLocalError',
                 'UNBOUNDLOCAL_ERROR_MSG',
                 address_of(f.code.co_varnames[arg]))
-            .goto_end(True)
+            .exc_goto_end()
         ]
         .mov(0,item)
     )
@@ -3035,7 +3055,7 @@ def binary_power(func,f):
     tos = f.stack.tos()
     return (f()
         .push_tos()
-        .invoke('PyNumber_Power',f.stack[1],tos,'Py_None')
+        .invoke(func,f.stack[1],tos,'Py_None')
         .check_err()
         .mov(f.stack[1],f.r_scratch[1])
         .mov(f.r_ret,f.stack[1])
@@ -3079,7 +3099,7 @@ def _op_LOAD_DEREF(f,arg,item):
         .invoke('PyCell_Get',item)
         .if_eax_is_zero(f()
             .invoke('format_exc_unbound',address_of(f.code),arg)
-            .goto_end(True)
+            .exc_goto_end()
         )
         .set_tos()
     )
@@ -3105,7 +3125,7 @@ def _op_DELETE_DEREF(f,arg,item):
         .mov(item,f.r_ret)
         .if_(signed(f.ctype('PyCellObject',f.r_ret).ob_ref) == 0) [f()
             .invoke('format_exc_unbound',address_of(f.code),arg)
-            .goto_end(True)
+            .exc_goto_end()
         ]
         .invoke('PyCell_Set',f.r_ret,0)
     )
@@ -3151,7 +3171,7 @@ def _op_BUILD_SET(f,arg):
         r.invoke('PySet_Add',f.stack[arg-1])
         r.if_eax_is_not_zero(f()
             (err)
-            .goto_end(True)
+            .exc_goto_end()
         )
         r.del_stack_items(arg)
         r.mov(f.r_pres[0],f.r_ret)
@@ -3303,7 +3323,7 @@ def _op_jump_or_pop_if(f,to,jop1,jop2):
         (jop1(dont_jump))
         (f.jump_to(jop2,f.JCC_MAX_LEN,to))
 
-        .goto_end(True)
+        .exc_goto_end()
 
         (dont_jump)
         .del_stack_items(1)
@@ -3358,13 +3378,17 @@ def switch_stack(f,reverse):
 def _op_YIELD_VALUE(f):
     # Currently, all the values that are part of the Python stack are copied
     # back and forth between our stack and the frame's f_valuestack member
-    # (where the interpreter would store them) when suspending and resuming from
-    # a generator. It might be better to have those values stored in
+    # (where the interpreter would store them) when suspending and resuming
+    # from a generator. It might be better to have those values stored in
     # f_valuestack in the first place and everything else on the actual stack
     # (ideally we would just store everything in f_valuestack, but there isn't
     # enough room).
 
     assert f.stack_prolog is not None and f.stack_prolog <= f.stack.offset
+
+    if not f.code.co_flags & CO_GENERATOR:
+        raise NCCompileError(
+            'The YIELD_VALUE opcode cannot be used if the code is not marked as a generator')
 
     r = f()
     if not r.use_tos():
@@ -3372,7 +3396,7 @@ def _op_YIELD_VALUE(f):
 
     r.mov(f.FRAME,f.r_pres[0])
     f_obj = f.ctype('PyFrameObject',f.r_pres[0])
-    
+
     valstack = f.stack.offset - f.stack_prolog
     if valstack:
         r += switch_stack(f,False)
@@ -3393,10 +3417,10 @@ def _op_YIELD_VALUE(f):
 
 
     #*** the generator will resume here: ***
-    
+
     # Note: don't use f.TEMP here because if the throw flag was passed to us
     # using a register, it was moved to f.TEMP (ie: f.throw_flag_store will
-    # equal to f.TEMP).
+    # equal f.TEMP).
 
     # an item gets pushed onto the stack when a generator is resumed
     r.add_to_stack(1)
@@ -3407,7 +3431,7 @@ def _op_YIELD_VALUE(f):
     r.mov(0,f_obj.f_stacktop)
     r.cmpl(0,f.throw_flag_store)
     r.if_cond(f.test_NE) [f()
-        .goto_end(True)
+        .exc_goto_end()
     ]
     return r
 
@@ -3416,11 +3440,11 @@ def _op_PRINT_EXPR(f):
     tos = f.stack.tos()
 
     r = f().invoke('_print_expr',tos)
-    
+
     # _print_expr steals a reference
     if not r.use_tos():
         r.add_to_stack(-1)
-    
+
     return r.check_err(True)
 
 
@@ -3437,7 +3461,7 @@ class Function:
         # the size, in bytes, of the trailing padding (nop instructions) in
         # "code"
         self.padding = padding
-        
+
         self.address = address
 
         # This is basically a modified Python code object. See
@@ -3470,7 +3494,7 @@ def resolve_jumps(op,chunks,end_targets=()):
     annot_size = 0
     annots = []
     annot_max = None
-    
+
     for i in range(len(chunks)-1,-1,-1):
         if isinstance(chunks[i],(debug.InnerAnnotation,debug.DescribedAnnot)):
             # since appending to a list is O(1) while prepending is O(n), we
@@ -3479,11 +3503,11 @@ def resolve_jumps(op,chunks,end_targets=()):
             annot_size = 0
             annot_max = debug.annot_max(annot_max,chunks[i])
             chunks[i] = None
-            
+
         elif isinstance(chunks[i],JumpTarget):
             chunks[i].displacement = displacement
             chunks[i] = None
-            
+
         else:
             if isinstance(chunks[i],JumpSource):
                 chunks[i] = chunks[i].compile(displacement)
@@ -3492,12 +3516,12 @@ def resolve_jumps(op,chunks,end_targets=()):
                     continue
             elif isinstance(chunks[i],DelayedCompile):
                 chunks[i].displacement = displacement
-            
+
             displacement += len(chunks[i])
             annot_size += len(chunks[i])
 
     assert annot_size == 0 or not annots, "if there are any annotations, there should be one at the start"
-    
+
     annots.reverse()
 
     # add padding for alignment
@@ -3506,7 +3530,7 @@ def resolve_jumps(op,chunks,end_targets=()):
         chunks += [op.nop()] * pad_size
         for et in end_targets:
             et.displacement += pad_size
-    
+
     code = join([(c.compile() if isinstance(c,DelayedCompile) else c) for c in chunks if c is not None])
 
     for et in end_targets:
@@ -3515,72 +3539,145 @@ def resolve_jumps(op,chunks,end_targets=()):
     return Function(code,pad_size,annotation=annots,annot_max=annot_max)
 
 
+def simple_frame(op,abi,tuning,func_name=None):
+    local_stack_size = aligned_size((MAX_ARGS + 1) * abi.ptr_size)
+    f = Frame(op,abi,tuning,local_stack_size)
+    r = f()
+    if func_name: r.comment(func_name + ' function:')
+    r.add_to_stack(1,debug.RETURN_ADDRESS)
+    return f, r
+
 def local_name_func(op,abi,tuning):
     # TODO: have just one copy shared by all compiled modules
 
-    local_stack_size = aligned_size((MAX_ARGS + 1) * abi.ptr_size)
-    stack_ptr_shift = local_stack_size - abi.ptr_size
+    f,r = simple_frame(op,abi,tuning,'local_name')
 
-    f = Frame(op,abi,tuning,local_stack_size)
-    
-    else_ = JumpTarget()
-    endif = JumpTarget()
+    else1 = JumpTarget()
+    endif1 = JumpTarget()
+    else2 = JumpTarget()
     ret = JumpTarget()
     inc_ret = JumpTarget()
 
     d_addr = pyinternals.raw_addresses['PyDict_Type']
     fits = f.fits_imm32(d_addr)
 
-    r = f().comment('local_name function:')
-    r.add_to_stack(1,debug.RETURN_ADDRESS)
-    
     if not fits:
-        r.mov(d_addr,f.r_scratch[0])
-    
-    return (f()
-        .sub(stack_ptr_shift,abi.r_sp)
+        r.mov(d_addr,f.r_pres[1])
+        d_addr = f.r_pres[1]
+
+    return (r
+        .reserve_stack()
         .mov(f.LOCALS,f.r_ret)
         .if_eax_is_zero(f()
             .invoke('PyErr_Format','PyExc_SystemError','NO_LOCALS_LOAD_MSG',f.r_pres[0])
             .goto(ret)
         )
-        
-        .cmp(d_addr if fits else f.r_scratch[0],f.type_of(f.r_ret))
-        .je(else_)
+
+        .cmp(d_addr,f.type_of(f.r_ret))
+        .je(else1)
             .invoke('PyObject_GetItem',f.r_ret,f.r_pres[0])
             .test(f.r_ret,f.r_ret)
             .jnz(ret)
-            
+
             .invoke('PyErr_ExceptionMatches','PyExc_KeyError')
             .test(f.r_ret,f.r_ret)
             .jz(ret)
             .call('PyErr_Clear')
 
-            .goto(endif)
-        (else_)
+            .goto(endif1)
+        (else1)
             .invoke('PyDict_GetItem',f.r_ret,f.r_pres[0])
             .test(f.r_ret,f.r_ret)
             .jnz(inc_ret)
-        (endif)
-    
+        (endif1)
+
         .invoke('PyDict_GetItem',f.GLOBALS,f.r_pres[0])
         .if_eax_is_zero(f()
-            .invoke('PyDict_GetItem',f.BUILTINS,f.r_pres[0])
-            .if_eax_is_zero(f()
+            .mov(f.BUILTINS,f.r_ret)
+            .cmp(d_addr,f.type_of(f.r_ret))
+            .je(else2)
+                .invoke('PyObject_GetItem',f.r_ret,f.r_pres[0])
+                .test(f.r_ret,f.r_ret)
+                .jnz(ret)
+
+                .invoke('PyErr_ExceptionMatches','PyExc_KeyError')
+                .test(f.r_ret,f.r_ret)
+                .jz(ret)
+                .call('PyErr_Clear')
+                .goto(ret)
+            (else2)
+                .invoke('PyDict_GetItem',f.r_ret,f.r_pres[0])
+                .test(f.r_ret,f.r_ret)
+                .jnz(inc_ret)
                 .invoke('format_exc_check_arg',
                     'PyExc_NameError',
                     'NAME_ERROR_MSG',
                     f.r_pres[0])
                 .goto(ret)
-            )
         )
-        
+
         (inc_ret)
         .incref(f.r_ret)
         (ret)
-        .add(stack_ptr_shift,abi.r_sp)
+        .release_stack()
         .ret()
     )
+
+def global_name_func(op,abi,tuning):
+    # TODO: have just one copy shared by all compiled modules
+
+    # r_pres[0] is expected to have the address of the name to load
+
+    f,r = simple_frame(op,abi,tuning,'global_name')
+
+    not_dict = JumpTarget()
+    name_err = JumpTarget()
+    ret = JumpTarget()
+
+    d_addr = pyinternals.raw_addresses['PyDict_Type']
+    fits = f.fits_imm32(d_addr)
+
+    if not fits:
+        r.mov(d_addr,f.r_scratch[0])
+        d_addr = f.r_scratch[0]
+
+    return (r
+        .reserve_stack()
+        .mov(f.GLOBALS,f.r_scratch[1])
+        .mov(f.BUILTINS,f.r_pres[1])
+        .cmp(d_addr,f.type_of(f.r_scratch[1]))
+        .jne(not_dict)
+        .cmp(d_addr,f.type_of(f.r_pres[1]))
+        .jne(not_dict)
+            .invoke('_PyDict_LoadGlobal',f.r_scratch[1],f.r_pres[1],f.r_pres[0])
+            .if_eax_is_zero(f()
+                .call('PyErr_Occurred')
+                .test(f.r_ret,f.r_ret)
+                .jz(name_err)
+                .mov(0,f.r_ret)
+                .goto(ret)
+            )
+            .incref()
+            .goto(ret)
+        (not_dict)
+            .invoke('PyObject_GetItem',f.r_scratch[1],f.r_pres[0])
+            .if_eax_is_zero(f()
+                .invoke('PyObject_GetItem',f.r_pres[1],f.r_pres[0])
+                .if_eax_is_zero(f()
+                    .invoke('PyErr_ExceptionMatches','PyExc_KeyError')
+                    .if_eax_is_not_zero(f()
+                        (name_err)
+                        .invoke('format_exc_check_arg',
+                            'PyExc_NameError',
+                            'GLOBAL_NAME_ERROR_MSG',
+                            f.r_pres[0])
+                        .mov(0,f.r_ret)
+                    )
+                )
+            )
+        (ret)
+        .release_stack()
+        .ret())
 
 def prepare_exc_handler_func_head(op,abi,tuning):
     # TODO: have just one copy shared by all compiled modules
@@ -3593,17 +3690,16 @@ def prepare_exc_handler_func_head(op,abi,tuning):
 
     # This function is broken into two parts: prepare_exc_handler_func_head and
     # prepare_exc_handler_func_tail. prepare_exc_handler_func_tail is made into
-    # a seperate part so reraise_exc_handler_func can use tail-call optimization
-    # with this function.
+    # a seperate part so reraise_exc_handler_func can use tail-call
+    # optimization with this function.
 
-    f,r,stack_ptr_shift = unwind_frame(op,abi,tuning)
+    f,r = simple_frame(op,abi,tuning,'exc_handler')
 
     r_tmp1 = f.stack.arg_reg(f.r_scratch[0],0)
     r_tmp2 = f.stack.arg_reg(f.r_scratch[1],1)
     tstate = f.ctype('PyThreadState',f.r_pres[1])
     return (r
-        .comment('exc_handler function:')
-        .sub(stack_ptr_shift,abi.r_sp)
+        .reserve_stack()
         .push_stack(f.r_scratch[0])
         .get_threadstate(f.r_pres[1])
         .invoke('PyTraceBack_Here',f.FRAME)
@@ -3612,8 +3708,7 @@ def prepare_exc_handler_func_head(op,abi,tuning):
         .if_(r_tmp1) [
             join(f.invoke('call_exc_trace',r_tmp1,r_tmp2))
         ]
-        .pop_stack(f.r_scratch[0])
-    )
+        .pop_stack(f.r_scratch[0]))
 
 def prepare_exc_handler_func_tail(op,abi,tuning):
     # MUST follow prepare_exc_handler_func_head
@@ -3627,7 +3722,7 @@ def prepare_exc_handler_func_tail(op,abi,tuning):
     # updating
     assert EXCEPT_VALUES == 6
 
-    f,r,stack_ptr_shift = unwind_frame(op,abi,tuning)
+    f,r = simple_frame(op,abi,tuning)
 
     exc = f.Address(-abi.ptr_size*6,f.r_pres[0])
     val = f.Address(-abi.ptr_size*5,f.r_pres[0])
@@ -3639,6 +3734,7 @@ def prepare_exc_handler_func_tail(op,abi,tuning):
     tstate = f.ctype('PyThreadState',f.r_pres[1])
 
     (r
+        .reserve_stack(False)
         .clean_stack(addr=f.Address(base=f.r_pres[0]),index=f.r_scratch[0])
 
         .get_threadstate(f.r_pres[1])
@@ -3651,8 +3747,7 @@ def prepare_exc_handler_func_tail(op,abi,tuning):
             .mov('Py_None',f.r_ret)
             .incref()
         )
-        .mov(f.r_ret,exc_old)
-    )
+        .mov(f.r_ret,exc_old))
 
     load_args = []
     for n,item in enumerate((exc,val,tb)):
@@ -3684,9 +3779,8 @@ def prepare_exc_handler_func_tail(op,abi,tuning):
         .incref(f.r_scratch[1])
         .mov(f.r_scratch[1],tstate.exc_traceback)
         .mov(0,f.r_ret)
-        .add(stack_ptr_shift,abi.r_sp)
-        .ret()
-    )
+        .release_stack()
+        .ret())
 
 def reraise_exc_handler_func(op,abi,tuning,prepare_exc_handler_tail):
     # TODO: have just one copy shared by all compiled modules
@@ -3697,19 +3791,11 @@ def reraise_exc_handler_func(op,abi,tuning,prepare_exc_handler_tail):
     # r_pres[0] is expected to be what the address of the top of the stack will
     # be once the items have been popped
 
-    f,r,stack_ptr_shift = unwind_frame(op,abi,tuning)
+    f,r = simple_frame(op,abi,tuning,'reraise_exc_handler')
 
     return (r
-        .comment('reraise_exc_handler function:')
-        .sub(stack_ptr_shift,abi.r_sp)
-        (InnerCall(op,abi,prepare_exc_handler_tail,True))
-    )
-
-def unwind_frame(op,abi,tuning):
-    local_stack_size = aligned_size((MAX_ARGS + 1) * abi.ptr_size)
-    f = Frame(op,abi,tuning,local_stack_size)
-    r = f().add_to_stack(1,debug.RETURN_ADDRESS)
-    return f, r, (local_stack_size - abi.ptr_size)
+        .reserve_stack()
+        (InnerCall(op,abi,prepare_exc_handler_tail,True)))
 
 def unwind_exc_func_head(op,abi,tuning):
     # TODO: have just one copy shared by all compiled modules
@@ -3720,24 +3806,21 @@ def unwind_exc_func_head(op,abi,tuning):
     # r_pres[0] is expected to be what the address of the top of the stack will
     # be once the items have been popped
 
-    # This function must be called if an exception handler exits before reaching
-    # POP_EXCEPT.
+    # This function must be called if an exception handler exits before
+    # reaching POP_EXCEPT.
 
     # This function is broken into two parts: unwind_exc_func_head and
-    # unwind_exc_func_tail. unwind_exc_func_tail is made into a seperate part so
-    # unwind_finally_func can use tail-call optimization with this function.
+    # unwind_exc_func_tail. unwind_exc_func_tail is made into a seperate part
+    # so unwind_finally_func can use tail-call optimization with this function.
 
-    f,r,stack_ptr_shift = unwind_frame(op,abi,tuning)
+    f,r = simple_frame(op,abi,tuning,'unwind_exc')
 
-    return (r
-        .comment('unwind_exc function:')
-        .sub(stack_ptr_shift,abi.r_sp)
-    )
+    return r.reserve_stack()
 
 def unwind_exc_func_tail(op,abi,tuning):
     # MUST follow unwind_exc_func_head
 
-    f,r,stack_ptr_shift = unwind_frame(op,abi,tuning)
+    f,r = simple_frame(op,abi,tuning)
 
     exc = f.Address(0,f.r_pres[0])
     val = f.Address(abi.ptr_size,f.r_pres[0])
@@ -3745,12 +3828,13 @@ def unwind_exc_func_tail(op,abi,tuning):
     tstate = f.ctype('PyThreadState',f.r_pres[1])
 
     (r
+        .reserve_stack(False)
         .clean_stack(addr=f.Address(base=f.r_pres[0]),index=f.r_scratch[0])
         .get_threadstate(f.r_pres[1])
         .mov(exc,f.r_scratch[0])
         .mov(val,f.r_scratch[1])
-        .mov(tb,f.r_pres[0])
-    )
+        .mov(tb,f.r_pres[0]))
+
     del exc, val, tb # no longer valid
     (r
         # swap the values
@@ -3762,16 +3846,15 @@ def unwind_exc_func_tail(op,abi,tuning):
         .xor(tstate.exc_traceback,f.r_pres[0])
         .xor(f.r_scratch[0],tstate.exc_type)
         .xor(f.r_scratch[1],tstate.exc_value)
-        .xor(f.r_pres[0],tstate.exc_traceback)
-    )
+        .xor(f.r_pres[0],tstate.exc_traceback))
+
     del tstate
     return (r
         .decref(f.r_scratch[0],preserve_reg=f.r_scratch[1]) # set to Py_None if NULL by prepare_exc_handler_func
         .if_(f.r_scratch[1])[f.decref(f.r_scratch[1])]
         .if_(f.r_pres[0])[f.decref(f.r_pres[0])]
-        .add(stack_ptr_shift,abi.r_sp)
-        .ret()
-    )
+        .release_stack()
+        .ret())
 
 def unwind_finally_func(op,abi,tuning,unwind_exc_tail):
     # this function uses an ad hoc calling convention and is only callable from
@@ -3793,12 +3876,11 @@ def unwind_finally_func(op,abi,tuning,unwind_exc_tail):
     # changes, the assumption should be rechecked.
     assert EXCEPT_VALUES == 6
 
-    f,r,stack_ptr_shift = unwind_frame(op,abi,tuning)
+    f,r = simple_frame(op,abi,tuning,'unwind_finally')
     not_exc = JumpTarget()
 
     return (r
-        .comment('unwind_finally function:')
-        .sub(stack_ptr_shift,abi.r_sp)
+        .reserve_stack()
         .clean_stack(addr=f.Address(base=f.r_pres[0]),index=f.r_scratch[0])
         .mov(f.Address(base=f.r_pres[0]),f.r_scratch[1])
         .mov(f.type_of(f.r_scratch[1]),f.r_ret)
@@ -3816,9 +3898,8 @@ def unwind_finally_func(op,abi,tuning,unwind_exc_tail):
         .decref(f.r_ret)
         .mov(f.Address(abi.ptr_size*2,f.r_pres[0]),f.r_ret)
         .decref(f.r_ret,amount=EXCEPT_VALUES-2)
-        .add(stack_ptr_shift,abi.r_sp)
-        .ret()
-    )
+        .release_stack()
+        .ret())
 
 def swap_exc_state_func(op,abi,tuning):
     # this function uses an ad hoc calling convention and is only callable from
@@ -3873,10 +3954,10 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
         stack_first += 1
 
     local_stack_size = aligned_size(
-        (code.co_stacksize + 
-         max(MAX_ARGS-len(abi.r_arg),0) + 
+        (code.co_stacksize +
+         max(MAX_ARGS-len(abi.r_arg),0) +
          stack_first) * abi.ptr_size + abi.shadow)
-         
+
     assert local_stack_size % abi.ptr_size == 0
 
     f = Frame(
@@ -3888,22 +3969,21 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
         util_funcs,
         entry_points)
 
-    s_offset = pre_stack + SAVED_REGS
-    stack_ptr_shift = local_stack_size - s_offset * abi.ptr_size
-    
     f.throw_flag_store = f.stack.func_arg(1)
-    move_throw_flag = isinstance(f.throw_flag_store,f.Register)
-    
+    move_throw_flag = (f.code.co_flags & CO_GENERATOR and
+                       isinstance(f.throw_flag_store,f.Register))
+
     if move_throw_flag:
         # we use f.TEMP to use the throw flag and temporarily use another
         # address (the address where the first Python stack value will go) as
         # our temporary store
         f.throw_flag_store = f.TEMP
         f.TEMP = f.stack[-stack_first-1]
-        
+
     # at the epilogue, GLOBALS is no longer used and we use its space as a
     # temporary store for the return value
     ret_temp_store = f.GLOBALS
+
     fast_end = JumpTarget()
 
     opcodes = (f()
@@ -3913,9 +3993,7 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
         .mov(abi.r_sp,abi.r_bp)
         .save_reg(f.r_pres[0])
         .save_reg(f.r_pres[1])
-        .sub(stack_ptr_shift,abi.r_sp)
-        .set_stack(s_offset,debug.PrologEnd(local_stack_size // abi.ptr_size))
-    )
+        .reserve_stack())
 
     f_obj = f.ctype('PyFrameObject',f.r_pres[0])
     tstate = f.ctype('PyThreadState',f.r_scratch[0])
@@ -3926,9 +4004,7 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
     argreg = f.stack.arg_reg(n=0)
     (opcodes
         .mov(f.stack.func_arg(0),f.r_pres[0])
-        .lea(f.stack[-1],argreg)
-        .mov(0,f.stack[-1])
-        .invoke('_EnterRecursiveCall',argreg)
+        .call('_EnterRecursiveCall')
         .check_err(True)
 
         .get_threadstate(f.r_scratch[0])
@@ -3936,7 +4012,7 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
         .mov(f_obj.f_globals,f.r_scratch[1])
         .mov(f_obj.f_builtins,f.r_ret)
 
-        .push_stack(f.r_pres[0])
+        .push_stack(f.r_pres[0],debug.PushVariable('f'))
         .push_stack(f.r_scratch[1])
         .push_stack(f.r_ret)
 
@@ -4006,31 +4082,31 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
 
     del f_obj
     del tstate
-    
+
     if move_throw_flag:
         # use the original address for TEMP again
         f.TEMP = f.throw_flag_store
 
-    opcodes.set_stack(stack_first,debug.PYTHON_STACK_START)    
+    opcodes.set_stack(stack_first,debug.PYTHON_STACK_START)
     f.stack_prolog = stack_first
     f.stack.protected_items.append(stack_first)
-    
+
     i = 0
     extended_arg = 0
     f.byte_offset = 0
     while i < len(f.code.co_code):
         bop = f.code.co_code[i]
         i += 1
-        
+
         if bop >= dis.HAVE_ARGUMENT:
             boparg = f.code.co_code[i] + (f.code.co_code[i+1] << 8) + extended_arg
             i += 2
-            
+
             if bop == dis.EXTENDED_ARG:
                 extended_arg = bop << 16
             else:
                 extended_arg = 0
-                
+
                 f.next_byte_offset = i
                 opcodes += get_handler(bop)(f,boparg)
                 f.byte_offset = i
@@ -4038,8 +4114,8 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
             f.next_byte_offset = i
             opcodes += get_handler(bop)(f)
             f.byte_offset = i
-    
-    
+
+
     if f.stack.offset is not None and f.stack.offset != f.stack_prolog:
         raise NCCompileError(
             'stack.offset should be {0}, but is {1}'
@@ -4050,7 +4126,9 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
 
     if f.blockends:
         raise NCCompileError('there is an unclosed block statement')
-    
+
+    tstate = f.ctype('PyThreadState',f.r_scratch[0])
+    f_obj = f.ctype('PyFrameObject',f.r_scratch[1])
 
     # call Py_DECREF on anything left on the stack and return %eax
     (opcodes
@@ -4063,15 +4141,14 @@ def compile_eval(code,op,abi,tuning,util_funcs,entry_points):
         .mov(ret_temp_store,f.r_ret)
         .get_threadstate(f.r_scratch[0])
         .mov(f.FRAME,f.r_scratch[1])
-        .add(stack_ptr_shift,abi.r_sp)
-        .set_stack(4,debug.EPILOG_START)
+        .release_stack()
         .restore_reg(f.r_pres[1])
         .restore_reg(f.r_pres[0])
-        .mov(f.ctype('PyFrameObject',f.r_scratch[1]).f_back,f.r_scratch[1])
+        .mov(f_obj.f_back,f.r_scratch[1])
         .restore_reg(abi.r_bp)
-        .mov(f.r_scratch[1],f.ctype('PyThreadState',f.r_scratch[0]).frame)
+        .mov(f.r_scratch[1],tstate.frame)
         .ret())
-    
+
     assert f.stack.offset == 1
 
     return opcodes
@@ -4109,7 +4186,7 @@ def compile_raw(_code,abi,tuning=Tuning(),op=None):
                 entry_points[id(c)] = (
                     pyinternals.create_compiled_entry_point(c),
                     ceval(c))
-    
+
     compile_code_constants(_code)
 
     functions = []
@@ -4145,7 +4222,10 @@ def compile_raw(_code,abi,tuning=Tuning(),op=None):
             ufuncs.reraise_exc_handler,
             reraise_exc_handler_func,
             prepare_exc_handler_tail)
-    
+
+    if ufuncs.global_name.used:
+        add_util_func(ufuncs.global_name,global_name_func)
+
     if ufuncs.local_name.used:
         add_util_func(ufuncs.local_name,local_name_func)
 
@@ -4161,7 +4241,7 @@ def compile_raw(_code,abi,tuning=Tuning(),op=None):
             func.entry_point = epf[0]
         func.address = offset
         offset += len(func)
-    
+
     return CompilationUnit(functions),[ep for ep,func in entry_points]
 
 

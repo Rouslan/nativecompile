@@ -20,7 +20,7 @@ class Annotation:
         self.stack,self.r_ret_used = i_annot[0:2]
         self.descr = getattr(i_annot,'descr',None)
         self.size = size
-        
+
     @staticmethod
     def mergable(a,b):
         return a.descr is None and b.descr is None and a.stack == b.stack and a.r_ret_used == b.r_ret_used
@@ -38,7 +38,7 @@ def append_annot(seq,item):
             seq[-1].size += item.size
         else:
             seq.append(item)
-            
+
 def max_not_none(a,b):
     if a is None: return b
     if b is None: return a
@@ -65,6 +65,10 @@ class SaveReg:
 class RestoreReg:
     def __init__(self,reg):
         self.reg = reg
+
+class PushVariable:
+    def __init__(self,name):
+        self.name = name
 
 
 class SymbolSection(elf.Section):
@@ -101,25 +105,29 @@ class SymbolSection(elf.Section):
                     elf.STT_FUNC,
                     1)
 
+
+def dwarf_reg(mode,reg):
+    """Convert a Register object to the corresponding dwarf value"""
+    return getattr(dwarf.reg(mode),reg.name)
+
 def dwarf_arg_loc(abi,mode,index):
     op = dwarf.OP(mode)
     if index >= len(abi.r_arg):
         r = op.fbreg(index * abi.ptr_size)
     else:
-        r = op.reg(int(getattr(dwarf.reg(mode),abi.r_arg[index].name)))
+        r = op.reg(dwarf_reg(mode,abi.r_arg[index]))
 
     return dwarf.FORM_exprloc(r)
 
 
-class AddrEntry:
+class StackBodyLocListEntry(dwarf.FORM_loclist_offset):
     def __init__(self,addr,annot):
         self.addr = addr
         self.annot = annot
 
-class StackBodyLocListEntry(AddrEntry):
-    def __call__(self,op):
+    def values(self,op):
         assert self.annot
-        
+
         bottom = self.annot[0].stack
         start = self.addr
         expr_end = op.stack_value()
@@ -130,8 +138,31 @@ class StackBodyLocListEntry(AddrEntry):
             yield start,end,op.const_int(stack - bottom) + expr_end
             start = end
 
-class StackTopARangeEntry(AddrEntry):
-    def __call__(self):
+class PyFrameLocListEntry(dwarf.FORM_loclist_offset):
+    def __init__(self,func,abi,mode):
+        self.start = func.address
+        self.end = func.address + len(func) - func.padding
+        self.annot = func.annotation
+        self.abi = abi
+        self.mode = mode
+
+    def values(self,op):
+        regend = self.start
+        for a in self.annot:
+            if isinstance(a.descr,PushVariable) and a.descr.name == 'f':
+                yield self.start,regend,op.reg(dwarf_reg(self.mode,self.abi.r_arg[0]))
+                yield regend,self.end - regend,op.fbreg(a.stack * -self.abi.ptr_size)
+                break
+            regend += a.size
+        else:
+            assert False
+
+class StackTopRangeEntry(dwarf.FORM_rangelist_offset):
+    def __init__(self,addr,annot):
+        self.addr = addr
+        self.annot = annot
+
+    def values(self):
         start = self.addr
         for used,annots in groupby(self.annot,(lambda a: a.r_ret_used)):
             end = start + sum(a.size for a in annots)
@@ -139,58 +170,64 @@ class StackTopARangeEntry(AddrEntry):
             if used: yield start,end
             start = end
 
-class CallFrameEntry(AddrEntry):
+class CallFrameEntry:
+    def __init__(self,addr,annot,ptr_size):
+        self.addr = addr
+        self.annot = annot
+        self.ptr_size = ptr_size
+
     def __call__(self,op,reg):
         assert self.annot
-        
+
         itr = iter(self.annot)
-        old_stack = next(itr).stack
+        a = next(itr)
+        old_stack = a.stack
         in_body = False
         instr = b''
-        span = 0
+        span = a.size
         tot_size = 0
-        
+
         def add_code(c):
             nonlocal instr,span,tot_size
-            
+
             if span:
                 instr += op.advance_loc_smallest(span)
                 tot_size += span
                 span = 0
             instr += c
-        
+
         # for the call frame, we need to record how much stack space is
         # allocated, not just how many items we have on it (which is what
         # a.stack specifies)
         for a in itr:
             assert a.stack is not None
-            
+
             if in_body:
                 if a.descr is EPILOG_START:
                     in_body = False
-                    add_code(op.def_cfa_offset(a.stack))
+                    add_code(op.def_cfa_offset(a.stack * self.ptr_size))
                     old_stack = a.stack
                     continue
             elif isinstance(a.descr,PrologEnd):
                 in_body = True
-                add_code(op.def_cfa_offset(a.descr.reserved))
+                add_code(op.def_cfa_offset(a.descr.reserved * self.ptr_size))
                 old_stack = a.descr.reserved
                 continue
             elif a.stack != old_stack:
-                add_code(op.def_cfa_offset(a.stack))
+                add_code(op.def_cfa_offset(a.stack * self.ptr_size))
                 old_stack = a.stack
-                    
+
             if isinstance(a.descr,SaveReg):
                 add_code(op.offset(getattr(reg,a.descr.reg.name),a.stack))
             elif isinstance(a.descr,RestoreReg):
                 add_code(op.restore(getattr(reg,a.descr.reg.name)))
-                    
+
             span += a.size
-                    
+
         tot_size += span
-        
+
         return self.addr,tot_size,instr
-    
+
 
 def generate(abi,cu,entry_points):
     emode = abi.ptr_size * 8
@@ -210,7 +247,7 @@ def generate(abi,cu,entry_points):
         encoding=dwarf.ATE.signed,
         byte_size=dwarf.FORM_data1(abi.int_size))
     dcu.children.append(t_int)
-    
+
     if abi.long_size > abi.int_size:
         t_ulong = dwarf.DIE('base_type',
             name=st['unsigned long'],
@@ -239,7 +276,7 @@ def generate(abi,cu,entry_points):
         func.name = None
         if func.entry_point:
             dop = dwarf.OP(dmode)
-            
+
             if func.entry_point.co_name:
                 df.name = st[elf.symbolify(func.entry_point.co_name)]
             df.type = ref(t_vptr)
@@ -248,45 +285,46 @@ def generate(abi,cu,entry_points):
             df.children.append(dwarf.DIE('formal_parameter',
                 name=st['f'],
                 type=ref(t_vptr),
-                location=dwarf_arg_loc(abi,dmode,0)))
+                location=PyFrameLocListEntry(func,abi,dmode)
+                    if abi.r_arg else dwarf_arg_loc(abi,dmode,0)))
 
             df.children.append(dwarf.DIE('formal_parameter',
                 name=st['throwflag'],
                 type=ref(t_int),
                 location=dwarf_arg_loc(abi,dmode,1)))
-            
+
             s_addr = func.address
             for i,a in enumerate(func.annotation):
                 if a.descr is PYTHON_STACK_START:
-            
+
                     v_size = dwarf.DIE('variable',
                         name=st['stack_len'],
                         type=ref(t_ulong),
-                        location=dwarf.FORM_loclist_offset(
-                            StackBodyLocListEntry(s_addr,func.annotation[i:])))
+                        location=StackBodyLocListEntry(s_addr,func.annotation[i:]))
                     df.children.append(v_size)
-                    
+
                     a_type = dwarf.DIE('array_type',
-                        type=ref(t_vptr))
+                        type=ref(t_vptr),
+                        byte_stride=dwarf.FORM_sdata(-abi.ptr_size))
                     df.children.append(a_type)
-                    
+
                     a_type.children.append(dwarf.DIE('subrange_type',
                         type=ref(t_ulong),
                         lower_bound=dwarf.FORM_udata(0),
                         count=ref(v_size)))
-                    
+
                     df.children.append(dwarf.DIE('variable',
                         name=st['stack'],
                         type=ref(a_type),
                         start_scope=dwarf.FORM_udata(s_addr),
                         location=dwarf.FORM_exprloc(dop.fbreg(a.stack * -abi.ptr_size))))
-                    
+
                     break
                 s_addr += a.size
             else:
                 assert False, "Named function without PROLOG_END marked"
-                
-            cfs.append(CallFrameEntry(func.address,func.annotation))
+
+            cfs.append(CallFrameEntry(func.address,func.annotation,abi.ptr_size))
 
         df.low_pc = dwarf.FORM_addr(func.address)
         df.high_pc = dwarf.FORM_udata(len(func) - func.padding)

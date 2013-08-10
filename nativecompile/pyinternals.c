@@ -8,7 +8,7 @@
     #include <sys/mman.h>
     #include <unistd.h>
     #include <stdlib.h>
-    
+
     #define USE_POSIX 1
 #elif defined(_WIN32) || defined(__WIN32__) || defined(__TOS_WIN__) || defined(__WINDOWS__)
     #include <Windows.h>
@@ -276,6 +276,7 @@ typedef struct {
     PyObject *co_varnames;
     PyObject *co_freevars;
     PyObject *co_cellvars;
+    unsigned char *co_cell2arg;
     PyObject *co_filename;
     PyObject *co_name;
     int co_firstlineno;
@@ -334,6 +335,7 @@ static PyObject *create_compiled_entry_point(PyObject *self,PyObject *_arg) {
         Py_XINCREF(ep->co_freevars);
         ep->co_cellvars = arg->co_cellvars;
         Py_XINCREF(ep->co_cellvars);
+        ep->co_cell2arg = NULL;
         ep->co_filename = arg->co_filename;
         Py_XINCREF(ep->co_filename);
         ep->co_name = arg->co_name;
@@ -343,6 +345,13 @@ static PyObject *create_compiled_entry_point(PyObject *self,PyObject *_arg) {
         Py_XINCREF(ep->co_lnotab);
         ep->co_zombieframe = NULL;
         ep->co_weakreflist = NULL;
+
+        if(arg->co_cell2arg) {
+            Py_ssize_t cellsize = PyTuple_GET_SIZE(arg->co_cellvars);
+            assert(arg->co_cellvars);
+            ep->co_cell2arg = PyMem_MALLOC(cellsize);
+            memcpy(ep->co_cell2arg,arg->co_cell2arg,cellsize);
+        }
 
         ep->compiled_code = NULL;
         ep->offset = 0;
@@ -390,13 +399,15 @@ static PyObject *cep_set_offset(PyObject *self,PyObject *args) {
     Py_RETURN_NONE;
 }
 
+/* This is a modified version of builtin_exec from Python/bltinmodule.c */
 static PyObject *cep_exec(PyObject *self,PyObject *args) {
     PyObject *r;
     PyObject *cep;
     PyObject *globals = Py_None;
     PyObject *locals = Py_None;
 
-    if(!PyArg_ParseTuple(args,"O|OO",&cep,&globals,&locals)) return NULL;
+    if (!PyArg_UnpackTuple(args, "cep_exec", 1, 3, &cep, &globals, &locals))
+        return NULL;
 
     CEP_CHECK(cep)
 
@@ -415,13 +426,13 @@ static PyObject *cep_exec(PyObject *self,PyObject *args) {
         locals = globals;
 
     if (!PyDict_Check(globals)) {
-        PyErr_Format(PyExc_TypeError, "globals must be a dict, not %.100s",
+        PyErr_Format(PyExc_TypeError, "arg 2 must be a dict, not %.100s",
                      globals->ob_type->tp_name);
         return NULL;
     }
     if (!PyMapping_Check(locals)) {
         PyErr_Format(PyExc_TypeError,
-            "locals must be a mapping or None, not %.100s",
+            "arg 3 must be a mapping or None, not %.100s",
             locals->ob_type->tp_name);
         return NULL;
     }
@@ -481,7 +492,7 @@ static int alloc_for_func(CompiledCode *self,long size) {
         PyErr_SetString(PyExc_ValueError,"parts cannot be empty");
         return -1;
     }
-        
+
 #ifdef USE_POSIX
     if((self->entry = mmap(0,size,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANON,-1,0)) == MAP_FAILED) {
     /*if(posix_memalign((void**)&self->entry,sysconf(_SC_PAGESIZE),size)) {*/
@@ -522,7 +533,7 @@ static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kw
     if(!PyArg_ParseTupleAndKeywords(args,kwds,"OO",kwlist,
         &parts,
         &entry_points)) return NULL;
-    
+
     self = (CompiledCode*)type->tp_alloc(type,0);
     if(self) {
         self->entry = NULL;
@@ -641,7 +652,7 @@ static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kw
         if(buff.obj) PyBuffer_Release(&buff);
 #endif
     }
-        
+
     return (PyObject*)self;
 }
 
@@ -654,7 +665,7 @@ static PyObject *CompiledCode_call(CompiledCode *self,PyObject *args,PyObject *k
         PyTuple_GET_ITEM(self->entry_points,0),
         PyEval_GetGlobals(),
         PyEval_GetLocals());
-    
+
     if(r) {
         Py_DECREF(r);
         Py_RETURN_NONE;
@@ -959,12 +970,7 @@ ext_do_call(PyObject *func, PyObject **pp_stack, int flags, int na, int nk)
                 goto ext_call_fail;
             if (PyDict_Update(d, kwdict) != 0) {
                 Py_DECREF(d);
-                /* PyDict_Update raises attribute
-                 * error (percolated from an attempt
-                 * to get 'keys' attribute) instead of
-                 * a type error if its second argument
-                 * is not a mapping.
-                 */
+
                 if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
                     PyErr_Format(PyExc_TypeError,
                                  "%.200s%.200s argument after ** "
@@ -988,7 +994,7 @@ ext_do_call(PyObject *func, PyObject **pp_stack, int flags, int na, int nk)
                 if (PyErr_ExceptionMatches(PyExc_TypeError)) {
                     PyErr_Format(PyExc_TypeError,
                                  "%.200s%.200s argument after * "
-                                 "must be a sequence, not %200s",
+                                 "must be a sequence, not %.200s",
                                  PyEval_GetFuncName(func),
                                  PyEval_GetFuncDesc(func),
                                  stararg->ob_type->tp_name);
@@ -1078,6 +1084,156 @@ format_exc_unbound(PyCodeObject *co, int oparg)
     return NULL;
 }
 
+static void
+format_missing(const char *kind, PyCodeObject *co, PyObject *names)
+{
+    int err;
+    Py_ssize_t len = PyList_GET_SIZE(names);
+    PyObject *name_str, *comma, *tail, *tmp;
+
+    assert(PyList_CheckExact(names));
+    assert(len >= 1);
+    /* Deal with the joys of natural language. */
+    switch (len) {
+    case 1:
+        name_str = PyList_GET_ITEM(names, 0);
+        Py_INCREF(name_str);
+        break;
+    case 2:
+        name_str = PyUnicode_FromFormat("%U and %U",
+                                        PyList_GET_ITEM(names, len - 2),
+                                        PyList_GET_ITEM(names, len - 1));
+        break;
+    default:
+        tail = PyUnicode_FromFormat(", %U, and %U",
+                                    PyList_GET_ITEM(names, len - 2),
+                                    PyList_GET_ITEM(names, len - 1));
+        if (tail == NULL)
+            return;
+        /* Chop off the last two objects in the list. This shouldn't actually
+           fail, but we can't be too careful. */
+        err = PyList_SetSlice(names, len - 2, len, NULL);
+        if (err == -1) {
+            Py_DECREF(tail);
+            return;
+        }
+        /* Stitch everything up into a nice comma-separated list. */
+        comma = PyUnicode_FromString(", ");
+        if (comma == NULL) {
+            Py_DECREF(tail);
+            return;
+        }
+        tmp = PyUnicode_Join(comma, names);
+        Py_DECREF(comma);
+        if (tmp == NULL) {
+            Py_DECREF(tail);
+            return;
+        }
+        name_str = PyUnicode_Concat(tmp, tail);
+        Py_DECREF(tmp);
+        Py_DECREF(tail);
+        break;
+    }
+    if (name_str == NULL)
+        return;
+    PyErr_Format(PyExc_TypeError,
+                 "%U() missing %i required %s argument%s: %U",
+                 co->co_name,
+                 len,
+                 kind,
+                 len == 1 ? "" : "s",
+                 name_str);
+    Py_DECREF(name_str);
+}
+
+static void
+missing_arguments(PyCodeObject *co, int missing, int defcount,
+                  PyObject **fastlocals)
+{
+    int i, j = 0;
+    int start, end;
+    int positional = defcount != -1;
+    const char *kind = positional ? "positional" : "keyword-only";
+    PyObject *missing_names;
+
+    /* Compute the names of the arguments that are missing. */
+    missing_names = PyList_New(missing);
+    if (missing_names == NULL)
+        return;
+    if (positional) {
+        start = 0;
+        end = co->co_argcount - defcount;
+    }
+    else {
+        start = co->co_argcount;
+        end = start + co->co_kwonlyargcount;
+    }
+    for (i = start; i < end; i++) {
+        if (GETLOCAL(i) == NULL) {
+            PyObject *raw = PyTuple_GET_ITEM(co->co_varnames, i);
+            PyObject *name = PyObject_Repr(raw);
+            if (name == NULL) {
+                Py_DECREF(missing_names);
+                return;
+            }
+            PyList_SET_ITEM(missing_names, j++, name);
+        }
+    }
+    assert(j == missing);
+    format_missing(kind, co, missing_names);
+    Py_DECREF(missing_names);
+}
+
+static void
+too_many_positional(PyCodeObject *co, int given, int defcount, PyObject **fastlocals)
+{
+    int plural;
+    int kwonly_given = 0;
+    int i;
+    PyObject *sig, *kwonly_sig;
+
+    assert((co->co_flags & CO_VARARGS) == 0);
+    /* Count missing keyword-only args. */
+    for (i = co->co_argcount; i < co->co_argcount + co->co_kwonlyargcount; i++)
+        if (GETLOCAL(i) != NULL)
+            kwonly_given++;
+    if (defcount) {
+        int atleast = co->co_argcount - defcount;
+        plural = 1;
+        sig = PyUnicode_FromFormat("from %d to %d", atleast, co->co_argcount);
+    }
+    else {
+        plural = co->co_argcount != 1;
+        sig = PyUnicode_FromFormat("%d", co->co_argcount);
+    }
+    if (sig == NULL)
+        return;
+    if (kwonly_given) {
+        const char *format = " positional argument%s (and %d keyword-only argument%s)";
+        kwonly_sig = PyUnicode_FromFormat(format, given != 1 ? "s" : "", kwonly_given,
+                                              kwonly_given != 1 ? "s" : "");
+        if (kwonly_sig == NULL) {
+            Py_DECREF(sig);
+            return;
+        }
+    }
+    else {
+        /* This will not fail. */
+        kwonly_sig = PyUnicode_FromString("");
+        assert(kwonly_sig != NULL);
+    }
+    PyErr_Format(PyExc_TypeError,
+                 "%U() takes %U positional argument%s but %d%U %s given",
+                 co->co_name,
+                 sig,
+                 plural ? "s" : "",
+                 given,
+                 kwonly_sig,
+                 given == 1 && !kwonly_given ? "was" : "were");
+    Py_DECREF(sig);
+    Py_DECREF(kwonly_sig);
+}
+
 /* we store stack values in reverse order compared to how CPython stores them so
    this function is given an extra parameter to multiply the index by, which can
    be 1 or -1 */
@@ -1094,6 +1250,9 @@ _cc_EvalCodeEx(PyObject *_co, PyObject *globals, PyObject *locals,
     PyThreadState *tstate = PyThreadState_GET();
     PyObject *x, *u;
     int total_args = co->co_argcount + co->co_kwonlyargcount;
+    int i;
+    int n = argcount;
+    PyObject *kwdict = NULL;
 
     if (globals == NULL) {
         PyErr_SetString(PyExc_SystemError,
@@ -1110,200 +1269,149 @@ _cc_EvalCodeEx(PyObject *_co, PyObject *globals, PyObject *locals,
     fastlocals = f->f_localsplus;
     freevars = f->f_localsplus + co->co_nlocals;
 
-    if (total_args || co->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) {
-        int i;
-        int n = argcount;
-        PyObject *kwdict = NULL;
-        if (co->co_flags & CO_VARKEYWORDS) {
-            kwdict = PyDict_New();
-            if (kwdict == NULL)
-                goto fail;
-            i = total_args;
-            if (co->co_flags & CO_VARARGS)
-                i++;
-            SETLOCAL(i, kwdict);
-        }
-        if (argcount > co->co_argcount) {
-            if (!(co->co_flags & CO_VARARGS)) {
-                PyErr_Format(PyExc_TypeError,
-                    "%U() takes %s %d "
-                    "positional argument%s (%d given)",
-                    co->co_name,
-                    defcount ? "at most" : "exactly",
-                    co->co_argcount,
-                    co->co_argcount == 1 ? "" : "s",
-                    argcount + kwcount);
-                goto fail;
-            }
-            n = co->co_argcount;
-        }
-        for (i = 0; i < n; i++) {
+    if (co->co_flags & CO_VARKEYWORDS) {
+        kwdict = PyDict_New();
+        if (kwdict == NULL)
+            goto fail;
+        i = total_args;
+        if (co->co_flags & CO_VARARGS)
+            i++;
+        SETLOCAL(i, kwdict);
+    }
+    if (argcount > co->co_argcount)
+        n = co->co_argcount;
+    for (i = 0; i < n; i++) {
+        x = args[i * indexmult];
+        Py_INCREF(x);
+        SETLOCAL(i, x);
+    }
+    if (co->co_flags & CO_VARARGS) {
+        u = PyTuple_New(argcount - n);
+        if (u == NULL)
+            goto fail;
+        SETLOCAL(total_args, u);
+        for (i = n; i < argcount; i++) {
             x = args[i * indexmult];
             Py_INCREF(x);
-            SETLOCAL(i, x);
+            PyTuple_SET_ITEM(u, i-n, x);
         }
-        if (co->co_flags & CO_VARARGS) {
-            u = PyTuple_New(argcount - n);
-            if (u == NULL)
-                goto fail;
-            SETLOCAL(total_args, u);
-            for (i = n; i < argcount; i++) {
-                x = args[i * indexmult];
-                Py_INCREF(x);
-                PyTuple_SET_ITEM(u, i-n, x);
-            }
+    }
+    for (i = 0; i < kwcount; i++) {
+        PyObject **co_varnames;
+        PyObject *keyword = kws[2*i * indexmult];
+        PyObject *value = kws[(2*i + 1) * indexmult];
+        int j;
+        if (keyword == NULL || !PyUnicode_Check(keyword)) {
+            PyErr_Format(PyExc_TypeError,
+                         "%U() keywords must be strings",
+                         co->co_name);
+            goto fail;
         }
-        for (i = 0; i < kwcount; i++) {
-            PyObject **co_varnames;
-            PyObject *keyword = kws[2*i*indexmult];
-            PyObject *value = kws[(2*i + 1) * indexmult];
-            int j;
-            if (keyword == NULL || !PyUnicode_Check(keyword)) {
-                PyErr_Format(PyExc_TypeError,
-                    "%U() keywords must be strings",
-                    co->co_name);
+
+        co_varnames = ((PyTupleObject *)(co->co_varnames))->ob_item;
+        for (j = 0; j < total_args; j++) {
+            PyObject *nm = co_varnames[j];
+            if (nm == keyword)
+                goto kw_found;
+        }
+
+        for (j = 0; j < total_args; j++) {
+            PyObject *nm = co_varnames[j];
+            int cmp = PyObject_RichCompareBool(
+                keyword, nm, Py_EQ);
+            if (cmp > 0)
+                goto kw_found;
+            else if (cmp < 0)
                 goto fail;
-            }
-            co_varnames = ((PyTupleObject *)(co->co_varnames))->ob_item;
-            for (j = 0; j < total_args; j++) {
-                PyObject *nm = co_varnames[j];
-                if (nm == keyword)
-                    goto kw_found;
-            }
-            for (j = 0; j < total_args; j++) {
-                PyObject *nm = co_varnames[j];
-                int cmp = PyObject_RichCompareBool(
-                    keyword, nm, Py_EQ);
-                if (cmp > 0)
-                    goto kw_found;
-                else if (cmp < 0)
-                    goto fail;
-            }
-            if (j >= total_args && kwdict == NULL) {
-                PyErr_Format(PyExc_TypeError,
-                             "%U() got an unexpected "
-                             "keyword argument '%S'",
-                             co->co_name,
-                             keyword);
-                goto fail;
-            }
-            PyDict_SetItem(kwdict, keyword, value);
-            continue;
-          kw_found:
-            if (GETLOCAL(j) != NULL) {
-                PyErr_Format(PyExc_TypeError,
-                         "%U() got multiple "
-                         "values for keyword "
-                         "argument '%S'",
+        }
+        if (j >= total_args && kwdict == NULL) {
+            PyErr_Format(PyExc_TypeError,
+                         "%U() got an unexpected "
+                         "keyword argument '%S'",
                          co->co_name,
                          keyword);
-                goto fail;
-            }
-            Py_INCREF(value);
-            SETLOCAL(j, value);
+            goto fail;
         }
-        if (co->co_kwonlyargcount > 0) {
-            for (i = co->co_argcount; i < total_args; i++) {
-                PyObject *name;
-                if (GETLOCAL(i) != NULL)
-                    continue;
-                name = PyTuple_GET_ITEM(co->co_varnames, i);
-                if (kwdefs != NULL) {
-                    PyObject *def = PyDict_GetItem(kwdefs, name);
-                    if (def) {
-                        Py_INCREF(def);
-                        SETLOCAL(i, def);
-                        continue;
-                    }
-                }
-                PyErr_Format(PyExc_TypeError,
-                    "%U() needs keyword-only argument %S",
-                    co->co_name, name);
-                goto fail;
-            }
+        PyDict_SetItem(kwdict, keyword, value);
+        continue;
+      kw_found:
+        if (GETLOCAL(j) != NULL) {
+            PyErr_Format(PyExc_TypeError,
+                         "%U() got multiple "
+                         "values for argument '%S'",
+                         co->co_name,
+                         keyword);
+            goto fail;
         }
-        if (argcount < co->co_argcount) {
-            int m = co->co_argcount - defcount;
-            for (i = argcount; i < m; i++) {
-                if (GETLOCAL(i) == NULL) {
-                    int j, given = 0;
-                    for (j = 0; j < co->co_argcount; j++)
-                        if (GETLOCAL(j))
-                            given++;
-                    PyErr_Format(PyExc_TypeError,
-                        "%U() takes %s %d "
-                        "argument%s "
-                        "(%d given)",
-                        co->co_name,
-                        ((co->co_flags & CO_VARARGS) ||
-                         defcount) ? "at least"
-                                   : "exactly",
-                             m, m == 1 ? "" : "s", given);
-                    goto fail;
-                }
-            }
-            if (n > m)
-                i = n - m;
-            else
-                i = 0;
-            for (; i < defcount; i++) {
-                if (GETLOCAL(m+i) == NULL) {
-                    PyObject *def = defs[i];
-                    Py_INCREF(def);
-                    SETLOCAL(m+i, def);
-                }
-            }
-        }
+        Py_INCREF(value);
+        SETLOCAL(j, value);
     }
-    else if (argcount > 0 || kwcount > 0) {
-        PyErr_Format(PyExc_TypeError,
-                     "%U() takes no arguments (%d given)",
-                     co->co_name,
-                     argcount + kwcount);
+    if (argcount > co->co_argcount && !(co->co_flags & CO_VARARGS)) {
+        too_many_positional(co, argcount, defcount, fastlocals);
         goto fail;
     }
-    if (PyTuple_GET_SIZE(co->co_cellvars)) {
-        int i, j, nargs, found;
-        Py_UNICODE *cellname, *argname;
-        PyObject *c;
-
-        nargs = total_args;
-        if (co->co_flags & CO_VARARGS)
-            nargs++;
-        if (co->co_flags & CO_VARKEYWORDS)
-            nargs++;
-
-        for (i = 0; i < PyTuple_GET_SIZE(co->co_cellvars); ++i) {
-            cellname = PyUnicode_AS_UNICODE(
-                PyTuple_GET_ITEM(co->co_cellvars, i));
-            found = 0;
-            for (j = 0; j < nargs; j++) {
-                argname = PyUnicode_AS_UNICODE(
-                    PyTuple_GET_ITEM(co->co_varnames, j));
-                if (Py_UNICODE_strcmp(cellname, argname) == 0) {
-                    c = PyCell_New(GETLOCAL(j));
-                    if (c == NULL)
-                        goto fail;
-                    GETLOCAL(co->co_nlocals + i) = c;
-                    found = 1;
-                    break;
-                }
-            }
-            if (found == 0) {
-                c = PyCell_New(NULL);
-                if (c == NULL)
-                    goto fail;
-                SETLOCAL(co->co_nlocals + i, c);
+    if (argcount < co->co_argcount) {
+        int m = co->co_argcount - defcount;
+        int missing = 0;
+        for (i = argcount; i < m; i++)
+            if (GETLOCAL(i) == NULL)
+                missing++;
+        if (missing) {
+            missing_arguments(co, missing, defcount, fastlocals);
+            goto fail;
+        }
+        if (n > m)
+            i = n - m;
+        else
+            i = 0;
+        for (; i < defcount; i++) {
+            if (GETLOCAL(m+i) == NULL) {
+                PyObject *def = defs[i];
+                Py_INCREF(def);
+                SETLOCAL(m+i, def);
             }
         }
     }
-    if (PyTuple_GET_SIZE(co->co_freevars)) {
-        int i;
-        for (i = 0; i < PyTuple_GET_SIZE(co->co_freevars); ++i) {
-            PyObject *o = PyTuple_GET_ITEM(closure, i);
-            Py_INCREF(o);
-            freevars[PyTuple_GET_SIZE(co->co_cellvars) + i] = o;
+    if (co->co_kwonlyargcount > 0) {
+        int missing = 0;
+        for (i = co->co_argcount; i < total_args; i++) {
+            PyObject *name;
+            if (GETLOCAL(i) != NULL)
+                continue;
+            name = PyTuple_GET_ITEM(co->co_varnames, i);
+            if (kwdefs != NULL) {
+                PyObject *def = PyDict_GetItem(kwdefs, name);
+                if (def) {
+                    Py_INCREF(def);
+                    SETLOCAL(i, def);
+                    continue;
+                }
+            }
+            missing++;
         }
+        if (missing) {
+            missing_arguments(co, missing, -1, fastlocals);
+            goto fail;
+        }
+    }
+
+    for (i = 0; i < PyTuple_GET_SIZE(co->co_cellvars); ++i) {
+        PyObject *c;
+        int arg;
+
+        if (co->co_cell2arg != NULL &&
+            (arg = co->co_cell2arg[i]) != CO_CELL_NOT_AN_ARG)
+            c = PyCell_New(GETLOCAL(arg));
+        else
+            c = PyCell_New(NULL);
+        if (c == NULL)
+            goto fail;
+        SETLOCAL(co->co_nlocals + i, c);
+    }
+    for (i = 0; i < PyTuple_GET_SIZE(co->co_freevars); ++i) {
+        PyObject *o = PyTuple_GET_ITEM(closure, i);
+        Py_INCREF(o);
+        freevars[PyTuple_GET_SIZE(co->co_cellvars) + i] = o;
     }
 
     if (co->co_flags & CO_GENERATOR) {
@@ -1334,18 +1442,18 @@ _cc_EvalCode(PyObject *_co, PyObject *globals, PyObject *locals) {
 #define POP() (*items++)
 
 static PyObject *_make_function(int makeclosure,unsigned int arg,PyObject **items) {
-    PyObject *val;
-    PyObject *key;
-    PyObject *func;
+    PyObject *val, *key, *func, *qname;
     int r;
     int posdefaults = arg & 0xff;
     int kwdefaults = (arg>>8) & 0xff;
     int num_annotations = (arg >> 16) & 0x7fff;
 
 
+    qname = POP();
     val = POP();
-    func = PyFunction_New(val, PyEval_GetGlobals());
+    func = PyFunction_NewWithQualName(val,PyEval_GetGlobals(),qname);
     Py_DECREF(val);
+    Py_DECREF(qname);
 
     if(!func) goto fail_closure;
 
@@ -1577,6 +1685,13 @@ _do_raise(PyObject *exc, PyObject *cause)
         value = PyObject_CallObject(exc, NULL);
         if (value == NULL)
             goto raise_error;
+        if (!PyExceptionInstance_Check(value)) {
+            PyErr_Format(PyExc_TypeError,
+                         "calling %R should have returned an instance of "
+                         "BaseException, not %R",
+                         type, Py_TYPE(value));
+            goto raise_error;
+        }
     }
     else if (PyExceptionInstance_Check(exc)) {
         value = exc;
@@ -1601,6 +1716,10 @@ _do_raise(PyObject *exc, PyObject *cause)
         else if (PyExceptionInstance_Check(cause)) {
             fixed_cause = cause;
         }
+        else if (cause == Py_None) {
+            Py_DECREF(cause);
+            fixed_cause = NULL;
+        }
         else {
             PyErr_SetString(PyExc_TypeError,
                             "exception causes must derive from "
@@ -1622,40 +1741,32 @@ raise_error:
     return NULL;
 }
 
-static int import_all_from(PyFrameObject *f, PyObject *v)
+static int
+import_all_from(PyObject *locals, PyObject *v)
 {
-    PyObject *locals;
-    PyObject *all;
+    _Py_IDENTIFIER(__all__);
+    _Py_IDENTIFIER(__dict__);
+    PyObject *all = _PyObject_GetAttrId(v, &PyId___all__);
     PyObject *dict, *name, *value;
     int skip_leading_underscores = 0;
-    int pos;
-    int err = -1;
-
-    PyFrame_FastToLocals(f);
-    if ((locals = f->f_locals) == NULL) {
-        PyErr_SetString(PyExc_SystemError,
-                        "no locals found during 'import *'");
-        goto all_err;
-    }
-
-    all = PyObject_GetAttrString(v, "__all__");
+    int pos, err;
 
     if (all == NULL) {
         if (!PyErr_ExceptionMatches(PyExc_AttributeError))
-            goto all_err;
+            return -1;
         PyErr_Clear();
-        dict = PyObject_GetAttrString(v, "__dict__");
+        dict = _PyObject_GetAttrId(v, &PyId___dict__);
         if (dict == NULL) {
             if (!PyErr_ExceptionMatches(PyExc_AttributeError))
-                goto all_err;
+                return -1;
             PyErr_SetString(PyExc_ImportError,
             "from-import-* object has no __dict__ and no __all__");
-            goto all_err;
+            return -1;
         }
         all = PyMapping_Keys(dict);
         Py_DECREF(dict);
         if (all == NULL)
-            goto all_err;
+            return -1;
         skip_leading_underscores = 1;
     }
 
@@ -1670,7 +1781,8 @@ static int import_all_from(PyFrameObject *f, PyObject *v)
         }
         if (skip_leading_underscores &&
             PyUnicode_Check(name) &&
-            PyUnicode_AS_UNICODE(name)[0] == '_')
+            PyUnicode_READY(name) != -1 &&
+            PyUnicode_READ_CHAR(name, 0) == '_')
         {
             Py_DECREF(name);
             continue;
@@ -1688,10 +1800,6 @@ static int import_all_from(PyFrameObject *f, PyObject *v)
             break;
     }
     Py_DECREF(all);
-all_err:
-    PyFrame_LocalsToFast(f, 0);
-    Py_DECREF(v);
-
     return err;
 }
 
@@ -1749,12 +1857,12 @@ _function_call(PyObject *func, PyObject *arg, PyObject *kw)
 }
 
 static PyObject *
-special_lookup(PyObject *o, char *meth, PyObject **cache)
+special_lookup(PyObject *o, _Py_Identifier *id)
 {
     PyObject *res;
-    res = _PyObject_LookupSpecial(o, meth, cache);
+    res = _PyObject_LookupSpecial(o, id);
     if (res == NULL && !PyErr_Occurred()) {
-        PyErr_SetObject(PyExc_AttributeError, *cache);
+        PyErr_SetObject(PyExc_AttributeError, id->object);
         return NULL;
     }
     return res;
@@ -1808,6 +1916,7 @@ call_exc_trace(Py_tracefunc func, PyObject *self, PyFrameObject *f)
         value = Py_None;
         Py_INCREF(value);
     }
+    PyErr_NormalizeException(&type, &value, &traceback);
     arg = PyTuple_Pack(3, type, value, traceback);
     if (arg == NULL) {
         PyErr_Restore(type, value, traceback);
@@ -1828,15 +1937,7 @@ static PyObject *
 unicode_concatenate(PyObject *v, PyObject *w, PyFrameObject *f,
                     unsigned char next_instr, int instr_arg)
 {
-    Py_ssize_t v_len = PyUnicode_GET_SIZE(v);
-    Py_ssize_t w_len = PyUnicode_GET_SIZE(w);
-    Py_ssize_t new_len = v_len + w_len;
-    if (new_len < 0) {
-        PyErr_SetString(PyExc_OverflowError,
-                        "strings are too large to concat");
-        return NULL;
-    }
-
+    PyObject *res;
     if (Py_REFCNT(v) == 2) {
         switch (next_instr) {
         case STORE_FAST:
@@ -1870,28 +1971,16 @@ unicode_concatenate(PyObject *v, PyObject *w, PyFrameObject *f,
         }
         }
     }
-
-    if (Py_REFCNT(v) == 1 && !PyUnicode_CHECK_INTERNED(v)) {
-        if (PyUnicode_Resize(&v, new_len) != 0) {
-            return NULL;
-        }
-
-        memcpy(PyUnicode_AS_UNICODE(v) + v_len,
-               PyUnicode_AS_UNICODE(w), w_len*sizeof(Py_UNICODE));
-        return v;
-    }
-    else {
-        w = PyUnicode_Concat(v, w);
-        Py_DECREF(v);
-        return w;
-    }
+    res = v;
+    PyUnicode_Append(&res, w);
+    return res;
 }
 
 
 static int _print_expr(PyObject *expr) {
     PyObject *args, *hook, *eval_ret;
     int ret = 0;
-    
+
     if(!(hook = PySys_GetObject("displayhook"))) {
         PyErr_SetString(PyExc_RuntimeError,"lost sys.displayhook");
         ret = -1;
@@ -1907,7 +1996,7 @@ static int _print_expr(PyObject *expr) {
         ret = -1;
         goto err2;
     }
-    
+
     Py_DECREF(eval_ret);
 err2:
     Py_DECREF(args);
@@ -1916,10 +2005,40 @@ err1:
     return ret;
 }
 
+static PyObject *_load_build_class(PyObject *f_builtins) {
+    PyObject *x;
+    _Py_IDENTIFIER(__build_class__);
 
-/* The following are modified functions from Objects/genobject.c: */
+    if (PyDict_CheckExact(f_builtins)) {
+        x = _PyDict_GetItemId(f_builtins, &PyId___build_class__);
+        if (x == NULL) {
+            PyErr_SetString(PyExc_NameError,
+                            "__build_class__ not found");
+            return NULL;
+        }
+        Py_INCREF(x);
+    }
+    else {
+        PyObject *build_class_str = _PyUnicode_FromId(&PyId___build_class__);
+        if (build_class_str == NULL)
+            return NULL;
+        x = PyObject_GetItem(f_builtins, build_class_str);
+        if (x == NULL) {
+            if (PyErr_ExceptionMatches(PyExc_KeyError))
+                PyErr_SetString(PyExc_NameError,
+                                "__build_class__ not found");
+            return NULL;
+        }
+    }
+    return x;
+}
 
-static PyObject *gen_send_ex(PyGenObject *gen, PyObject *arg, int exc)
+
+/* The following is from Objects/genobject.c. gen_send_ex is modified to use
+   call_ccode_or_evalframe istead of PyEval_EvalFrameEx. */
+
+static PyObject *
+gen_send_ex(PyGenObject *gen, PyObject *arg, int exc)
 {
     PyThreadState *tstate = PyThreadState_GET();
     PyFrameObject *f = gen->gi_frame;
@@ -1930,7 +2049,7 @@ static PyObject *gen_send_ex(PyGenObject *gen, PyObject *arg, int exc)
                         "generator already executing");
         return NULL;
     }
-    if (f==NULL || f->f_stacktop == NULL) {
+    if (f == NULL || f->f_stacktop == NULL) {
         if (arg && !exc)
             PyErr_SetNone(PyExc_StopIteration);
         return NULL;
@@ -1960,16 +2079,33 @@ static PyObject *gen_send_ex(PyGenObject *gen, PyObject *arg, int exc)
     assert(f->f_back == tstate->frame);
     Py_CLEAR(f->f_back);
 
-    if (result == Py_None && f->f_stacktop == NULL) {
-        Py_DECREF(result);
-        result = NULL;
-        if (arg)
+    if (result && f->f_stacktop == NULL) {
+        if (result == Py_None) {
             PyErr_SetNone(PyExc_StopIteration);
+        } else {
+            PyObject *e = PyObject_CallFunctionObjArgs(
+                               PyExc_StopIteration, result, NULL);
+            if (e != NULL) {
+                PyErr_SetObject(PyExc_StopIteration, e);
+                Py_DECREF(e);
+            }
+        }
+        Py_CLEAR(result);
     }
 
     if (!result || f->f_stacktop == NULL) {
-        Py_DECREF(f);
+        PyObject *t, *v, *tb;
+        t = f->f_exc_type;
+        v = f->f_exc_value;
+        tb = f->f_exc_traceback;
+        f->f_exc_type = NULL;
+        f->f_exc_value = NULL;
+        f->f_exc_traceback = NULL;
+        Py_XDECREF(t);
+        Py_XDECREF(v);
+        Py_XDECREF(tb);
         gen->gi_frame = NULL;
+        Py_DECREF(f);
     }
 
     return result;
@@ -1981,11 +2117,69 @@ gen_send(PyGenObject *gen, PyObject *arg)
     return gen_send_ex(gen, arg, 0);
 }
 
+static PyObject *gen_close(PyGenObject *gen, PyObject *args);
+
+static int
+gen_close_iter(PyObject *yf)
+{
+    PyObject *retval = NULL;
+    _Py_IDENTIFIER(close);
+
+    if (PyGen_CheckExact(yf)) {
+        retval = gen_close((PyGenObject *)yf, NULL);
+        if (retval == NULL)
+            return -1;
+    } else {
+        PyObject *meth = _PyObject_GetAttrId(yf, &PyId_close);
+        if (meth == NULL) {
+            if (!PyErr_ExceptionMatches(PyExc_AttributeError))
+                PyErr_WriteUnraisable(yf);
+            PyErr_Clear();
+        } else {
+            retval = PyObject_CallFunction(meth, "");
+            Py_DECREF(meth);
+            if (retval == NULL)
+                return -1;
+        }
+    }
+    Py_XDECREF(retval);
+    return 0;
+}
+
+static PyObject *
+gen_yf(PyGenObject *gen)
+{
+    PyObject *yf = NULL;
+    PyFrameObject *f = gen->gi_frame;
+
+    if (f && f->f_stacktop) {
+        PyObject *bytecode = f->f_code->co_code;
+        unsigned char *code = (unsigned char *)PyBytes_AS_STRING(bytecode);
+
+        if (code[f->f_lasti + 1] != YIELD_FROM)
+            return NULL;
+        yf = f->f_stacktop[-1];
+        Py_INCREF(yf);
+    }
+
+    return yf;
+}
+
 static PyObject *
 gen_close(PyGenObject *gen, PyObject *args)
 {
     PyObject *retval;
-    PyErr_SetNone(PyExc_GeneratorExit);
+    PyObject *yf = gen_yf(gen);
+    int err = 0;
+
+    if (yf) {
+        gen->gi_running = 1;
+        err = gen_close_iter(yf);
+        gen->gi_running = 0;
+        Py_DECREF(yf);
+    }
+    if (err == 0)
+        PyErr_SetNone(PyExc_GeneratorExit);
     retval = gen_send_ex(gen, Py_None, 1);
     if (retval) {
         Py_DECREF(retval);
@@ -1994,8 +2188,7 @@ gen_close(PyGenObject *gen, PyObject *args)
         return NULL;
     }
     if (PyErr_ExceptionMatches(PyExc_StopIteration)
-        || PyErr_ExceptionMatches(PyExc_GeneratorExit))
-    {
+        || PyErr_ExceptionMatches(PyExc_GeneratorExit)) {
         PyErr_Clear();
         Py_INCREF(Py_None);
         return Py_None;
@@ -2009,12 +2202,65 @@ gen_throw(PyGenObject *gen, PyObject *args)
     PyObject *typ;
     PyObject *tb = NULL;
     PyObject *val = NULL;
+    PyObject *yf = gen_yf(gen);
+    _Py_IDENTIFIER(throw);
 
     if (!PyArg_UnpackTuple(args, "throw", 1, 3, &typ, &val, &tb))
         return NULL;
 
-    if (tb == Py_None)
+    if (yf) {
+        PyObject *ret;
+        int err;
+        if (PyErr_GivenExceptionMatches(typ, PyExc_GeneratorExit)) {
+            gen->gi_running = 1;
+            err = gen_close_iter(yf);
+            gen->gi_running = 0;
+            Py_DECREF(yf);
+            if (err < 0)
+                return gen_send_ex(gen, Py_None, 1);
+            goto throw_here;
+        }
+        if (PyGen_CheckExact(yf)) {
+            gen->gi_running = 1;
+            ret = gen_throw((PyGenObject *)yf, args);
+            gen->gi_running = 0;
+        } else {
+            PyObject *meth = _PyObject_GetAttrId(yf, &PyId_throw);
+            if (meth == NULL) {
+                if (!PyErr_ExceptionMatches(PyExc_AttributeError)) {
+                    Py_DECREF(yf);
+                    return NULL;
+                }
+                PyErr_Clear();
+                Py_DECREF(yf);
+                goto throw_here;
+            }
+            gen->gi_running = 1;
+            ret = PyObject_CallObject(meth, args);
+            gen->gi_running = 0;
+            Py_DECREF(meth);
+        }
+        Py_DECREF(yf);
+        if (!ret) {
+            PyObject *val;
+            ret = *(--gen->gi_frame->f_stacktop);
+            assert(ret == yf);
+            Py_DECREF(ret);
+            gen->gi_frame->f_lasti++;
+            if (_PyGen_FetchStopIterationValue(&val) == 0) {
+                ret = gen_send_ex(gen, val, 0);
+                Py_DECREF(val);
+            } else {
+                ret = gen_send_ex(gen, Py_None, 1);
+            }
+        }
+        return ret;
+    }
+
+throw_here:
+    if (tb == Py_None) {
         tb = NULL;
+    }
     else if (tb != NULL && !PyTraceBack_Check(tb)) {
         PyErr_SetString(PyExc_TypeError,
             "throw() third argument must be a traceback object");
@@ -2025,9 +2271,8 @@ gen_throw(PyGenObject *gen, PyObject *args)
     Py_XINCREF(val);
     Py_XINCREF(tb);
 
-    if (PyExceptionClass_Check(typ)) {
+    if (PyExceptionClass_Check(typ))
         PyErr_NormalizeException(&typ, &val, &tb);
-    }
 
     else if (PyExceptionInstance_Check(typ)) {
         if (val && val != Py_None) {
@@ -2040,13 +2285,16 @@ gen_throw(PyGenObject *gen, PyObject *args)
             val = typ;
             typ = PyExceptionInstance_Class(typ);
             Py_INCREF(typ);
+
+            if (tb == NULL)
+                tb = PyException_GetTraceback(val);
         }
     }
     else {
         PyErr_Format(PyExc_TypeError,
                      "exceptions must be classes or instances "
                      "deriving from BaseException, not %s",
-                     typ->ob_type->tp_name);
+                     Py_TYPE(typ)->tp_name);
             goto failed_throw;
     }
 
@@ -2068,21 +2316,23 @@ gen_iternext(PyGenObject *gen)
 
 
 
-static PyObject *exit_cache = NULL;
-static PyObject *enter_cache = NULL;
-
-
-
 /* Py_EnterRecursiveCall and Py_LeaveRecursiveCall are somewhat complicated
  * macros so they are wrapped in the following two functions */
 
-static int _EnterRecursiveCall(char *where) {
-    return Py_EnterRecursiveCall(where);
+static int _EnterRecursiveCall(void) {
+    return Py_EnterRecursiveCall("");
 }
 
 static void _LeaveRecursiveCall(void) {
     Py_LeaveRecursiveCall();
 }
+
+
+
+_Py_IDENTIFIER(__import__);
+_Py_IDENTIFIER(__enter__);
+_Py_IDENTIFIER(__exit__);
+
 
 
 static PyMethodDef functions[] = {
@@ -2195,11 +2445,14 @@ static OffsetStruct member_offsets[] = {
 
 PyMODINIT_FUNC
 PyInit_pyinternals(void) {
+    /* in case any members were added to PyCodeObject that we missed */
+    assert(offsetof(CodeObjectWithCCode,co_weakreflist) == offsetof(PyCodeObject,co_weakreflist));
+
     PyObject *m, *addrs, *m_offsets, *m_dict, *tmp;
     OffsetStruct *structs;
     OffsetMember *members;
     int ret, i;
-    
+
     if(PyType_Ready(&CompiledCodeType) < 0) return NULL;
 
     m = PyModule_Create(&this_module);
@@ -2231,7 +2484,7 @@ PyInit_pyinternals(void) {
         }
     }
 
-    
+
     if(!(addrs = PyDict_New())) return NULL;
     if(PyModule_AddObject(m,"raw_addresses",addrs) == -1) return NULL;
 
@@ -2243,6 +2496,8 @@ PyInit_pyinternals(void) {
         ADD_ADDR(PyDict_SetItem),
         ADD_ADDR(PyDict_GetItemString),
         ADD_ADDR(_PyDict_NewPresized),
+        ADD_ADDR(_PyDict_LoadGlobal),
+        ADD_ADDR(_PyDict_GetItemId),
         ADD_ADDR(PyObject_GetItem),
         ADD_ADDR(PyObject_SetItem),
         ADD_ADDR(PyObject_DelItem),
@@ -2322,7 +2577,8 @@ PyInit_pyinternals(void) {
         ADD_ADDR(unicode_concatenate),
         ADD_ADDR(ext_do_call),
         ADD_ADDR(_print_expr),
-    
+        ADD_ADDR(_load_build_class),
+
         ADD_ADDR(Py_True),
         ADD_ADDR(Py_False),
         ADD_ADDR(Py_None),
@@ -2351,11 +2607,9 @@ PyInit_pyinternals(void) {
         ADD_ADDR(IMPORT_NOT_FOUND_MSG),
         ADD_ADDR(BAD_EXCEPTION_MSG),
         ADD_ADDR_STR("__build_class__"),
-        ADD_ADDR_STR("__import__"),
-        ADD_ADDR_STR("__exit__"),
-        ADD_ADDR_STR("__enter__"),
-        ADD_ADDR_OF(exit_cache),
-        ADD_ADDR_OF(enter_cache)
+        ADD_ADDR_OF(PyId___import__),
+        ADD_ADDR_OF(PyId___exit__),
+        ADD_ADDR_OF(PyId___enter__)
     };
 
     for(i=0; i<sizeof(addr_records)/sizeof(AddrRec); ++i) {
@@ -2364,7 +2618,7 @@ PyInit_pyinternals(void) {
         Py_DECREF(tmp);
         if(ret == -1) return NULL;
     }
-    
+
     Py_INCREF(&CompiledCodeType);
     if(PyModule_AddObject(m,"CompiledCode",(PyObject*)&CompiledCodeType) == -1) return NULL;
 
@@ -2377,7 +2631,7 @@ PyInit_pyinternals(void) {
     backup_and_set(old_gen_throw,(PyCFunction)gen_throw,PyGen_Type.tp_methods[1].ml_meth);
     backup_and_set(old_gen_close,(PyCFunction)gen_close,PyGen_Type.tp_methods[2].ml_meth);
     backup_and_set(old_gen_iternext,(iternextfunc)gen_iternext,PyGen_Type.tp_iternext);
-    
+
     return m;
 }
 

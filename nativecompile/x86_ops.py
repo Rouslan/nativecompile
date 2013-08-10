@@ -96,10 +96,11 @@ class Address:
         return None
     
     def _sib(self):
-        return bytes([
-            ({1:0,2:1,4:2,8:3}[self.scale] << 6) | 
-            ((self.index.reg if self.index else 0b100) << 3) | 
-            (self.base.reg if self.base else 0b101)])
+        r = (((self.index.reg if self.index else 0b100) << 3) | 
+            (self.base.reg if self.base else 0b101))
+        if self.index:
+            r |= {1:0,2:1<<6,4:2<<6,8:3<<6}[self.scale]
+        return bytes([r])
     
     def _mod_rm_sib_disp(self):
         if self.index or (self.base and self.base.reg == 0b100):
@@ -134,9 +135,10 @@ class Address:
         return bytes([(mod << 6) | (mid << 3) | rm]) + extra
     
     def __str__(self):
-        if self.scale != 1:
-            return '{}({},{},{})'.format(hex(self.offset) if self.offset else '',self.base or '',self.index,self.scale)
         if self.index is not None:
+            if self.scale != 1:
+                return '{}({},{},{})'.format(hex(self.offset) if self.offset else '',self.base or '',self.index,self.scale)
+ 
             return '{}({},{})'.format(hex(self.offset) if self.offset else '',self.base or '',self.index)
         if self.base is not None:
             return '{}({})'.format(hex(self.offset) if self.offset else '',self.base)

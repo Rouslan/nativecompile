@@ -270,7 +270,7 @@ a = [1,2,3]
 b = {'a':'A','b':'B','c':'C'}
 def f(*args,**kwds):
   print(args)
-  print(kwds)
+  print(sorted(kwds.items(),key=lambda x: x[0]))
 
 f(*a)
 f(**b)
