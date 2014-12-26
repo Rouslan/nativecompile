@@ -1,5 +1,5 @@
 
-from . multimethod import multimethod
+from . multimethod import mmtype,multimethod
 from . import x86_ops
 from .x86_ops import (
     TEST_MNEMONICS,Displacement,Test,AsmSequence,al,cl,dl,bl,eax,ecx,edx,ebx,
@@ -160,8 +160,8 @@ def mov(a : int,b : Register):
 
 mov.inherit(x86_ops.mov)
 
-@multimethod
-def movq(a : int,b : Address):
+def movq(a,b):
+    assert mmtype(b.__class__) is x86_ops.Address
     return x86_ops.mov_imm_addr(a,b,SIZE_Q)
 
 

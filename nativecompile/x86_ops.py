@@ -8,7 +8,7 @@ import binascii
 import copy
 from functools import partial
 
-from .multimethod import multimethod
+from .multimethod import mmtype,multimethod
 
 
 SIZE_B = 0 # SIZE_B must evaluate to False
@@ -28,12 +28,17 @@ def int_to_8(x):
     return x.to_bytes(1,byteorder='little',signed=True)
 
 def immediate_data(w,data):
-    return data.to_bytes(4 if w else 1,byteorder='little',signed=data<0)
+    w = 4 if w else 1
+    if isinstance(data,bytes):
+        assert len(data) == w
+        return data
+    return data.to_bytes(w,byteorder='little',signed=data<0)
 
 
 
 class Register:
     def __init__(self,size,code):
+        assert size in (SIZE_B,SIZE_D,SIZE_Q) and isinstance(code,int)
         self.size = size
         self.code = code
 
@@ -60,6 +65,9 @@ class Register:
             return self.size != b.size or self.code != b.code
         
         return NotImplemented
+    
+    def __hash__(self):
+        return self.code | (self.size << 4)
 
     @property
     def name(self):
@@ -68,6 +76,9 @@ class Register:
             ['al','cl','dl','bl','ah','ch','dh','bh'],
             ['eax','ecx','edx','ebx','esp','ebp','esi','edi']
         ][self.size][self.reg]
+    
+    def __repr__(self):
+        return 'Register({},{})'.format(self.size,self.code)
 
     def __str__(self):
         return '%' + self.name
@@ -88,6 +99,27 @@ class Address:
         self.base = base
         self.index = index
         self.scale = scale
+    
+    def __eq__(self,b):
+        if isinstance(b,Address):
+            return (self.offset == b.offset
+                and self.base == b.base
+                and self.index == b.index
+                and self.scale == b.scale)
+        
+        return NotImplemented
+    
+    def __ne__(self,b):
+        if isinstance(b,Address):
+            return (self.offset != b.offset
+                or self.base != b.base
+                or self.index != b.index
+                or self.scale != b.scale)
+        
+        return NotImplemented
+    
+    def __hash__(self):
+        return self.offset ^ hash(self.base) ^ hash(self.index) ^ self.scale
 
     @property
     def size(self):
@@ -173,13 +205,24 @@ Address.__mmtype__ = Address
 class Displacement:
     """A displacement relative to the next instruction.
     
-    This class exists to make it clear that a given op code treats a value as a
-    displacement and not an absolute address.
+    This class exists to make it clear that a given op code treats a value as
+    a displacement and not an absolute address.
     
     """
     def __init__(self,value,force_full_size=False):
         self.val = value
         self.force_full_size = force_full_size
+    
+    def __eq__(self,b):
+        if isinstance(b,Displacement):
+            return self.val == b.val and self.force_full_size == b.force_full_size
+    
+    def __ne__(self,b):
+        if isinstance(b,Displacement):
+            return self.val != b.val or self.force_full_size != b.force_full_size
+    
+    def __hash__(self):
+        return self.val ^ self.force_full_size
 
 
 def fits_in_sbyte(x):
@@ -247,9 +290,15 @@ class Test:
         
         return NotImplemented
     
+    def __hash__(self):
+        return self.val
+    
     @property
     def mnemonic(self):
         return TEST_MNEMONICS[self.val][0]
+    
+    def __repr__(self):
+        return 'Test({})'.format(self.val)
 
 
 
@@ -322,10 +371,13 @@ class Assembly:
     def op(self,name,*args):
         return AsmSequence([(self.binary(name)(*args),name,args)])
 
-    def binary(self,name):
+    @staticmethod
+    def binary(name):
         return globals()[name]
     
     def __getattr__(self,name):
+        b = self.binary(name)
+        if not callable(b): return b
         return partial(self.op,name)
     
     def jcc(self,test,x):
@@ -423,8 +475,8 @@ def _op_imm_addr(byte1,mid,a,b,size):
 
 
 
-# Some functions are decorated with @multimethod even though they only have one
-# version. This is to have consistent type-checking.
+# Some functions are decorated with @multimethod even though they only have
+# one version. This is to have consistent type-checking.
 
 
 @multimethod
@@ -666,12 +718,12 @@ def mov(a : int,b : Register):
 def mov_imm_addr(a,b,size):
     return rex(size,b) + bytes([0b11000110 | bool(size)]) + b.mod_rm_sib_disp(0) + immediate_data(bool(size),a)
 
-@multimethod
-def movb(a : int,b : Address):
+def movb(a,b):
+    assert mmtype(b.__class__) is Address
     return mov_imm_addr(a,b,SIZE_B)
 
-@multimethod
-def movl(a : int,b : Address):
+def movl(a,b):
+    assert mmtype(b.__class__) is Address
     return mov_imm_addr(a,b,SIZE_D)
 
 

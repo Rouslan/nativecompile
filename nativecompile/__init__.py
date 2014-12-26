@@ -1,3 +1,3 @@
 
-from .compile import *
+from .compile import compile
 

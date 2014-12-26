@@ -8,8 +8,8 @@ registry = {}
 
 
 # Since this implementation doesn't match derived types to base types, a class
-# can define __mmtype__ to specifiy what type it is a substitute for (it's not a
-# complete solution but it's enough for this package).
+# can define __mmtype__ to specifiy what type it is a substitute for (it's not
+# a complete solution but it's enough for this package).
 def mmtype(x):
     return getattr(x,'__mmtype__',x)
 

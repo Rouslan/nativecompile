@@ -47,7 +47,7 @@ def enc_sleb128(x):
     while more:
         b = x & 0x7f
         x >>= 7
-        if (x and not b & 0x40) or (x == -1 and b & 0x40):
+        if (x == 0 and not b & 0x40) or (x == -1 and b & 0x40):
             more = False
         else:
             b |= 0x80
@@ -837,6 +837,7 @@ class DebugInfo:
             mapping[ll] = out.tell() - baseloc
 
             for start,end,expr in ll.values(op):
+                assert end >= start
                 # these addresses are not supposed to be absolute addresses
                 # even in an in-memory object file
                 out.write(self.mode.enc_int(start))
