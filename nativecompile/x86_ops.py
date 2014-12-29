@@ -312,13 +312,27 @@ def asm_str(indirect,nextaddr,x):
         return '*'+str(x)
     return str(x)
 
+class AsmOp:
+    __slots__ = ('binary','name','args','annot')
+    
+    def __init__(self,binary,name,args,annot=''):
+        self.binary = binary
+        self.name = name
+        self.args = args
+        self.annot = annot
+
+class AsmComment:
+    __slots__ = ('message',)
+    
+    def __init__(self,message):
+        self.message = message
 
 class AsmSequence:
     def __init__(self,ops=None):
         self.ops = ops or []
     
     def __len__(self):
-        return sum(len(op[0]) for op in self.ops)
+        return sum(len(op.binary) for op in self.ops if type(op) is AsmOp)
     
     def __add__(self,b):
         if isinstance(b,AsmSequence):
@@ -349,18 +363,19 @@ class AsmSequence:
     def dump(self,base=0):
         lines = []
         addr = base
-        for bin,name,args in self.ops:
-            if name == '$COMMENT$':
-                lines.append('; {}\n'.format(args))
+        for op in self.ops:
+            if isinstance(op,AsmComment):
+                lines.append('; {}\n'.format(op.message))
             else:
-                indirect = name == 'call' or name == 'jmp'
-                nextaddr = addr + len(bin)
+                indirect = op.name == 'call' or op.name == 'jmp'
+                nextaddr = addr + len(op.binary)
             
-                lines.append('{:8x}: {:20}{:8} {}\n'.format(
+                lines.append('{:8x}: {:20}{:8} {}{}\n'.format(
                     addr,
-                    binascii.hexlify(bin).decode(),
-                    name,
-                    ', '.join(asm_str(indirect,nextaddr,arg) for arg in args) ))
+                    binascii.hexlify(op.binary).decode(),
+                    op.name,
+                    ', '.join(asm_str(indirect,nextaddr,arg) for arg in op.args),
+                    op.annot and '  ; '+op.annot))
                 
                 addr = nextaddr
         
@@ -368,28 +383,32 @@ class AsmSequence:
 
 
 class Assembly:
-    def op(self,name,*args):
-        return AsmSequence([(self.binary(name)(*args),name,args)])
-
     @staticmethod
-    def binary(name):
-        return globals()[name]
+    def namespace():
+        return globals()
     
+    def op(self,name,*args):
+        return AsmSequence([AsmOp(self.namespace()[name](*args),name,args)])
+
     def __getattr__(self,name):
-        b = self.binary(name)
+        b = self.namespace()[name]
         if not callable(b): return b
         return partial(self.op,name)
     
     def jcc(self,test,x):
-        return AsmSequence([(self.binary('jcc')(test,x),'j'+test.mnemonic,(x,))])
+        return AsmSequence([AsmOp(self.namespace()['jcc'](test,x),'j'+test.mnemonic,(x,))])
 
     def comment(self,comm):
-        return AsmSequence([(b'','$COMMENT$',comm)])
+        return AsmSequence([AsmComment(comm)])
 
     def with_new_imm_dword(self,op,imm):
         assert len(op.ops) == 1
-        bin,name,args = op.ops[0]
-        return AsmSequence([(with_new_imm_dword(bin,imm),name,(imm,args[1]))])
+        
+        old = op.ops[0]
+        
+        assert isinstance(old,AsmOp) and len(old.args) == 2
+        
+        return AsmSequence([AsmOp(with_new_imm_dword(old.binary,imm),old.name,(imm,old.args[1]),old.annot)])
 
 
 

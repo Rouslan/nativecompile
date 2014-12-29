@@ -1,4 +1,5 @@
 
+import sys
 import operator
 import warnings
 import itertools
@@ -162,8 +163,16 @@ def type_of(r):
 def type_flags_of(r):
     return CType('PyTypeObject',r).tp_flags
 
-def tuple_item(r,n):
-    return CType('PyTupleObject',r).ob_item + PTR_SIZE * n
+
+class TupleItem(StitchValue):
+    def __init__(self,r,n):
+        self.addr = CType('PyTupleObject',r).ob_item
+        self.n = n
+    
+    def __call__(self,s):
+        return self.addr(s) + s.abi.ptr_size * self.n
+
+tuple_item = TupleItem
 
 
 class FrameAddr(StitchValue):
@@ -335,8 +344,43 @@ class JumpTarget:
     used = False
     displacement = None
 
-class DelayedCompileEarly:
-    pass
+
+if __debug__:
+    class SaveOrigin(type):
+        def __new__(cls,name,bases,namespace,**kwds):
+            old_init = namespace.get('__init__')
+            if old_init:
+                def __init__(self,*args,**kwds):
+                    old_init(self,*args,**kwds)
+                    
+                    # determine where this was defined
+                    f = sys._getframe(1)
+                    while f and f.f_code.co_filename == __file__: f = f.f_back
+                    
+                    if f: self._origin = (f.f_lineno,f.f_code.co_filename)
+                
+                namespace['__init__'] = __init__
+                
+                old_compile = namespace.get('compile')
+                if old_compile:
+                    def compile(self,displacement):
+                        try:
+                            return old_compile(self,displacement)
+                        except Exception as e:
+                            o = getattr(self,'_origin')
+                            if o:
+                                e.args += ('origin: {1}:{0}'.format(*o),)
+                            raise
+                    
+                    namespace['compile'] = compile
+            
+            return type.__new__(cls,name,bases,namespace)
+    
+    class DelayedCompileEarly(metaclass=SaveOrigin):
+        pass
+else:
+    class DelayedCompileEarly:
+        pass
 
 class JumpSource(DelayedCompileEarly):
     def __init__(self,op,abi,target):
@@ -423,15 +467,16 @@ class DeferredOffsetAddress(DeferredValue):
         self.scale = scale
     
     def __call__(self,abi):
-        return abi.Address(self.offset.realize(self.offset_arg),self.base,self.index,self.scale)
+        return abi.Address(self.offset.realize(self.offset_arg) * abi.ptr_size,self.base,self.index,self.scale)
 
 class DeferredOffset(DeferredValue):
-    def __init__(self,base,arg):
+    def __init__(self,base,arg,factor=1):
         self.base = base
         self.arg = arg
+        self.factor = factor
     
     def __call__(self,abi):
-        return self.base.realize(self.arg)
+        return self.base.realize(self.arg) * self.factor
 
 class DeferredOffsetBase(DeferredValue):
     def __init__(self):
@@ -599,6 +644,42 @@ class CountedValue(StitchValue):
     def borrow(self):
         return BorrowedValue(self) if self.owned else self
     
+    def steal(self,s):
+        # this test is needed because self.owned is not always assignable, but
+        # a value of True guarantees that it is
+        if self.owned:
+            self.owned = False
+        else:
+            s.incref(self)
+        
+        self.discard(s)
+    
+    def to_addr_movable_val(self,s):
+        """If this value is in an address, move it to a register and return the
+        new value object, otherwise return self.
+        
+        A MOV instruction can't have an address as both a source and
+        destination, so if eg: a value needs to be moved to an address and then
+        freed, calling this will make sure the value can be moved and wont need
+        to be loaded into a register a second time to decrement the reference
+        counter.
+        
+        """
+        
+        loc = self(s)
+        if isinstance(loc,(s.abi.Address,DeferredOffsetAddress)):
+            dest = RegValue(s,s.unused_reg(),self.owned)
+            s.mov(loc,dest)
+            
+            # this test is needed because self.owned is not always assignable,
+            # but a value of True guarantees that it is
+            if self.owned: self.owned = False
+            
+            self.discard(s)
+            return dest
+        
+        return self
+    
     if __debug__:
         def __del__(self):
             if getattr(self,'owned',False):
@@ -621,7 +702,7 @@ def stack_location(s,offset):
     # 1 is added to "offset" because the byte offset is relative to the end of
     # the stack (the final value is the size of the stack minus this value) and
     # a value of 0 would refer to an item after the end of the stack
-    return DeferredOffsetAddress(s.def_stack_offset,(offset + 1) * s.abi.ptr_size,s.abi.r_sp)
+    return DeferredOffsetAddress(s.def_stack_offset,offset + 1,s.abi.r_sp)
 
 class RawStackValue(StitchValue):
     """A miscellaneous value stored on the stack"""
@@ -670,10 +751,10 @@ class StackValue(RawStackValue,CountedValue):
 class RegValue(CountedValue):
     """A Python object stored in a register"""
     
-    def __init__(self,s,reg):
+    def __init__(self,s,reg,owned=True):
         reg = make_value(s,reg)
         assert reg not in s.state.used_regs
-        self.owned = True
+        self.owned = owned
         s.state.used_regs.add(reg)
         self.reg = reg
     
@@ -707,11 +788,14 @@ class ScratchValue(CountedValue):
     
     def discard(self,s):
         inreg = self.in_register(s)
-        if inreg: s.state.used_regs.remove(self.reg)
+        if inreg:
+            s.state.used_regs.remove(self.reg)
+            s.state.scratch.remove(CompareByIdWrapper(self))
 
         if self.owned:
             if inreg:
                 s.decref(self.reg)
+                if self.offset: s.state.stack[self.offset] = None
             else:
                 assert self.offset is not None
                 discard_stack_value(s,self.offset)
@@ -724,11 +808,24 @@ class ScratchValue(CountedValue):
         self.offset = offset
         return self
     
+    def reload_reg(self,s,r=None):
+        r = make_value(s,r)
+        
+        if not self.in_register(s):
+            self.reg = r or s.unused_reg()
+            s.state.used_regs.add(self.reg)
+            s.state.scratch.add(CompareByIdWrapper(self))
+            s.mov(stack_location(s,self.offset),self.reg)
+        else:
+            assert r is None or self.reg == r
+    
     def invalidate_scratch(self,s):
-        assert self.offset is None
-        s.new_stack_value(value_t=self._set_offset)
-        s.mov(self.reg,stack_location(s,self.offset))
         s.state.used_regs.remove(self.reg)
+        
+        if not self.offset:
+            s.new_stack_value(value_t=self._set_offset)
+        
+        s.mov(self.reg,stack_location(s,self.offset))
 
 def reg_or_scratch_value(s,r):
     """Return an instance of RegValue or ScratchValue depending on whether "r"
@@ -757,9 +854,13 @@ class ConstValue(CountedValue):
 
 class RegTemp:
     """A miscellaneous value stored in a register"""
-    def __init__(self,s,reg):
-        reg = make_value(s,reg)
-        assert reg not in s.state.used_regs
+    def __init__(self,s,reg=None):
+        if reg is not None:
+            reg = make_value(s,reg)
+            assert reg not in s.state.used_regs
+        else:
+            reg = s.unused_reg()
+        
         self._s = s
         s.state.used_regs.add(reg)
         self.reg = reg
@@ -960,7 +1061,7 @@ class Stitch:
         self.state.unreserved_offset = len(self.state.stack)
         
         if move_sp:
-            self.sub(DeferredOffset(self.def_stack_offset,len(self.state.stack) * self.abi.ptr_size),self.abi.r_sp)
+            self.sub(DeferredOffset(self.def_stack_offset,len(self.state.stack),self.abi.ptr_size),self.abi.r_sp)
 
         self(DeferredValueInstr(
             self.abi,
@@ -976,7 +1077,7 @@ class Stitch:
         assert self.state.unreserved_offset is not None
         
         (self
-            .add(DeferredOffset(self.def_stack_offset,self.state.unreserved_offset * self.abi.ptr_size),self.abi.r_sp)
+            .add(DeferredOffset(self.def_stack_offset,self.state.unreserved_offset,self.abi.ptr_size),self.abi.r_sp)
             .annotation(debug.EPILOG_START,self.state.unreserved_offset))
         
         self.state.stack = self.state.stack[0:self.state.unreserved_offset]
@@ -995,7 +1096,6 @@ class Stitch:
     
     def annotation(self,descr,stack=None):
         if stack is None: stack = len(self.state.stack)
-        stack *= self.abi.ptr_size
         return self.append(annot_with_comment(self.abi,descr,stack))
     
     def push_stack_prolog(self,reg,descr=None):
@@ -1012,7 +1112,7 @@ class Stitch:
         the arguments of the function about to be called.
 
         """
-        return self.abi.r_arg[n] if n < len(self.abi.r_arg) else DeferredOffsetAddress(self.def_stack_offset,-n * self.abi.stack_size,self.abi.r_sp)
+        return self.abi.r_arg[n] if n < len(self.abi.r_arg) else DeferredOffsetAddress(self.def_stack_offset,-n,self.abi.r_sp)
     
     def append(self,x,is_jmp=None):
         self.last_op_is_uncond_jmp = is_jmp
@@ -1111,6 +1211,14 @@ class Stitch:
 
     def comment(self,c,*args):
         return self.append(self.abi.comment(c,*args))
+    
+    def inline_comment(self,c):
+        assert self._code
+        if self.abi.assembly:
+            assert self._code[-1].ops and not self._code[-1].ops[-1].annot
+            self._code[-1].ops[-1].annot = c
+        
+        return self
     
     def unwind_handler(self,down_to=0):
         # since subsequent exception-unwinds overwrite previous exception-
@@ -1260,6 +1368,7 @@ class Stitch:
         return self.abi.r_arg[n] if n < len(self.abi.r_arg) else self._stack_arg_at(n)
 
     def push_arg(self,x,tempreg=None,n=None):
+        x = make_value(self,x)
         if not tempreg: tempreg = R_SCRATCH1
 
         if n is None:
@@ -1274,7 +1383,7 @@ class Stitch:
         else:
             dest = self._stack_arg_at(n)
 
-            if isinstance(x,Addr):
+            if isinstance(x,(self.abi.Address,DeferredOffsetAddress)):
                 self.mov(x,tempreg).mov(tempreg,dest)
             else:
                 self.mov(x,dest)
@@ -1290,7 +1399,8 @@ class Stitch:
         if isinstance(func,str):
             return (self
                 .mov(pyinternals.raw_addresses[func],R_RET)
-                .append(self.abi.op.call(self.abi.r_ret)))
+                .append(self.abi.op.call(self.abi.r_ret))
+                .inline_comment(func))
 
         return self.append(self.abi.op.call(func))
     

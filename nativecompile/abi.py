@@ -121,17 +121,14 @@ class Tuning:
 class Abi:
     def __init__(self,*,assembly=False):
         self.tuning = Tuning()
-        if assembly:
-            self._op = self._op.Assembly()
-            self.comment = lambda x,*args: [self._op.comment(x.format(*args) if args else x)]
+        self.assembly = assembly
     
-    @staticmethod
-    def comment(x,*args):
-        return []
+    def comment(self,x,*args):
+        return [self._op.Assembly().comment(x.format(*args) if args else x)] if self.assembly else []
     
     @property
     def op(self):
-        return OpAbstractor(self,self._op)
+        return OpAbstractor(self,self._op.Assembly() if self.assembly else self._op)
 
 class CdeclAbi(Abi):
     _op = x86_ops

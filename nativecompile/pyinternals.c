@@ -70,13 +70,11 @@
 #define BAD_EXCEPTION_MSG "'finally' pops bad exception"
 
 
-static void err_args(PyObject *func, int flags, int nargs);
 static int call_trace(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
                       int what, PyObject *arg);
 static int call_trace_protected(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
                                 int what, PyObject *arg);
 
-#define EXT_POP(STACK_POINTER) (*(STACK_POINTER)++)
 
 #define GETLOCAL(i)     (fastlocals[i])
 #define SETLOCAL(i, value)      do { PyObject *tmp = GETLOCAL(i); \
@@ -537,24 +535,108 @@ static PyObject *read_address(PyObject *self,PyObject *args) {
 }
 
 
+/* This function is based on ext_do_call from Python/ceval.c. This steals a
+   reference to args if it's not NULL. */
+static PyObject *append_tuple_for_call(PyObject *func,PyObject *args,PyObject *star) {
+    Py_ssize_t i, oldlen;
+    PyObject *tmp = NULL;
+    
+    if(!PyTuple_Check(star)) {
+        tmp = PySequence_Tuple(star);
+        if(!tmp) {
+            if(PyErr_ExceptionMatches(PyExc_TypeError)) {
+                PyErr_Format(PyExc_TypeError,
+                             "%.200s%.200s argument after * "
+                             "must be a sequence, not %.200s",
+                             PyEval_GetFuncName(func),
+                             PyEval_GetFuncDesc(func),
+                             star->ob_type->tp_name);
+            }
+            Py_XDECREF(args);
+            return NULL;
+        }
+        star = tmp;
+    }
+    
+    if(args) {
+        oldlen = PyTuple_GET_SIZE(args);
+        if(_PyTuple_Resize(&args,oldlen + PyTuple_GET_SIZE(star))) {
+            Py_DECREF(args);
+            args = NULL;
+        } else {
+            for(i=0; i<PyTuple_GET_SIZE(star); ++i) {
+                PyTuple_SET_ITEM(args,oldlen + i,PyTuple_GET_ITEM(star,i));
+                Py_INCREF(PyTuple_GET_ITEM(star,i));
+            }
+        }
+    } else  {
+        Py_INCREF(star);
+        args = star;
+    }
+    
+    Py_XDECREF(tmp);
+    return args;
+}
+
+/* This function is based on ext_do_call and update_keyword_args from
+   Python/ceval.c. This steals a reference to args if it's not NULL. */
+static PyObject *append_dict_for_call(PyObject *func,PyObject *args,PyObject *star) {
+    PyObject *k, *v;
+    PyObject *tmp = NULL;
+    Py_ssize_t pos = 0;
+    
+    if(!PyDict_Check(star)) {
+        if(!(tmp = PyDict_New())) {
+            Py_XDECREF(args);
+            return NULL;
+        }
+        
+        if(PyDict_Update(tmp,star)) {
+            if(PyErr_ExceptionMatches(PyExc_TypeError)) {
+                PyErr_Format(PyExc_TypeError,
+                             "%.200s%.200s argument after * "
+                             "must be a mapping, not %.200s",
+                             PyEval_GetFuncName(func),
+                             PyEval_GetFuncDesc(func),
+                             star->ob_type->tp_name);
+            }
+            Py_XDECREF(args);
+            return NULL;
+        }
+        star = tmp;
+    }
+    
+    if(args) {
+        while(PyDict_Next(star,&pos,&k,&v)) {
+            if(PyDict_GetItem(args,k)) {
+                PyErr_Format(PyExc_TypeError,
+                             "%.200s%s got multiple values "
+                             "for keyword argument '%U'",
+                             PyEval_GetFuncName(func),
+                             PyEval_GetFuncDesc(func),
+                             k);
+                Py_DECREF(args);
+                args = NULL;
+                break;
+            }
+            if(PyDict_SetItem(args,k,v)) {
+                Py_DECREF(args);
+                args = NULL;
+                break;
+            }
+        }
+    } else {
+        Py_INCREF(star);
+        args = star;
+    }
+    
+    Py_XDECREF(tmp);
+    return args;
+}
+
 
 
 /* The following are copied from Python/ceval.c */
-
-static void
-err_args(PyObject *func, int flags, int nargs)
-{
-    if (flags & METH_NOARGS)
-        PyErr_Format(PyExc_TypeError,
-                     "%.200s() takes no arguments (%d given)",
-                     ((PyCFunctionObject *)func)->m_ml->ml_name,
-                     nargs);
-    else
-        PyErr_Format(PyExc_TypeError,
-                     "%.200s() takes exactly one argument (%d given)",
-                     ((PyCFunctionObject *)func)->m_ml->ml_name,
-                     nargs);
-}
 
 static PyObject *
 format_exc_check_arg(PyObject *exc, const char *format_str, PyObject *obj)
@@ -592,157 +674,6 @@ format_exc_unbound(PyCodeObject *co, int oparg)
     }
     return NULL;
 }
-
-static void
-format_missing(const char *kind, PyCodeObject *co, PyObject *names)
-{
-    int err;
-    Py_ssize_t len = PyList_GET_SIZE(names);
-    PyObject *name_str, *comma, *tail, *tmp;
-
-    assert(PyList_CheckExact(names));
-    assert(len >= 1);
-    /* Deal with the joys of natural language. */
-    switch (len) {
-    case 1:
-        name_str = PyList_GET_ITEM(names, 0);
-        Py_INCREF(name_str);
-        break;
-    case 2:
-        name_str = PyUnicode_FromFormat("%U and %U",
-                                        PyList_GET_ITEM(names, len - 2),
-                                        PyList_GET_ITEM(names, len - 1));
-        break;
-    default:
-        tail = PyUnicode_FromFormat(", %U, and %U",
-                                    PyList_GET_ITEM(names, len - 2),
-                                    PyList_GET_ITEM(names, len - 1));
-        if (tail == NULL)
-            return;
-        /* Chop off the last two objects in the list. This shouldn't actually
-           fail, but we can't be too careful. */
-        err = PyList_SetSlice(names, len - 2, len, NULL);
-        if (err == -1) {
-            Py_DECREF(tail);
-            return;
-        }
-        /* Stitch everything up into a nice comma-separated list. */
-        comma = PyUnicode_FromString(", ");
-        if (comma == NULL) {
-            Py_DECREF(tail);
-            return;
-        }
-        tmp = PyUnicode_Join(comma, names);
-        Py_DECREF(comma);
-        if (tmp == NULL) {
-            Py_DECREF(tail);
-            return;
-        }
-        name_str = PyUnicode_Concat(tmp, tail);
-        Py_DECREF(tmp);
-        Py_DECREF(tail);
-        break;
-    }
-    if (name_str == NULL)
-        return;
-    PyErr_Format(PyExc_TypeError,
-                 "%U() missing %i required %s argument%s: %U",
-                 co->co_name,
-                 len,
-                 kind,
-                 len == 1 ? "" : "s",
-                 name_str);
-    Py_DECREF(name_str);
-}
-
-static void
-missing_arguments(PyCodeObject *co, int missing, int defcount,
-                  PyObject **fastlocals)
-{
-    int i, j = 0;
-    int start, end;
-    int positional = defcount != -1;
-    const char *kind = positional ? "positional" : "keyword-only";
-    PyObject *missing_names;
-
-    /* Compute the names of the arguments that are missing. */
-    missing_names = PyList_New(missing);
-    if (missing_names == NULL)
-        return;
-    if (positional) {
-        start = 0;
-        end = co->co_argcount - defcount;
-    }
-    else {
-        start = co->co_argcount;
-        end = start + co->co_kwonlyargcount;
-    }
-    for (i = start; i < end; i++) {
-        if (GETLOCAL(i) == NULL) {
-            PyObject *raw = PyTuple_GET_ITEM(co->co_varnames, i);
-            PyObject *name = PyObject_Repr(raw);
-            if (name == NULL) {
-                Py_DECREF(missing_names);
-                return;
-            }
-            PyList_SET_ITEM(missing_names, j++, name);
-        }
-    }
-    assert(j == missing);
-    format_missing(kind, co, missing_names);
-    Py_DECREF(missing_names);
-}
-
-static void
-too_many_positional(PyCodeObject *co, int given, int defcount, PyObject **fastlocals)
-{
-    int plural;
-    int kwonly_given = 0;
-    int i;
-    PyObject *sig, *kwonly_sig;
-
-    assert((co->co_flags & CO_VARARGS) == 0);
-    /* Count missing keyword-only args. */
-    for (i = co->co_argcount; i < co->co_argcount + co->co_kwonlyargcount; i++)
-        if (GETLOCAL(i) != NULL)
-            kwonly_given++;
-    if (defcount) {
-        int atleast = co->co_argcount - defcount;
-        plural = 1;
-        sig = PyUnicode_FromFormat("from %d to %d", atleast, co->co_argcount);
-    }
-    else {
-        plural = co->co_argcount != 1;
-        sig = PyUnicode_FromFormat("%d", co->co_argcount);
-    }
-    if (sig == NULL)
-        return;
-    if (kwonly_given) {
-        const char *format = " positional argument%s (and %d keyword-only argument%s)";
-        kwonly_sig = PyUnicode_FromFormat(format, given != 1 ? "s" : "", kwonly_given,
-                                              kwonly_given != 1 ? "s" : "");
-        if (kwonly_sig == NULL) {
-            Py_DECREF(sig);
-            return;
-        }
-    }
-    else {
-        /* This will not fail. */
-        kwonly_sig = PyUnicode_FromString("");
-        assert(kwonly_sig != NULL);
-    }
-    PyErr_Format(PyExc_TypeError,
-                 "%U() takes %U positional argument%s but %d%U %s given",
-                 co->co_name,
-                 sig,
-                 plural ? "s" : "",
-                 given,
-                 kwonly_sig,
-                 given == 1 && !kwonly_given ? "was" : "were");
-    Py_DECREF(sig);
-    Py_DECREF(kwonly_sig);
-}
-
 
 static int
 _unpack_iterable(PyObject *v, int argcnt, int argcntafter, PyObject **sp)
@@ -1405,6 +1336,9 @@ PyInit_pyinternals(void) {
         ADD_ADDR(_PyGen_FetchStopIterationValue),
         ADD_ADDR(_EnterRecursiveCall),
         ADD_ADDR(_LeaveRecursiveCall),
+        
+        ADD_ADDR(append_tuple_for_call),
+        ADD_ADDR(append_dict_for_call),
         ADD_ADDR(format_exc_check_arg),
         ADD_ADDR(format_exc_unbound),
         ADD_ADDR(_unpack_iterable),

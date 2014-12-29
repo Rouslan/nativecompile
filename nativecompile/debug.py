@@ -194,16 +194,16 @@ class CallFrameEntry:
             if in_body:
                 if a.descr is EPILOG_START:
                     in_body = False
-                    add_code(op.def_cfa_offset(a.stack))
+                    add_code(op.def_cfa_offset(a.stack * self.ptr_size))
                     old_stack = a.stack
                     continue
             elif a.descr is PROLOG_END:
                 in_body = True
-                add_code(op.def_cfa_offset(a.stack))
+                add_code(op.def_cfa_offset(a.stack * self.ptr_size))
                 old_stack = a.stack
                 continue
             elif a.stack != old_stack:
-                add_code(op.def_cfa_offset(a.stack))
+                add_code(op.def_cfa_offset(a.stack * self.ptr_size))
                 old_stack = a.stack
 
             if isinstance(a.descr,SaveReg):

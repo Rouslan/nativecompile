@@ -403,7 +403,88 @@ class ExprCompiler(ast.NodeVisitor):
     def visit_Compare(self,node):
         raise NotImplementedError()
     def visit_Call(self,node):
-        raise NotImplementedError()
+        fobj = self.visit(node.func)
+        
+        args_obj = None
+        if node.args:
+            (self.code
+                .invoke('PyTuple_New',len(node.args))
+                .check_err())
+            
+            args_obj = ScratchValue(self.code,R_RET)
+            
+            for i,a in enumerate(node.args):
+                aobj = self.visit(a).to_addr_movable_val(self.code)
+                
+                args_obj.reload_reg(self.code)
+                
+                self.code.mov(aobj,tuple_item(args_obj,i))
+                aobj.steal(self.code)
+        
+        if node.starargs:
+            s_args_obj = self.visit(node.starargs)
+            
+            args_p = 0
+            if args_obj:
+                args_p = args_obj(self.code)
+                args_obj.steal(self.code)
+            
+            (self.code
+                .invoke('append_tuple_for_call',fobj,args_p,s_args_obj)
+                .check_err())
+            
+            args_obj = ScratchValue(self.code,R_RET)
+            
+            s_args_obj.discard(self.code)
+        
+        args_kwds = None
+        if node.keywords:
+            (self.code
+                .invoke('_PyDict_NewPresized',len(node.keywords))
+                .check_err())
+            
+            args_kwds = ScratchValue(self.code,R_RET)
+            
+            for kwds in node.keywords:
+                obj = self.visit(kwds.value)
+                
+                (self.code
+                    .invoke('PyDict_SetItem',args_kwds,self.get_name(kwds.arg),obj)
+                    .check_err(True))
+                
+                obj.discard(self.code)
+        
+        if node.kwargs:
+            s_kwds = self.visit(node.kwargs)
+            
+            args_p = 0
+            if args_kwds:
+                args_p = args_kwds(self.code)
+                args_kwds.steal(self.code)
+            
+            (self.code
+                .invoke('append_dict_for_call',fobj,args_p,s_kwds)
+                .check_err())
+            
+            args_kwds = ScratchValue(self.code,R_RET)
+            
+            s_kwds.discard(self.code)
+        
+        (self.code
+            .invoke('PyObject_Call',
+                fobj,
+                args_obj or self.get_const(()),
+                args_kwds or 0)
+            .check_err())
+        
+        r = ScratchValue(self.code,R_RET)
+        
+        if args_kwds: args_kwds.discard(self.code)
+        if args_obj: args_obj.discard(self.code)
+        fobj.discard(self.code)
+        
+        return r
+    
     def visit_Num(self,node):
         return self.get_const(node.n)
     
@@ -469,9 +550,9 @@ class ExprCompiler(ast.NodeVisitor):
         
         r = ScratchValue(self.code,R_RET)
         
-        with RegCache(self) as tmp:
+        with RegCache(self.code) as tmp:
             for i,item in enumerate(node.elts):
-                obj = self.visit(item)
+                obj = self.visit(item).to_addr_movable_val(self.code)
                 
                 if not tmp.valid:
                     src = r(self.code)
@@ -481,10 +562,9 @@ class ExprCompiler(ast.NodeVisitor):
                         src = tmp.reg
                     self.mov(addr(item_offset,src),tmp.reg)
                 
-                with self.reg_temp_for(obj) as obj_tmp:
-                    self.mov(obj_tmp.reg,addr(self.abi.ptr_size * i,tmp.reg))
-                
-                obj.discard(self.code)
+
+                self.mov(obj,addr(self.abi.ptr_size * i,tmp.reg))
+                obj.steal(self.code)
         
         return r
     
@@ -500,21 +580,13 @@ class ExprCompiler(ast.NodeVisitor):
         
         r = ScratchValue(self.code,R_RET)
         
-        with RegCache(self) as tmp:
-            for i,item in enumerate(node.elts):
-                obj = self.visit(item)
-                
-                src = r(self.code)
-                if not isinstance(src,self.abi.Register):
-                    if not tmp.valid:
-                        tmp.validate(self.unused_reg())
-                        self.mov(src,tmp.reg)
-                    src = tmp.reg
+        for i,item in enumerate(node.elts):
+            obj = self.visit(item).to_addr_movable_val(self.code)
+            
+            r.reload_reg(self.code)
 
-                with self.reg_temp_for(obj) as obj_tmp:
-                    self.mov(obj.reg,addr(item_offset + self.abi.ptr_size * i,src))
-                
-                obj.discard(self.code)
+            self.code.mov(obj,tuple_item(r,i))
+            obj.steal(self.code)
         
         return r
 
@@ -523,7 +595,7 @@ def simple_frame(func_name):
     def decorator(func_name,f):
         def inner(abi,end_targets,*extra):
             s = Stitch(abi)
-            s.def_stack_offset.base = aligned_size((MAX_ARGS + 1) * abi.ptr_size)
+            s.def_stack_offset.base = aligned_size((MAX_ARGS + 1) * abi.ptr_size) // abi.ptr_size
             
             s.new_stack_value(True) # the return address added by CALL
 
@@ -842,7 +914,7 @@ def compile_eval(code,abi,util_funcs,entry_points,global_scope):
         .ret())
 
     ec.code.def_stack_offset.base = aligned_size(
-        (stack_len + max(MAX_ARGS-len(abi.r_arg),0)) * abi.ptr_size + abi.shadow)
+        (stack_len + max(MAX_ARGS-len(abi.r_arg),0)) * abi.ptr_size + abi.shadow) // abi.ptr_size
 
     return PyFunction(ProtoFunction('stuff',ec.code.code),tuple(ec.names.keys()),tuple(ec.consts.keys()))
 
