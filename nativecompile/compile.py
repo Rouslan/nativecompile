@@ -42,6 +42,21 @@ class UtilityFunctions:
         self.swap_exc_state = JumpTarget()
 
 
+def create_uninitialized(t):
+    return t.__new__(t)
+
+def check_context_load(node):
+    if not isinstance(node.ctx,ast.Load):
+        raise NCompileError('{} node has assign/delete context type but is not in assign/delete statement'.format(node.__class__.__name__))
+
+FunctionInput = namedtuple('FunctionInput',['func','name','args','returns','body'])
+
+class _ParsedValue:
+    """A fake AST node to allow inserting arbitrary values into AST trees"""
+    
+    def __init__(self,value):
+        self.value = value
+
 class ExprCompiler(ast.NodeVisitor):
     def __init__(self,code,s_table=None,util_funcs=None,global_scope=False):
         self.code = code
@@ -50,6 +65,7 @@ class ExprCompiler(ast.NodeVisitor):
         self.global_scope = global_scope
         self.consts = {}
         self.names = {}
+        self.func_nodes = []
         self.local_addrs = None
         self.visit_depth = 0
     
@@ -99,6 +115,7 @@ class ExprCompiler(ast.NodeVisitor):
             .check_err())
         
         r = ScratchValue(self.code,R_RET)
+        
         arg1.discard(self.code)
         arg2.discard(self.code)
 
@@ -149,11 +166,66 @@ class ExprCompiler(ast.NodeVisitor):
             self.code.comment('  '*self.visit_depth + '}')
             return r
     
+    def _visit_slice(self,slice):
+        if isinstance(slice,ast.Index):
+            return self.visit(slice.value)
+        
+        if isinstance(slice,ast.Slice):
+            start = None
+            if slice.lower:
+                start = self.visit(slice.lower)
+            
+            end = None
+            if slice.upper:
+                end = self.visit(slice.upper)
+            
+            step = None
+            if slice.step:
+                step = self.visit(slice.step)
+            
+            (self.code
+                .invoke('PySlice_New',
+                    start or 0,
+                    end or 0,
+                    step or 0)
+                .check_err())
+            
+            r = ScratchValue(self.code,R_RET)
+            
+            if start: start.discard(self.code)
+            if end: end.discard(self.code)
+            if step: step.discard(self.code)
+            
+            return r
+        
+        if isinstance(slice,ast.ExtSlice):
+            raise NotImplementedError()
+        
+        raise NCompileError('invalid index type in subscript')
+    
+    def visit__ParsedValue(self,node):
+        return node.value
+    
     def visit_Module(self,node):
         for stmt in node.body: self.visit(stmt)
         (self.code
             .mov(self.get_const(None),R_RET)
             .incref(R_RET))
+    
+    def visit_FunctionDef(self,node):
+        func = create_uninitialized(pyinternals.Function)
+        self.func_nodes.append(FunctionInput(func,node.name,node.args,node.returns,node.body))
+        
+        fobj = self.get_const(func)
+        
+        # the decorator application and name assignment can be broken down into
+        # other AST nodes
+        
+        alt_node = _ParsedValue(fobj)
+        for d in reversed(node.decorator_list):
+            alt_node = ast.Call(d,[alt_node],[],None,None,lineno=d.lineno,col_offset=d.col_offset)
+        
+        self.visit(ast.Assign([ast.Name(node.name,ast.Store())],alt_node,lineno=node.lineno,col_offset=node.col_offset))
     
     def visit_Assign(self,node):
         expr = self.visit(node.value)
@@ -228,15 +300,7 @@ class ExprCompiler(ast.NodeVisitor):
             
             elif isinstance(t,ast.Subscript):
                 obj = self.visit(t.value)
-                
-                if isinstance(t.slice,ast.Index):
-                    slice = self.visit(t.slice.value)
-                elif isinstance(t.slice,ast.Slice):
-                    raise NotImplementedError()
-                elif isinstance(t.slice,ast.ExtSlice):
-                    raise NotImplementedError()
-                else:
-                    raise NCompileError('invalid index type in subscript')
+                slice = self._visit_slice(t.slice)
                 
                 (self.code
                     .invoke('PyObject_SetItem',obj,slice,expr)
@@ -257,40 +321,26 @@ class ExprCompiler(ast.NodeVisitor):
         expr.discard(self.code)
     
     def visit_If(self,node):
-        ok = JumpTarget()
-        endif = JumpTarget()
-        else_ = endif
-        if node.orelse: else_ = JumpTarget()
-        
         test = self.visit(node.test)
         self.code.invoke('PyObject_IsTrue',test)
-        test.discard(self,preserve_reg=R_RET)
+        test.discard(self.code,preserve_reg=R_RET)
         
-        if __debug__ or node.orelse:
-            old_state = self.state.copy()
-        
-        (self.code
+        self.code = (self.code
             .test(R_RET,R_RET)
-            .jge(ok)
-            .exc_cleanup()
-            (ok)
-            .jz(else_))
+            .if_cond(TEST_L)
+                .exc_cleanup()
+            .endif()
+            .if_cond(TEST_NZ))
         
         for stmt in node.body:
             self.visit(stmt)
         
         if node.orelse:
-            if __debug__:
-                new_state = self.state
-            self.state = old_state
-            
-            self.code(else_)
+            self.code.else_()
             for stmt in node.orelse:
                 self.visit(stmt)
         
-        assert (self.state == new_state) if node.orelse else (self.state == old_state)
-        
-        self.code(endif)
+        self.code = self.code.endif()
     
     def visit_Expr(self,node):
         self.visit(node.value).discard(self.code)
@@ -304,19 +354,21 @@ class ExprCompiler(ast.NodeVisitor):
         op = type(node.op)
         
         if op is ast.Add:
-            assert False
+            raise NotImplementedError()
         
         if op is ast.Mod:
-            uaddr = r.fit_addr('PyUnicode_Type',R_SCRATCH1)
-            func = self.unused_reg()
-
+            with self.code.reg_temp_for(arg1) as r_arg1:
+                func,r_uaddr = self.code.unused_regs(2)
+                r_arg1 = r_arg1.reg
+            
+            uaddr = self.code.fit_addr('PyUnicode_Type',r_uaddr)
+            
             (self.code
-                .mov(arg1.location,R_RET)
                 .mov('PyUnicode_Format',func)
-                .if_(uaddr != type_of(R_RET))
+                .if_(uaddr != type_of(r_arg1))
                     .mov('PyNumber_Remainder',func)
                 .endif()
-                .invoke(func,arg2.location,R_RET)
+                .invoke(func,r_arg1,arg2)
                 .check_err())
         elif op is ast.Pow:
             (self.code
@@ -326,8 +378,10 @@ class ExprCompiler(ast.NodeVisitor):
             return self.basic_binop(BINOP_FUNCS[op],arg1,arg2)
     
         r = ScratchValue(self.code,R_RET)
+        
         arg1.discard(self.code)
         arg2.discard(self.code)
+        
         return r
     
     def visit_UnaryOp(self,node):
@@ -500,14 +554,41 @@ class ExprCompiler(ast.NodeVisitor):
         return self.get_const(...)
     
     def visit_Attribute(self,node):
-        raise NotImplementedError()
+        check_context_load(node)
+        
+        obj = self.visit(node.value)
+        
+        (self.code
+            .invoke('PyObject_GetAttr',obj,self.get_name(node.attr))
+            .check_err())
+        
+        r = ScratchValue(self.code,R_RET)
+        
+        obj.discard(self.code)
+        
+        return r
+    
     def visit_Subscript(self,node):
-        raise NotImplementedError()
+        check_context_load(node)
+        
+        value = self.visit(node.value)
+        slice = self._visit_slice(node.slice)
+        
+        (self.code
+            .invoke('PyObject_GetItem',value,slice)
+            .check_err())
+        
+        r = ScratchValue(self.code,R_RET)
+        
+        value.discard(self.code)
+        slice.discard(self.code)
+        
+        return r
+    
     def visit_Starred(self,node):
         raise NotImplementedError()
     def visit_Name(self,node):
-        if not isinstance(node.ctx,ast.Load):
-            raise NCompileError('name node has assign/delete context type but is not in assign/delete statement')
+        check_context_load(node)
         
         s = self.stable.lookup(node.id)
         
@@ -539,14 +620,13 @@ class ExprCompiler(ast.NodeVisitor):
         return ScratchValue(self.code,R_RET)
     
     def visit_List(self,node):
-        if not isinstance(node.ctx,ast.Load):
-            raise NCompileError('list node has assign/delete context type but is not in assign/delete statement')
+        check_context_load(node)
         
         item_offset = pyinternals.member_offsets['PyListObject']['ob_item']
         
         (self.code
             .invoke('PyList_New',len(node.elts))
-            [self.check_err()])
+            .check_err())
         
         r = ScratchValue(self.code,R_RET)
         
@@ -556,23 +636,20 @@ class ExprCompiler(ast.NodeVisitor):
                 
                 if not tmp.valid:
                     src = r(self.code)
-                    tmp.validate(self.unused_reg())
+                    tmp.validate()
                     if not isinstance(src,self.abi.Register):
-                        self.mov(src,tmp.reg)
+                        self.code.mov(src,tmp.reg)
                         src = tmp.reg
-                    self.mov(addr(item_offset,src),tmp.reg)
+                    self.code.mov(addr(item_offset,src),tmp.reg)
                 
 
-                self.mov(obj,addr(self.abi.ptr_size * i,tmp.reg))
+                self.code.mov(obj,addr(self.abi.ptr_size * i,tmp.reg))
                 obj.steal(self.code)
         
         return r
     
     def visit_Tuple(self,node):
-        if not isinstance(node.ctx,ast.Load):
-            raise NCompileError('tuple node has assign/delete context type but is not in assign/delete statement')
-        
-        item_offset = pyinternals.member_offsets['PyTupleObject']['ob_item']
+        check_context_load(node)
         
         (self.code
             .invoke('PyTuple_New',len(node.elts))

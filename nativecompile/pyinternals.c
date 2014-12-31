@@ -393,6 +393,11 @@ static PyObject *Function_call(Function *self,PyObject *args,PyObject *kwds) {
     PyObject *r = NULL;
     
     static char *kwlist[] = {"globals","locals",NULL};
+    
+    if(!self->code) {
+        PyErr_SetString(PyExc_AttributeError,"code");
+        return NULL;
+    }
 
     if(!PyArg_ParseTupleAndKeywords(args,kwds,"|OO",kwlist,
         &globals,
@@ -421,17 +426,27 @@ static int Function_traverse(Function *self,visitproc visit,void *arg) {
     return 0;
 }
 
+static int Function_clear(Function *self) {
+    Py_CLEAR(self->name);
+    Py_CLEAR(self->names);
+    Py_CLEAR(self->consts);
+    Py_CLEAR(self->code);
+    
+    return 0;
+}
+
 static void Function_dealloc(Function *self) {
-    Py_DECREF(self->name);
-    Py_DECREF(self->names);
-    Py_DECREF(self->consts);
-    Py_DECREF(self->code);
+    Function_clear(self);
     
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
-static PyObject *Function_new(PyTypeObject *type,PyObject *args,PyObject *kwds) {
-    Function *self;
+/* Although there is no reason to modify a Function instance once it's
+   initialized, initialization is done in tp_init and not tp_new so that an
+   instance can be created and have an address in memory, before it is
+   initialized. This is so the function's address can be hard-coded into its own
+   code object.  */
+static int Function_init(Function *self,PyObject *args,PyObject *kwds) {
     CompiledCode *code;
     PyObject *name, *names, *consts;
     Py_ssize_t offset;
@@ -444,17 +459,16 @@ static PyObject *Function_new(PyTypeObject *type,PyObject *args,PyObject *kwds) 
         &name,
         &names,
         &consts)) return NULL;
-
-    self = (Function*)type->tp_alloc(type,0);
-    if(!self) return NULL;
+    
+    Function_clear(self);
     
     self->names = PySequence_Tuple(names);
-    if(!self->names) return NULL;
+    if(!self->names) return -1;
     
     self->consts = PySequence_Tuple(consts);
     if(!self->consts) {
-        Py_DECREF(self->names);
-        return NULL;
+        Py_CLEAR(self->names);
+        return -1;
     }
     
     self->name = name;
@@ -465,7 +479,7 @@ static PyObject *Function_new(PyTypeObject *type,PyObject *args,PyObject *kwds) 
     
     self->offset = offset;
 
-    return (PyObject*)self;
+    return 0;
 }
 
 static PyMemberDef Function_members[] = {
@@ -499,7 +513,7 @@ static PyTypeObject FunctionType = {
     Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC, /* tp_flags */
     "Compiled Function",       /* tp_doc */
     (traverseproc)Function_traverse, /* tp_traverse */
-    0,	                       /* tp_clear */
+    (inquiry)Function_clear,   /* tp_clear */
     0,	                       /* tp_richcompare */
     0,	                       /* tp_weaklistoffset */
     0,	                       /* tp_iter */
@@ -512,9 +526,9 @@ static PyTypeObject FunctionType = {
     0,                         /* tp_descr_get */
     0,                         /* tp_descr_set */
     0,                         /* tp_dictoffset */
-    0,                         /* tp_init */
+    (initproc)Function_init,   /* tp_init */
     0,                         /* tp_alloc */
-    Function_new,              /* tp_new */
+    0,                         /* tp_new */
 };
 
 
@@ -1223,6 +1237,7 @@ PyInit_pyinternals(void) {
 
     if(PyType_Ready(&CompiledCodeType) < 0) return NULL;
     
+    FunctionType.tp_new = PyType_GenericNew;
     if(PyType_Ready(&FunctionType) < 0) return NULL;
 
     m = PyModule_Create(&this_module);

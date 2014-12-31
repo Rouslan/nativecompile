@@ -621,9 +621,10 @@ def resolve_jumps(op,chunks,end_targets=()):
     # add padding for alignment
     if CALL_ALIGN_MASK:
         pad_size = aligned_size(displacement) - displacement
-        late_chunks[0] = code_join(op.nop() * pad_size)
-        for et in end_targets:
-            et.displacement += pad_size
+        if pad_size:
+            late_chunks[0] = code_join(op.nop() * pad_size)
+            for et in end_targets:
+                et.displacement += pad_size
 
     code = code_join([(c.compile() if isinstance(c,DelayedCompileLate) else c) for c in reversed(late_chunks) if c is not None])
 
@@ -695,7 +696,7 @@ class BorrowedValue(CountedValue):
     def __call__(self,s):
         return self.value.location(s)
     
-    def discard(self,s):
+    def discard(self,s,**kwds):
         pass
 
 def stack_location(s,offset):
@@ -711,7 +712,7 @@ class RawStackValue(StitchValue):
         assert offset is not None
         self.offset = offset
     
-    def discard(self,s):
+    def discard(self,s,**kwds):
         if self.owned:
             assert self.offset is not None
             
@@ -724,13 +725,13 @@ class RawStackValue(StitchValue):
         return stack_location(s,self.offset)
 
 
-def discard_stack_value(s,offset):
+def discard_stack_value(s,offset,**kwds):
     tmp = s.unused_reg()
     # we free the stack slot before calling decref (which calls
     # invalidate_scratch) so a scratch value can use that slot if needed
     s.mov(stack_location(s,offset),tmp)
     s.state.stack[offset] = None
-    s.decref(tmp)
+    s.decref(tmp,**kwds)
 
 class StackValue(RawStackValue,CountedValue):
     """A Python object stored on the stack"""
@@ -739,11 +740,11 @@ class StackValue(RawStackValue,CountedValue):
         super().__init__(offset)
         self.owned = True
     
-    def discard(self,s):
+    def discard(self,s,**kwds):
         if self.owned:
             assert self.offset is not None
 
-            discard_stack_value(s,self.offset)
+            discard_stack_value(s,self.offset,**kwds)
             self.owned = False
         
         self.offset = None
@@ -758,10 +759,10 @@ class RegValue(CountedValue):
         s.state.used_regs.add(reg)
         self.reg = reg
     
-    def discard(self,s):
+    def discard(self,s,**kwds):
         if self.owned:
             assert self.reg is not None
-            s.decref(self.reg)
+            s.decref(self.reg,**kwds)
             self.owned = False
         s.state.used_regs.remove(self.reg)
         self.reg = None
@@ -786,7 +787,7 @@ class ScratchValue(CountedValue):
     def in_register(self,s):
         return CompareByIdWrapper(self) in s.state.scratch
     
-    def discard(self,s):
+    def discard(self,s,**kwds):
         inreg = self.in_register(s)
         if inreg:
             s.state.used_regs.remove(self.reg)
@@ -798,7 +799,7 @@ class ScratchValue(CountedValue):
                 if self.offset: s.state.stack[self.offset] = None
             else:
                 assert self.offset is not None
-                discard_stack_value(s,self.offset)
+                discard_stack_value(s,self.offset,**kwds)
         self.owned = False
     
     def __call__(self,s):
@@ -824,8 +825,7 @@ class ScratchValue(CountedValue):
         
         if not self.offset:
             s.new_stack_value(value_t=self._set_offset)
-        
-        s.mov(self.reg,stack_location(s,self.offset))
+            s.mov(self.reg,stack_location(s,self.offset))
 
 def reg_or_scratch_value(s,r):
     """Return an instance of RegValue or ScratchValue depending on whether "r"
@@ -887,7 +887,7 @@ class BorrowedRegTemp(RegTemp):
     if __debug__:
         @property
         def reg(self):
-            assert self.owner.location(self._s) == self._reg,"the register might not have the value anymore"
+            assert self.owner(self._s) == self._reg,"the register might not have the value anymore"
             return self._reg
     
     def discard(self):
@@ -898,10 +898,12 @@ class RegCache(RegTemp):
     preserved"""
     def __init__(self,s,reg=None):
         self._s = s
+        self.reg = reg
         if reg is not None: self.validate(make_value(s,reg))
     
-    def validate(self,reg):
-        assert self.reg is None and reg is not None and reg not in self._s.state.used_regs
+    def validate(self,reg=None):
+        assert self.reg is None and (reg is None or reg not in self._s.state.used_regs)
+        if reg is None: reg = self._s.unused_reg()
         self.reg = reg
         self._s.state.used_regs.add(reg)
         self._s.state.scratch.add(self)
@@ -1009,6 +1011,26 @@ class Stitch:
         s = self.state.scratch.pop()
         s.invalidate_scratch(self)
         return s.reg
+    
+    def unused_regs(self,num):
+        assert num >= 0
+        regs = []
+        
+        for r in self.usable_tmp_regs:
+            if len(regs) == num: return regs
+            if r not in self.state.used_regs: regs.append(r)
+
+        while len(regs) < num:
+            assert self.state.scratch,"not enough free registers"
+        
+            s = self.state.scratch.pop()
+            regs.append(s(self))
+            
+            assert isinstance(regs[-1],self.abi.Register)
+            
+            s.invalidate_scratch(self)
+        
+        return regs
     
     def unused_reg_temp(self):
         return RegTemp(self,self.unused_reg())
@@ -1149,6 +1171,7 @@ class Stitch:
         return self
 
     def _if_cond(self,test,in_elif):
+        test = make_value(self,test)
         after = JumpTarget()
         self.jcc(~test,after)
         return self.branch(after,in_elif)
@@ -1304,10 +1327,14 @@ class Stitch:
     def decref(self,reg=R_RET,preserve_reg=None,amount=1):
         """Generate instructions equivalent to Py_DECREF"""
         assert amount > 0
+        
+        preserve_reg = make_value(self,preserve_reg)
 
         if pyinternals.REF_DEBUG:
             if preserve_reg:
-                self.mov(preserve_reg,STATE.temp_store)
+                self.mov(preserve_reg,DEFAULT_TEMP)
+                used = preserve_reg in self.state.used_regs
+                if used: self.state.used_regs.remove(preserve_reg)
 
             if amount > 1:
                 self.mov(reg,TEMP_CX)
@@ -1318,7 +1345,8 @@ class Stitch:
                 self.invoke('Py_DecRef',TEMP_CX)
 
             if preserve_reg:
-                self.mov(STATE.temp_store,preserve_reg)
+                self.mov(DEFAULT_TEMP,preserve_reg)
+                if used: self.state.used_regs.add(preserve_reg)
             elif preserve_reg == 0:
                 self.mov(0,R_RET)
 
@@ -1328,8 +1356,10 @@ class Stitch:
             .sub(amount,CType('PyObject',reg).ob_refcnt)
             .if_cond(TEST_Z))
         
-        if reserve_reg:
-            instr.mov(preserve_reg,STATE.temp_store)
+        if preserve_reg:
+            instr.mov(preserve_reg,DEFAULT_TEMP)
+            used = preserve_reg in instr.state.used_regs
+            if used: instr.state.used_regs.discard(preserve_reg)
         
         instr.mov(CType('PyObject',reg).ob_type,R_SCRATCH1)
 
@@ -1342,7 +1372,8 @@ class Stitch:
             instr.invoke('inc_count',COUNT_ALLOCS_TEMP)
         
         if preserve_reg:
-            instr.mov(STATE.temp_store,preserve_reg)
+            instr.mov(DEFAULT_TEMP,preserve_reg)
+            if used: instr.state.used_regs.add(preserve_reg)
         elif preserve_reg == 0:
             instr.mov(0,R_RET)
         
