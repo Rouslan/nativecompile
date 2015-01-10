@@ -6,7 +6,7 @@ import os
 import io
 import sys
 from functools import partial
-from collections import namedtuple
+from collections import namedtuple, OrderedDict
 
 from . import pyinternals
 from . import debug
@@ -64,9 +64,10 @@ class ExprCompiler(ast.NodeVisitor):
         self.util_funcs = util_funcs
         self.global_scope = global_scope
         self.consts = {}
-        self.names = {}
+        self.names = OrderedDict()
         self.func_nodes = []
         self.local_addrs = None
+        self.local_addr_start = None
         self.visit_depth = 0
     
     @property
@@ -84,18 +85,42 @@ class ExprCompiler(ast.NodeVisitor):
             .mov(tmp1,b))
         return b,a
     
-    def allocate_locals(self):
+    def allocate_locals(self,args):
         assert self.local_addrs is None and self.stable is not None
-        
+
         self.local_addrs = {}
-        if self.stable.is_optimized() and isinstance(self.stable,symtable.Function) and self.stable.get_locals():
+        if self.stable.is_optimized() and isinstance(self.stable,symtable.Function):
+            assert args is not None
+            
+            # FUNCTION_BODY_NAME_ORDER
+            # the order of the arguments must match the order in
+            # pyinternals.FunctionBody.names which is described in
+            # pyinternals.c
+            
+            locals = [a.arg for a in args.args]
+            if args.vararg: locals.append(args.vararg.arg)
+            locals.extend(a.arg for a in args.kwonlyargs)
+            if args.kwarg: local.append(args.kwarg.arg)
+            
+            the_rest = set(self.stable.get_locals())
+            the_rest.update_difference(locals)
+            locals.extend(the_rest)
+            
+            for n in locals:
+                self.names[n] = address_of(n)
+            
             tmp = self.unused_reg(self)
             self.code.mov(0,tmp)
-            for loc in self.stable.get_locals():
+ 
+            # locals is reversed because each stack value has a lower address
+            # than the previous value
+            for loc in reversed(locals):
                 addr = self.code.new_stack_value(True)(self.code)
                 self.code.mov(tmp,addr)
                 # TODO: create annotation for local
                 self.local_addrs[loc] = addr
+            
+            self.local_addr_start = addr
     
     def deallocate_locals(self,s=None):
         assert self.local_addrs is not None
@@ -108,6 +133,334 @@ class ExprCompiler(ast.NodeVisitor):
                 .if_(R_RET)
                     .decref(R_RET)
                 .endif())
+            loc.discard(s)
+        
+        self.local_addrs = None
+        self.local_addr_start = None
+    
+    def do_kw_args(self,args,func_self,func_kwds,with_dict,without_dict):
+        assert args.kwonlyargs or with_dict
+        
+        miss_flag = self.code.new_stack_value(True)
+        
+        def mark_miss(s):
+            # miss_flag needs to be set to any non-zero value and using a
+            # register instead of an immediate value results in shorter
+            # machine code
+            s.mov(R_PRES1,miss_flag)
+        
+        hit_count = self.code.new_stack_value(True)
+        
+        def mark_hit(name):
+            def inner(s):
+                if args.kwarg:
+                    (s
+                        .invoke('PyDict_DelItem',R_PRES1,name)
+                        .check_err(True))
+                else:
+                    s.add(1,hit_count)
+            
+            return inner
+        
+        s = (self.code
+            .mov(0,miss_flag)
+            .mov(0,hit_count)
+            .mov(func_kwds,R_RET)
+            .if_(R_RET)
+                .mov(len(args.args),R_PRES3)
+                .sub(CType('PyVarObject',R_PRES2).ob_size,R_PRES3))
+        
+        if args.kwarg:
+            (s
+                .invoke('PyDict_Copy',R_RET)
+                .check_err()
+                .mov(R_RET,R_PRES1)
+                .mov(R_RET,self.get_name(args.kwarg.arg)))
+        else:
+            s.mov(R_RET,R_PRES1)
+        
+        if with_dict: with_dict(s,mark_miss,mark_hit)
+        
+        if args.kwonlyargs:
+            (s
+                .mov(func_self,R_PRES2)
+                .mov(CType('Function',R_PRES2).kwdefaults,R_PRES2))
+            
+            for i,a in enumerate(args.kwonlyargs):
+                name = self.get_name(a.arg)
+                no_def = JumpTarget()
+                
+                s = (s
+                    .invoke('PyDict_GetItem',R_PRES1,name)
+                    .if_(R_RET)
+                        .mov(R_RET,self.local_addrs[a.arg])
+                        .incref(R_RET)
+                        [mark_hit(name)]
+                    .elif_(R_PRES2)
+                        .mov(0,R_SCRATCH1)
+                        .mov(addr(i*self.abi.ptr_size,R_PRES2),R_RET)
+                        .test(R_RET,R_RET)
+                        .jz(no_def)
+                        .mov(R_RET,self.local_addrs[a.arg])
+                        .incref(R_RET)
+                    .else_()(no_def)
+                        [mark_miss]
+                    .endif())
+        
+        if not args.kwarg:
+            (s
+                .invoke('PyDict_Size',R_PRES1)
+                .if_(signed(R_RET) > hit_count)
+                   .invoke('excess_keyword',func_self,R_PRES1)
+                   .exc_cleanup()
+                .endif())
+        
+        hit_count.discard(s)
+        
+        s.else_()
+        
+        if args.kwarg:
+            (s
+                .invoke('PyDict_New')
+                .check_err()
+                .mov(R_RET,self.get_name(args.kwarg.arg)))
+        
+        if without_dict: without_dict(s,mark_miss)
+        
+        if args.kwonlyargs:
+            s = (s
+                .mov(func_self,R_PRES2)
+                .mov(CType('Function',R_PRES2).kwdefaults,R_PRES2)
+                .if_(R_PRES2))
+            
+            no_def = JumpTarget()
+            
+            for i,a in enumerate(args.kwonlyargs):
+                name = self.get_name(a.arg)
+                
+                (s
+                    .mov(addr(i*self.abi.ptr_size,R_PRES2),R_RET)
+                    .test(R_RET,R_RET)
+                    .jz(no_def)
+                    .mov(R_RET,self.local_addrs[a.arg])
+                    .incref(R_RET))
+            
+            s = (s
+                .else_()(no_def)
+                    [mark_miss]
+                .endif())
+        
+        r_arg = s.arg_reg(R_RET,1)
+        (s
+            .endif()
+            .lea(self.local_addr_start,r_arg)
+            .if_(miss_flag)
+                .invoke('missing_arguments',func_self,r_arg,tmpreg=R_SCRATCH1)
+                .exc_cleanup()
+            .endif())
+        
+        miss_flag.discard(s)
+    
+    def handle_args_optimized(self,args,func_self,func_args,func_kwds):
+        if args.args:
+            # a short-cut to the part where positional arguments are moved
+            arg_target1 = JumpTarget()
+            
+            s = (self.code
+                .mov(func_self,R_PRES2)
+                .mov(func_args,R_PRES1)
+                .mov(len(args.args),R_PRES3)
+                .sub(CType('PyVarObject',R_PRES1).ob_size,R_PRES3)
+                .mov(CType('Function',R_PRES2).defaults,R_PRES2)
+                .if_cond(TEST_L)
+                    .neg(R_PRES3))
+             
+            # if there are more arguments than parameters
+            if args.vararg:
+                
+                dest_item = tuple_item(R_RET,0)(c)
+                dest_item.index = R_PRES3
+                dest_item.scale = self.abi.ptr_size
+                
+                src_item = tuple_item(R_PRES1,len(args.args))(c)
+                src_item.index = R_PRES3
+                src_item.scale = self.abi.ptr_size
+                
+                (s
+                        .invoke('PyTuple_New',len(node.args))
+                        .check_err()
+                        .do()
+                            .sub(1,R_PRES3)
+                            .mov(src_item,R_RET)
+                            .mov(R_RET,dest_item)
+                            .incref(R_RET)
+                        .while_(R_PRES3)
+                        .mov(R_RET,self.local_addrs[args.vararg.arg])
+                        .jmp(arg_target1)
+                    .else_()
+                        .mov(self.get_const(()),self.local_addrs[args.vararg.arg]))
+            else:
+                (s
+                    .invoke('too_many_positional',func_self,R_PRES3,func_kwds)
+                    .exc_cleanup())
+            
+            s.endif()
+            
+            # set positional arguments
+            
+            targets = []
+            
+            (self.code
+                .jump_table(R_PRES3,targets,R_SCRATCH2))
+            
+            for i,a in reversed(enumerate(args.args)):
+                target = JumpTarget() if targets else arg_target1
+                targets.append(target)
+                
+                (self.code
+                    (target)
+                    .mov(tuple_item(R_PRES1,i),R_RET)
+                    .mov(R_RET,self.local_addrs[a.arg])
+                    .incref(R_RET))
+            
+            target = JumpTarget()
+            targets.append(target)
+            self.code(target)
+            
+            # set keyword arguments
+            
+            def with_dict(s,mark_miss,mark_hit):
+                default_item = tuple_item(R_PRES2,0)(c)
+                default_item.index = R_RET
+                default_item.scale = self.abi.ptr_size
+                
+                c_func_self = CType('Function',R_PRES1)
+                
+                for i,a in enumerate(args.args):
+                    name = self.get_name(a.arg)
+                    s = (s
+                        .invoke('PyDict_GetItem',R_PRES1,name)
+                        .if_(R_RET)
+                            .if_(self.local_addrs[a.arg])
+                                .mov(func_self,R_PRES1)
+                                .invoke('PyErr_Format',
+                                    'PyExc_TypeError',
+                                    'DUPLICATE_VAL_MSG',
+                                    c_func_self.name,
+                                    name)
+                                .exc_cleanup()
+                            .endif()
+                            .mov(R_RET,self.local_addrs[a.arg])
+                            .incref(R_RET),
+                            [mark_hit(name)]
+                        .else_()
+                            .mov(i,R_RET)
+                            .sub(R_PRES3,R_RET)
+                            .if_cond(TEST_GE)
+                                .mov(default_item,R_RET)
+                                .mov(R_RET,self.local_addrs[a.arg])
+                                .incref(R_RET)
+                            .else_()
+                                [mark_miss]
+                            .endif()
+                        .endif())
+            
+            def without_dict(s,mark_miss):
+                # just set the defaults.
+                
+                targets = []
+                
+                (s
+                    .mov(len(args.args),R_RET)
+                    .sub(R_PRES3,R_RET)
+                    .sub(CType('PyVarObject',R_PRES2).ob_size,R_SCRATCH1)
+                    .if_(signed(R_RET) < R_SCRATCH1)
+                        [mark_miss]
+                        .mov(R_SCRATCH1,R_RET)
+                    .endif()
+                    .jump_table(R_RET,targets,R_SCRATCH2))
+                
+                for i,a in enumerate(args.args):
+                    target = JumpTarget()
+                    targets.append(target)
+                    
+                    (s
+                        (target)
+                        .mov(tuple_item(R_PRES2,i),R_RET)
+                        .mov(R_RET,self.local_addrs[a.arg])
+                        .incref(R_RET))
+                
+                target = JumpTarget()
+                targets.append(target)
+                s(target)
+            
+            self.do_kw_args(args,func_self,func_kwds,with_dict,without_dict)
+        else:
+            if args.vararg:
+                (self.code
+                    .mov(func_args,R_RET)
+                    .mov(R_RET,self.local_addrs[args.vararg.arg])
+                    .incref(R_RET))
+            else:
+                (self.code
+                    .mov(func_args,R_RET)
+                    .if_(CType('PyVarObject',R_RET).ob_size)
+                        .invoke('too_many_positional',func_self,R_RET,func_kwds)
+                        .exc_cleanup()
+                    .endif())
+
+            if args.kwonlyargs:
+                self.do_kw_args(args,func_self,func_kwds,None,None)
+            elif args.kwarg:
+                (self.code
+                    .mov(func_kwds,R_RET)
+                    .if_(R_RET)
+                        .invoke('PyDict_Copy',R_RET)
+                    .else_()
+                        .invoke('PyDict_New')
+                    .check_err()
+                    .mov(R_RET,self.get_name(args.kwarg.arg))
+                    .endif())
+            else:
+                (self.code
+                    .mov(func_kwds,R_PRES1)
+                    .if_(R_PRES1)
+                        .invoke('PyDict_Size',R_PRES1)
+                        .if_(R_RET)
+                            .invoke('excess_keyword',func_self,R_PRES1)
+                        .endif()
+                    .endif())
+    
+    def handle_args_unoptimized(self,args,func_self,func_args,func_kwds):
+        dict_addr = self.code.fit_addr('PyDict_Type',R_SCRATCH2)
+
+        (self.code
+            .mov(self.code.special_addrs['locals'],R_PRES1)
+            .if_(not_(R_PRES1))
+                .invoke('PyErr_Format','PyExc_SystemError','NO_LOCALS_STORE_MSG')
+                .exc_cleanup()
+            .endif()
+            .mov(dict_addr,R_SCRATCH1)
+            .mov('PyObject_SetItem',R_PRES2)
+            .push_arg(R_RET,n=0)
+            .if_(R_SCRATCH1 == type_of(R_PRES1))
+                .mov('PyDict_SetItem',R_PRES2)
+            .endif())
+        
+    
+        if args.args:
+            pass
+        elif args.vararg:
+            (self.code
+                .invoke(R_PRES2,R_PRES1,self.get_name(args.vararg.arg),func_args)
+                .check_err())
+    
+    def handle_args(self,args,func_self,func_args,func_kwds):
+        assert self.local_addrs is not None
+        
+        if args is None or not (args.args or args.vararg or args.kwonlyargs or args.kwarg): return
+        
+        (self.handle_args_optimized if if self.stable.is_optimized() else self.handle_args_unoptimized)(args,func_self,func_args,func_kwds)
     
     def basic_binop(self,func,arg1,arg2):
         (self.code
@@ -270,7 +623,7 @@ class ExprCompiler(ast.NodeVisitor):
                         (self.code
                             .push_arg(expr,n=2)
                             .push_arg(self.get_name(t.id),n=1)
-                            .mov(LOCALS,R_RET)
+                            .mov(self.code.special_addrs['locals'],R_RET)
                             .if_(not_(R_RET))
                                 .clear_args()
                                 .invoke('PyErr_Format','PyExc_SystemError','NO_LOCALS_STORE_MSG')
@@ -286,7 +639,7 @@ class ExprCompiler(ast.NodeVisitor):
                             .check_err(True))
                 else:
                     (self.code
-                        .invoke('PyDict_SetItem',GLOBALS,self.get_name(t.id),expr)
+                        .invoke('PyDict_SetItem',self.code.special_addrs['globals'],self.get_name(t.id),expr)
                         .check_err(True))
             
             elif isinstance(t,ast.Attribute):
@@ -613,9 +966,11 @@ class ExprCompiler(ast.NodeVisitor):
             
             return reg_or_scratch_value(self.code,r)
 
+        local = self.is_local(s)
         (self.code
             .mov(self.get_name(node.id),R_PRES1)
-            .inner_call(self.util_funcs.local_name if self.is_local(s) else self.util_funcs.global_name)
+            .mov(self.code.special_addrs['frame'],R_PRES3)
+            .inner_call(self.util_funcs.local_name if local else self.util_funcs.global_name)
             .check_err())
         return ScratchValue(self.code,R_RET)
     
@@ -689,14 +1044,19 @@ def simple_frame(func_name):
 @simple_frame('local_name')
 def local_name_func(s):
     # TODO: have just one copy shared by all compiled modules
+    
+    # R_PRES1 is expected to have the address of the name to load
+    # R_PRES3 is expected to have the address of the frame object
 
     ret = JumpTarget()
     inc_ret = JumpTarget()
     d_addr = s.fit_addr('PyDict_Type',R_PRES2)
+    
+    frame = CType('PyFrameObject',R_PRES3)
 
     return (s
         .reserve_stack()
-        .mov(LOCALS,R_RET)
+        .mov(frame.f_locals,R_RET)
         .if_(not_(R_RET))
             .invoke('PyErr_Format','PyExc_SystemError','NO_LOCALS_LOAD_MSG',R_PRES1)
             .jmp(ret)
@@ -717,9 +1077,9 @@ def local_name_func(s):
             .jnz(inc_ret)
         .endif()
 
-        .invoke('PyDict_GetItem',GLOBALS,R_PRES1)
+        .invoke('PyDict_GetItem',frame.f_globals,R_PRES1)
         .if_(not_(R_RET))
-            .mov(BUILTINS,R_RET)
+            .mov(frame.f_builtins,R_RET)
             .if_(d_addr != type_of(R_RET))
                 .invoke('PyObject_GetItem',R_RET,R_PRES1)
                 .test(R_RET,R_RET)
@@ -753,16 +1113,19 @@ def global_name_func(s):
     # TODO: have just one copy shared by all compiled modules
 
     # R_PRES1 is expected to have the address of the name to load
+    # R_PRES3 is expected to have the address of the frame object
 
     ret = JumpTarget()
     name_err = JumpTarget()
     
     d_addr = s.fit_addr('PyDict_Type',R_SCRATCH1)
+    
+    frame = CType('PyFrameObject',R_PRES3)
 
     return (s
         .reserve_stack()
-        .mov(GLOBALS,R_SCRATCH2)
-        .mov(BUILTINS,R_PRES2)
+        .mov(frame.f_globals,R_SCRATCH2)
+        .mov(frame.f_builtins,R_PRES2)
         .if_(and_(d_addr == type_of(R_SCRATCH2),d_addr == type_of(R_PRES2)))
             .invoke('_PyDict_LoadGlobal',R_SCRATCH2,R_PRES2,R_PRES1)
             .if_(not_(R_RET))
@@ -794,6 +1157,10 @@ def global_name_func(s):
         .release_stack()
         .ret())
 
+@simple_frame('get_arg')
+def get_arg_func(s):
+    # TODO: have just one copy shared by all compiled modules
+
 
 ProtoFunction = namedtuple('ProtoFunction',['name','code'])
 
@@ -808,9 +1175,28 @@ class PyFunction:
     def name(self):
         return self.func.name
 
-def compile_eval(code,abi,util_funcs,entry_points,global_scope):
-    """Generate a function equivalent to PyEval_EvalFrameEx called with f.code"""
+
+def func_arg_addr(ec,i):
+    r = ec.code.func_arg(i)
     
+    if isinstance(r,ec.abi.Register):
+        psv = PendingStackValue()
+        ec.code.mov(r,psv)
+        return psv
+    
+    return r
+
+def func_arg_bind(ec,arg):
+    if isinstance(arg,PendingStackValue):
+        sv = ec.new_stack_value()
+        sv.owned = False
+        arg.bind(sv)
+        return sv
+    
+    return BorrowedValue(arg)
+
+
+def compile_eval(code,abi,util_funcs,entry_points,global_scope,name='<module>',args=None):
     # TODO: create and use extension function that creates the SymbolTable
     # object from the AST object (symtable.symtable generates an AST and then
     # discards it)
@@ -824,18 +1210,17 @@ def compile_eval(code,abi,util_funcs,entry_points,global_scope):
     
     # the stack will have following items:
     #     - return address
-    #     - old value of %ebp/%rbp
-    #     - old value of %ebx/%rbx
-    #     - old value of %esi/%rsi
+    #     - old value of R_PRES1
+    #     - old value of R_PRES2
+    #     - old value of R_PRES3
     #     - Frame object
-    #     - GLOBALS
-    #     - BUILTINS
-    #     - LOCALS
+    #     - globals
+    #     - locals
     #     - miscellaneous temp value
-    #     - TEMP_AX (if pyinternals.REF_DEBUG)
-    #     - TEMP_CX (if pyinternals.REF_DEBUG)
-    #     - TEMP_DX (if pyinternals.REF_DEBUG)
-    #     - COUNT_ALLOCS_TEMP (if pyinternals.COUNT_ALLOCS and not
+    #     - temp_ax (if pyinternals.REF_DEBUG)
+    #     - temp_cx (if pyinternals.REF_DEBUG)
+    #     - temp_dx (if pyinternals.REF_DEBUG)
+    #     - count_allocs_temp (if pyinternals.COUNT_ALLOCS and not
     #       pyinternals.REF_DEBUG)
     
     #state.throw_flag_store = ec.func_arg(1)
@@ -849,19 +1234,14 @@ def compile_eval(code,abi,util_funcs,entry_points,global_scope):
 
     fast_end = JumpTarget()
     
-    # at the epilogue, GLOBALS is no longer used and we use its space as a
-    # temporary store for the return value
-    ret_temp_store = GLOBALS
-    
     ec.code.new_stack_value(True) # the return address added by CALL
 
     (ec.code
         .comment('prologue')
         .annotation(debug.RETURN_ADDRESS)
-        .save_reg(R_BP)
-        .mov(R_SP,R_BP)
         .save_reg(R_PRES1)
         .save_reg(R_PRES2)
+        .save_reg(R_PRES3)
         .reserve_stack())
 
     f_obj = CType('PyFrameObject',R_PRES1)
@@ -869,6 +1249,11 @@ def compile_eval(code,abi,util_funcs,entry_points,global_scope):
 
     #if move_throw_flag:
     #    ec.code.mov(dword(ec.func_arg(1)),STATE.throw_flag_store)
+    
+    if args:
+        func_self = func_arg_addr(ec,1)
+        func_args = func_arg_addr(ec,2)
+        func_kwds = func_arg_addr(ec,3)
 
     argreg = arg_reg(0,R_SCRATCH1)
     (ec.code
@@ -879,31 +1264,32 @@ def compile_eval(code,abi,util_funcs,entry_points,global_scope):
         .get_threadstate(R_SCRATCH1)
 
         .mov(f_obj.f_globals,R_SCRATCH2)
-        .mov(f_obj.f_builtins,R_RET)
+        .mov(f_obj.f_locals,R_RET)
 
-        .push_stack_prolog(R_PRES1,debug.PushVariable('f'))
-        .push_stack_prolog(R_SCRATCH2)
-        .push_stack_prolog(R_RET)
-
-        .mov(f_obj.f_locals,R_SCRATCH2)
-        .push_stack_prolog(R_SCRATCH2)
+        .push_stack_prolog(R_PRES1,'frame',debug.PushVariable('f'))
+        .push_stack_prolog(R_SCRATCH2,'globals')
+        .push_stack_prolog(R_RET,'locals')
 
         .mov(R_PRES1,tstate.frame))
     
-    stack_extra = 1 # 1 for the miscellaneous temp value
+    ec.code.new_stack_value(True,'temp')
+    
     if pyinternals.REF_DEBUG:
         # a place to store r_ret, r_scratch[0] and r_scratch[1] when increasing
         # reference counts (which calls a function when ref_debug is True)
-        stack_extra += DEBUG_TEMPS
+        ec.code.new_stack_value(True,'temp_ax')
+        ec.code.new_stack_value(True,'temp_cx')
+        ec.code.new_stack_value(True,'temp_dx')
     elif pyinternals.COUNT_ALLOCS:
         # when COUNT_ALLOCS is True and REF_DEBUG is not, an extra space is
         # needed to save a temporary value
-        stack_extra += 1
-    
-    for _ in range(stack_extra):
-        ec.code.new_stack_value(True)
+        ec.code.new_stack_value(True,'count_allocs_temp')
 
     naddr = ec.code.fit_addr('Py_None',R_RET)
+    
+    # at the epilogue, GLOBALS is no longer used and we use its space as a
+    # temporary store for the return value
+    ret_temp_store = ec.code.special_addrs['globals']
 
     if False: #STATE.code.co_flags & CO_GENERATOR:
         (ec.code
@@ -953,12 +1339,25 @@ def compile_eval(code,abi,util_funcs,entry_points,global_scope):
                 .mov(0,ret_temp_store)
                 .jmp(fast_end)
             .endif())
-    
-    ec.allocate_locals()
 
     #if move_throw_flag:
         # use the original address for temp_store again
         #state.temp_store = state.throw_flag_store
+    
+    counted = []
+    
+    ec.allocate_locals(args)
+    
+    if args:
+        func_self = func_arg_bind(ec,func_self)
+        func_args = func_arg_bind(ec,func_args)
+        func_kwds = func_arg_bind(ec,func_kwds)
+        
+        ec.handle_args(args,func_self,func_args,func_kwds)
+        
+        func_self.discard(ec.code)
+        func_args.discard(ec.code)
+        func_kwds.discard(ec.code)
     
     ec.visit(mod_ast)
     
@@ -966,10 +1365,6 @@ def compile_eval(code,abi,util_funcs,entry_points,global_scope):
 
     tstate = CType('PyThreadState',R_SCRATCH1)
     f_obj = CType('PyFrameObject',R_SCRATCH2)
-    
-    # at the epilogue, GLOBALS is no longer used and we use its space as a
-    # temporary store for the return value
-    ret_temp_store = GLOBALS
 
     # return R_RET
     (ec.code
@@ -981,19 +1376,19 @@ def compile_eval(code,abi,util_funcs,entry_points,global_scope):
         .call('_LeaveRecursiveCall')
         .mov(ret_temp_store,R_RET)
         .get_threadstate(R_SCRATCH1)
-        .mov(FRAME,R_SCRATCH2)
+        .mov(ec.code.special_addrs['frame'],R_SCRATCH2)
         .release_stack()
+        .restore_reg(R_PRES3)
         .restore_reg(R_PRES2)
-        .restore_reg(R_PRES1)
         .mov(f_obj.f_back,R_SCRATCH2)
-        .restore_reg(R_BP)
+        .restore_reg(R_PRES1)
         .mov(R_SCRATCH2,tstate.frame)
         .ret())
 
     ec.code.def_stack_offset.base = aligned_size(
         (stack_len + max(MAX_ARGS-len(abi.r_arg),0)) * abi.ptr_size + abi.shadow) // abi.ptr_size
 
-    return PyFunction(ProtoFunction('stuff',ec.code.code),tuple(ec.names.keys()),tuple(ec.consts.keys()))
+    return PyFunction(ProtoFunction(name,ec.code.code),tuple(ec.names.keys()),tuple(ec.consts.keys()))
 
 
 def compile_raw(code,abi):

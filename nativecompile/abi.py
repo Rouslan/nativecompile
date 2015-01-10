@@ -119,6 +119,8 @@ class Tuning:
 
 
 class Abi:
+    has_cmovecc = False
+    
     def __init__(self,*,assembly=False):
         self.tuning = Tuning()
         self.assembly = assembly
@@ -135,10 +137,9 @@ class CdeclAbi(Abi):
     
     shadow = 0
     r_ret = x86_ops.eax
-    r_scratch = [x86_ops.ecx,x86_ops.edx]
+    r_scratch = [x86_ops.ecx,x86_ops.edx,x86_ops.ebp]
     r_pres = [x86_ops.ebx,x86_ops.esi,x86_ops.edi]
     r_sp = x86_ops.esp
-    r_bp = x86_ops.ebp
     r_arg = []
     ptr_size = 4
     char_size = 1
@@ -153,11 +154,12 @@ class CdeclAbi(Abi):
 
 
 class X86_64Abi(Abi):
+    has_cmovecc = True
+    
     _op = x86_64_ops
     
     r_ret = x86_64_ops.rax
     r_sp = x86_64_ops.rsp
-    r_bp = x86_64_ops.rbp
     r_rip = x86_64_ops.rip
     
     ptr_size = 8
@@ -175,7 +177,7 @@ class SystemVAbi(X86_64Abi):
     shadow = 0
 
     r_scratch = [x86_64_ops.r10,x86_64_ops.r11]
-    r_pres = [x86_64_ops.rbx,x86_64_ops.r12,x86_64_ops.r13,x86_64_ops.r14,x86_64_ops.r15]
+    r_pres = [x86_64_ops.rbx,x86_64_ops.rbp,x86_64_ops.r12,x86_64_ops.r13,x86_64_ops.r14,x86_64_ops.r15]
     
     r_arg = [x86_64_ops.rdi,x86_64_ops.rsi,x86_64_ops.rdx,x86_64_ops.rcx,x86_64_ops.r8,x86_64_ops.r9]
 
@@ -184,7 +186,7 @@ class MicrosoftX64Abi(X86_64Abi):
     shadow = 32
 
     r_scratch = [x86_64_ops.r10,x86_64_ops.r11]
-    r_pres = [x86_64_ops.rbx,x86_64_ops.rsi,x86_64_ops.rdi,x86_64_ops.r12,x86_64_ops.r13,x86_64_ops.r14,x86_64_ops.r15]
+    r_pres = [x86_64_ops.rbx,x86_64_ops.rsi,x86_64_ops.rdi,x86_64_ops.rbp,x86_64_ops.r12,x86_64_ops.r13,x86_64_ops.r14,x86_64_ops.r15]
     r_arg = [x86_64_ops.rcx,x86_64_ops.rdx,x86_64_ops.r8,x86_64_ops.r9]
 
 

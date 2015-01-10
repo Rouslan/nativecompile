@@ -551,7 +551,7 @@ def cmovcc(test : Test,a : Register,b : Register):
     assert a.w and b.w
 
     # unlike most, this instruction moves R/M to Reg instead of Reg to R/M
-    # (lookup the Intel machine instruction format for the nomenclature)
+    # (look-up the Intel machine instruction format for the nomenclature)
     return rex(b,a) + bytes([
         0b00001111,
         0b01000000 | test.val,
@@ -766,6 +766,35 @@ def notb(x : Address):
 @multimethod
 def notl(x : Address):
     return not_addr(x,SIZE_D)
+
+
+
+@multimethod
+def or_(a : Register,b : Register):
+    return _op_reg_reg(0b00001000,a,b)
+
+@multimethod
+def or_(a : Address,b : Register):
+    return _op_addr_reg(0b00001000,a,b,True)
+
+@multimethod
+def or_(a : Register,b : Address):
+    return _op_addr_reg(0b00001000,a,b,False)
+
+@multimethod
+def or_(a : int,b : Register):
+    return _op_imm_reg(0b10000000,0b001,0b00001100,a,b)
+
+def or_imm_addr(a,b,size):
+    return _op_imm_addr(0b10000000,0b001,a,b,size)
+
+@multimethod
+def orb(a : int,b : Address):
+    return or_imm_addr(a,b,SIZE_B)
+
+@multimethod
+def ord(a : int,b : Address):
+    return or_imm_addr(a,b,SIZE_D)
 
 
 

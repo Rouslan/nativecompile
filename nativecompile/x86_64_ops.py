@@ -174,6 +174,12 @@ def notq(x : Address):
 
 
 @multimethod
+def orq(a : int,b : Address):
+    return x86_ops.or_imm_addr(a,b,SIZE_Q)
+
+
+
+@multimethod
 def push(x : Register):
     assert x.size == SIZE_Q
     return x86_ops.push(x)

@@ -68,6 +68,8 @@
 #define CANNOT_IMPORT_MSG "cannot import name %S"
 #define IMPORT_NOT_FOUND_MSG "__import__ not found"
 #define BAD_EXCEPTION_MSG "'finally' pops bad exception"
+#define UNEXPECTED_KW_ARG_MSG "%U() got an unexpected keyword argument '%S'"
+#define DUPLICATE_VAL_MSG "%U() got multiple values for argument '%S'"
 
 
 static int call_trace(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
@@ -376,48 +378,30 @@ typedef struct {
     PyObject_HEAD
 
     PyObject *name;
+    
+    /* The function parameter names are always at the beginning and in order.
+       The positional parameter names are at the start, followed by the name of
+       the * parameter if var_pos is 1, followed by the keyword-only parameters,
+       followed by the ** parameter if var_kw if 1.
+    
+       All code that relies on this order (including python code) will have a
+       comment containing "FUNCTION_BODY_NAME_ORDER". */
     PyObject *names;
+    
     PyObject *consts;
 
     CompiledCode *code;
 
     Py_ssize_t offset;
-} Function;
+    
+    int pos_params;
+    int kwonly_params;
+    
+    char var_pos;
+    char var_kw;
+} FunctionBody;
 
-static PyObject *Function_call(Function *self,PyObject *args,PyObject *kwds) {
-    PyFrameObject *f;
-    PyCodeObject *dummy_code;
-    PyObject *locals = PyEval_GetLocals();
-    PyObject *globals = PyEval_GetGlobals();
-    PyThreadState *tstate = PyThreadState_GET();
-    PyObject *r = NULL;
-    
-    static char *kwlist[] = {"globals","locals",NULL};
-    
-    if(!self->code) {
-        PyErr_SetString(PyExc_AttributeError,"code");
-        return NULL;
-    }
-
-    if(!PyArg_ParseTupleAndKeywords(args,kwds,"|OO",kwlist,
-        &globals,
-        &locals)) return NULL;
-    
-    dummy_code = PyCode_NewEmpty("<string>","generated",0);
-    if(!dummy_code) return NULL;
-    
-    f = PyFrame_New(tstate,dummy_code,globals,locals);
-    Py_DECREF(dummy_code);
-    
-    if(f) {
-        r = (*(PyObject *(*)(PyFrameObject*))(self->code->data + self->offset))(f);
-        Py_DECREF(f);
-    }
-    
-    return r;
-}
-
-static int Function_traverse(Function *self,visitproc visit,void *arg) {
+static int FunctionBody_traverse(FunctionBody *self,visitproc visit,void *arg) {
     Py_VISIT(self->name);
     Py_VISIT(self->names);
     Py_VISIT(self->consts);
@@ -426,7 +410,7 @@ static int Function_traverse(Function *self,visitproc visit,void *arg) {
     return 0;
 }
 
-static int Function_clear(Function *self) {
+static int FunctionBody_clear(FunctionBody *self) {
     Py_CLEAR(self->name);
     Py_CLEAR(self->names);
     Py_CLEAR(self->consts);
@@ -435,41 +419,47 @@ static int Function_clear(Function *self) {
     return 0;
 }
 
-static void Function_dealloc(Function *self) {
-    Function_clear(self);
+static void FunctionBody_dealloc(FunctionBody *self) {
+    FunctionBody_clear(self);
     
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
-/* Although there is no reason to modify a Function instance once it's
-   initialized, initialization is done in tp_init and not tp_new so that an
-   instance can be created and have an address in memory, before it is
-   initialized. This is so the function's address can be hard-coded into its own
-   code object.  */
-static int Function_init(Function *self,PyObject *args,PyObject *kwds) {
+/* There is no reason to modify a FunctionBody instance once it's initialized,
+   but initialization is done in tp_init and not tp_new so that an instance can
+   be created and have an address in memory, before it is initialized. This is
+   so the function's address can be hard-coded into its own code object. */
+static int FunctionBody_init(FunctionBody *self,PyObject *args,PyObject *kwds) {
     CompiledCode *code;
     PyObject *name, *names, *consts;
     Py_ssize_t offset;
+    int pos_params, var_pos, kw_params, var_kw;
     
-    static char *kwlist[] = {"code","offset","name","names","consts",NULL};
+    static char *kwlist[] = {"code","offset","name","names","pos_params","var_pos","kw_params","var_kw","consts",NULL};
+    
+    if(self->code) {
+        PyErr_SetString(PyExc_ValueError,"an instance of FunctionBody can only be initialized once");
+        return -1;
+    }
 
-    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O!nUOO",kwlist,
+    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O!nUOipipO",kwlist,
         &CompiledCodeType,&code,
         &offset,
         &name,
         &names,
-        &consts)) return NULL;
+        &pos_params,
+        &var_pos,
+        &kw_params,
+        &var_kw,
+        &consts)) return -1;
     
-    Function_clear(self);
+    FunctionBody_clear(self);
     
     self->names = PySequence_Tuple(names);
     if(!self->names) return -1;
     
     self->consts = PySequence_Tuple(consts);
-    if(!self->consts) {
-        Py_CLEAR(self->names);
-        return -1;
-    }
+    if(!self->consts) return -1;
     
     self->name = name;
     Py_INCREF(name);
@@ -478,15 +468,236 @@ static int Function_init(Function *self,PyObject *args,PyObject *kwds) {
     Py_INCREF(code);
     
     self->offset = offset;
+    self->pos_params = pos_params;
+    self->var_pos = var_pos;
+    self->kw_params = kw_params;
+    self->var_kw = var_kw;
 
     return 0;
 }
 
+static PyMemberDef FunctionBody_members[] = {
+    {"name",T_OBJECT_EX,offsetof(FunctionBody,name),READONLY,NULL},
+    {"names",T_OBJECT_EX,offsetof(FunctionBody,names),READONLY,NULL},
+    {"consts",T_OBJECT_EX,offsetof(FunctionBody,consts),READONLY,NULL},
+    {"code",T_OBJECT_EX,offsetof(FunctionBody,code),READONLY,NULL},
+    {"pos_params",T_INT,offsetof(FunctionBody,code),READONLY,NULL},
+    {"kw_params",T_INT,offsetof(FunctionBody,code),READONLY,NULL},
+    {"var_pos",T_BOOL,offsetof(FunctionBody,code),READONLY,NULL},
+    {"var_kw",T_BOOL,offsetof(FunctionBody,code),READONLY,NULL},
+    {NULL}
+};
+
+static PyTypeObject FunctionBodyType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "nativecompile.pyinternals.FunctionBody", /* tp_name */
+    sizeof(FunctionBody),      /* tp_basicsize */
+    0,                         /* tp_itemsize */
+    (destructor)FunctionBody_dealloc, /* tp_dealloc */
+    0,                         /* tp_print */
+    0,                         /* tp_getattr */
+    0,                         /* tp_setattr */
+    0,                         /* tp_reserved */
+    0,                         /* tp_repr */
+    0,                         /* tp_as_number */
+    0,                         /* tp_as_sequence */
+    0,                         /* tp_as_mapping */
+    0,                         /* tp_hash  */
+    0,                         /* tp_call */
+    0,                         /* tp_str */
+    0,                         /* tp_getattro */
+    0,                         /* tp_setattro */
+    0,                         /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC, /* tp_flags */
+    "Compiled Function Body",  /* tp_doc */
+    (traverseproc)FunctionBody_traverse, /* tp_traverse */
+    (inquiry)FunctionBody_clear, /* tp_clear */
+    0,                         /* tp_richcompare */
+    0,                         /* tp_weaklistoffset */
+    0,                         /* tp_iter */
+    0,                         /* tp_iternext */
+    0,                         /* tp_methods */
+    FunctionBody_members,      /* tp_members */
+    0,                         /* tp_getset */
+    0,                         /* tp_base */
+    0,                         /* tp_dict */
+    0,                         /* tp_descr_get */
+    0,                         /* tp_descr_set */
+    0,                         /* tp_dictoffset */
+    (initproc)FunctionBody_init, /* tp_init */
+    0,                         /* tp_alloc */
+    0,                         /* tp_new */
+};
+
+
+typedef struct {
+    PyObject_HEAD
+
+    PyObject *name;
+    PyObject *doc;
+    PyObject *globals;
+    PyObject *defaults;
+    PyObject **kwdefaults;
+    PyObject *annotations;
+    PyObject *module;
+    PyObject *dict;
+    PyObject *weakrefs;
+
+    FunctionBody *body;
+} Function;
+
+static PyObject *Function_call(Function *self,PyObject *args,PyObject *kwds) {
+    PyFrameObject *f;
+    PyCodeObject *dummy_code;
+    PyThreadState *tstate = PyThreadState_GET();
+    PyObject *r = NULL;
+
+
+    assert(self->body && self->globals);
+    
+    dummy_code = PyCode_NewEmpty("<string>","generated",0);
+    if(!dummy_code) return NULL;
+    
+    f = PyFrame_New(tstate,dummy_code,self->globals,NULL);
+    Py_DECREF(dummy_code);
+    
+    if(f) {
+        r = (*(PyObject *(*)(PyFrameObject*,Function*,PyObject*,PyObject*))(self->code->data + self->offset))(f,self,args,kwds);
+        Py_DECREF(f);
+    }
+    
+    return r;
+}
+
+#define FOR_FUNCTION_ATTR(X) \
+    X(self->name); \
+    X(self->doc); \
+    X(self->globals); \
+    X(self->defaults); \
+    { \
+        int i; \
+        for(i=0; i<self->body->kwonly_params; ++i) X(self->kwdefaults[i]); \
+    } \
+    X(self->annotations); \
+    X(self->module); \
+    X(self->dict); \
+    X(self->body)
+
+static int Function_traverse(Function *self,visitproc visit,void *arg) {
+    FOR_FUNCTION_ATTR(Py_VISIT);
+    
+    return 0;
+}
+
+static void Function_dealloc(Function *self) {
+    if(self->weakrefs) PyObject_ClearWeakRefs((PyObject*)self);
+    
+    FOR_FUNCTION_ATTR(Py_XDECREF);
+    
+    PyMem_Free(self->kwdefaults);
+    
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static PyObject *Function_new(PyTypeObject *type,PyObject *args,PyObject *kwds) {
+    Function *self;
+    PyObject *kwdefaults;
+    
+    static char *kwlist[] = {"body","name","globals","doc","defaults","kwdefaults","annotations",NULL};
+    
+    self = (Function*)type->tp_alloc(type,0);
+    if(!self) return NULL;
+
+    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O!UO!|OO!O!O!",kwlist,
+            &FunctionBodyType,&self->body,
+            &self->name,
+            &PyDict_Type,&self->globals,
+            &self->doc,
+            &PyTuple_Type,&self->defaults,
+            &PyDict_Type,&kwdefaults,
+            &PyDict_Type,&self->annotations)) {
+        Py_DECREF(self);
+        return NULL;
+    }
+    
+    if(!self->body->code) {
+        PyErr_SetString(PyExc_ValueError,"\"body\" was not initialized");
+        Py_DECREF(self);
+        return NULL;
+    }
+    
+    if(!self->defaults) {
+        if(self->body->pos_params) {
+            self->defaults = PyTuple_New(0);
+            if(!self->defaults) {
+                Py_DECREF(self);
+                return NULL;
+            }
+        }
+    } else if(PyTuple_GET_SIZE(self->defaults) > self->body->pos_params) {
+        PyErr_SetString(PyExc_ValueError,"there cannot be more default positional arguments than positional parameters");
+        Py_DECREF(self);
+        return NULL;
+    }
+    
+    if(kwdefaults) {
+        PyObject *k, *v;
+        Py_ssize_t pos = 0;
+        
+        if(self->body->kwonly_params) {
+            self->kwdefaults = PyMem_Malloc(sizeof(PyObject*)*self->body->kwonly_params);
+        }
+        
+        while(PyDict_Next(kwdefaults,&pos,&k,&v)) {
+            int i;
+            int kwoffset = self->body->pos_params + self->body->var_pos;
+            
+            for(i=0; i<self->body->kwonly_params; ++i) {
+                PyObject *kwname = self->body->names[kwoffset+i];
+                int cmp = PyObject_RichCompareBool(kwname,k,Py_EQ);
+                
+                if(cmp < 0) {
+                    Py_DECREF(self);
+                    return NULL;
+                }
+                if(cmp) {
+                    self->kwdefaults[i] = v;
+                    Py_INCREF(v);
+                    goto next;
+                }
+            }
+            
+            PyErr_Format(PyExc_ValueError,"\"body\" does not have a keyword-only parameter named \"%S\"",v);
+            Py_DECREF(self);
+            return NULL;
+            
+        next:
+            ;
+        }
+    }
+    
+    /* TODO: store interned unicode object in this module */
+    self->module = PyDict_GetItemString(self->globals,"__name__");
+    if(self->module) Py_INCREF(module);
+
+    return (PyObject*)self;
+}
+
+static PyObject *Function_descr_get(PyObject *self,PyObject *obj,PyObject *type) {
+    if(!obj || obj == Py_None) {
+        Py_INCREF(self);
+        return self;
+    }
+    return PyMethod_New(self,obj);
+}
+
 static PyMemberDef Function_members[] = {
-    {"name",T_OBJECT_EX,offsetof(Function,name),READONLY,NULL},
-    {"names",T_OBJECT_EX,offsetof(Function,names),READONLY,NULL},
-    {"consts",T_OBJECT_EX,offsetof(Function,consts),READONLY,NULL},
-    {"code",T_OBJECT_EX,offsetof(Function,code),READONLY,NULL},
+    {"__name__",T_OBJECT_EX,offsetof(Function,name),READONLY,NULL},
+    {"__doc__",T_OBJECT_EX,offsetof(Function,doc),READONLY,NULL},
+    {"defaults",T_OBJECT_EX,offsetof(Function,defaults),READONLY,NULL},
+    {"annotations",T_OBJECT_EX,offsetof(Function,annotations),READONLY,NULL},
+    {"__module__",T_OBJECT_EX,offsetof(Function,module),READONLY,NULL},
+    {"body",T_OBJECT_EX,offsetof(Function,body),READONLY,NULL},
     {NULL}
 };
 
@@ -513,22 +724,22 @@ static PyTypeObject FunctionType = {
     Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC, /* tp_flags */
     "Compiled Function",       /* tp_doc */
     (traverseproc)Function_traverse, /* tp_traverse */
-    (inquiry)Function_clear,   /* tp_clear */
-    0,	                       /* tp_richcompare */
-    0,	                       /* tp_weaklistoffset */
-    0,	                       /* tp_iter */
-    0,	                       /* tp_iternext */
+    0,                         /* tp_clear */
+    0,                         /* tp_richcompare */
+    offsetof(Function,weakrefs), /* tp_weaklistoffset */
+    0,                         /* tp_iter */
+    0,                         /* tp_iternext */
     0,                         /* tp_methods */
     Function_members,          /* tp_members */
     0,                         /* tp_getset */
     0,                         /* tp_base */
     0,                         /* tp_dict */
-    0,                         /* tp_descr_get */
+    Function_descr_get,        /* tp_descr_get */
     0,                         /* tp_descr_set */
-    0,                         /* tp_dictoffset */
-    (initproc)Function_init,   /* tp_init */
+    offsetof(Function,dict),   /* tp_dictoffset */
+    0,                         /* tp_init */
     0,                         /* tp_alloc */
-    0,                         /* tp_new */
+    Function_new,              /* tp_new */
 };
 
 
@@ -560,11 +771,10 @@ static PyObject *append_tuple_for_call(PyObject *func,PyObject *args,PyObject *s
         if(!tmp) {
             if(PyErr_ExceptionMatches(PyExc_TypeError)) {
                 PyErr_Format(PyExc_TypeError,
-                             "%.200s%.200s argument after * "
-                             "must be a sequence, not %.200s",
-                             PyEval_GetFuncName(func),
-                             PyEval_GetFuncDesc(func),
-                             star->ob_type->tp_name);
+                    "%.200s%.200s argument after * must be a sequence, not %.200s",
+                    PyEval_GetFuncName(func),
+                    PyEval_GetFuncDesc(func),
+                    star->ob_type->tp_name);
             }
             Py_XDECREF(args);
             return NULL;
@@ -608,11 +818,10 @@ static PyObject *append_dict_for_call(PyObject *func,PyObject *args,PyObject *st
         if(PyDict_Update(tmp,star)) {
             if(PyErr_ExceptionMatches(PyExc_TypeError)) {
                 PyErr_Format(PyExc_TypeError,
-                             "%.200s%.200s argument after * "
-                             "must be a mapping, not %.200s",
-                             PyEval_GetFuncName(func),
-                             PyEval_GetFuncDesc(func),
-                             star->ob_type->tp_name);
+                    "%.200s%.200s argument after * must be a mapping, not %.200s",
+                    PyEval_GetFuncName(func),
+                    PyEval_GetFuncDesc(func),
+                    star->ob_type->tp_name);
             }
             Py_XDECREF(args);
             return NULL;
@@ -624,11 +833,10 @@ static PyObject *append_dict_for_call(PyObject *func,PyObject *args,PyObject *st
         while(PyDict_Next(star,&pos,&k,&v)) {
             if(PyDict_GetItem(args,k)) {
                 PyErr_Format(PyExc_TypeError,
-                             "%.200s%s got multiple values "
-                             "for keyword argument '%U'",
-                             PyEval_GetFuncName(func),
-                             PyEval_GetFuncDesc(func),
-                             k);
+                    "%.200s%s got multiple values for keyword argument '%U'",
+                    PyEval_GetFuncName(func),
+                    PyEval_GetFuncDesc(func),
+                    k);
                 Py_DECREF(args);
                 args = NULL;
                 break;
@@ -646,6 +854,157 @@ static PyObject *append_dict_for_call(PyObject *func,PyObject *args,PyObject *st
     
     Py_XDECREF(tmp);
     return args;
+}
+
+static void too_many_positional(Function *f,long excess,PyObject *kwds) {
+    PyObject *sig, kw_sig;
+    int plural, given, start, i;
+    int kwonly = 0;
+    
+    assert(!f->body->var_pos);
+    
+    if(PyTuple_GET_SIZE(f->defaults)) {
+        sig = PyUnicode_FromFormat(
+            "from %d to %d",
+            f->body->pos_params - PyTuple_GET_SIZE(f->defaults),
+            f->body->pos_params);
+        plural = 1;
+    } else {
+        sig = PyUnicode_FromFormat("%d",f->body->pos_params);
+        plural = f->body->pos_params != 1;
+    }
+    if(!sig) return;
+    
+    start = f->body->pos_params + f->body->var_pos;
+    for(i=start; i<start+f->body->kwonly_params; ++i) {
+        int c = PyDict_Contains(kwds,f->body->names[i]);
+        if(c < 0) return;
+        kwonly += c;
+    }
+    
+    given = f->body->pos_params + excess;
+    
+    if(kwonly)
+        kw_sig = PyUnicode_FromFormat(
+            " positional argument%s (and %d keyword-only argument%s)",
+            given != 1 ? "s" : "",
+            kwonly,
+            kwonly != 1 ? "s" : "");
+    else
+        kw_sig = PyUnicode_FromString("");
+    
+    if(!kw_sig) {
+        Py_DECREF(sig);
+        return;
+    }
+    
+    PyErr_Format(PyExc_TypeError,
+        "%U() takes %U positional argument%s but %d%U %s given",
+        f->name,
+        sig,
+        plural ? "s" : "",
+        given,
+        kw_sig,
+        given == 1 && !kwonly ? "was" : "were");
+    
+    Py_DECREF(kw_sig);
+    Py_DECREF(sig);
+}
+
+/* Note: we report missing arguments slightly differently from CPython. CPython
+   first checks positional arguments and then keyword-only arguments and
+   mentions whether the arguments are positional or keyword-only in the error
+   message. Our code will report all missing arguments together, and not mention
+   which kind they are (since the list could have both). */
+static void missing_arguments(Function *f,PyObject **locals) {
+    int i, len;
+    PyObject *name_str, *comma, *tail, *tmp;
+    
+    int n_count = f->body->pos_params + f->body->var_pos + f->body->kwonly_params;
+    PyObject *names = PyList_New(0);
+    if(!names) return;
+    
+    for(i=0; i<f->body->pos_params; ++i) {
+        /* FUNCTION_BODY_NAME_ORDER
+           it doesn't matter if the "*" parameter is set */
+        if(!locals[i] && !(f->body->var_pos && i == f->body->pos_params)) {
+            int r;
+            
+            PyObject *name = PyObject_Repr(PyTuple_GET_ITEM(f->body->names,i));
+            if(!name) {
+                Py_DECREF(names);
+                return;
+            }
+            
+            r = PyList_Append(names,name);
+            PyDECREF(name);
+            if(r < 0) {
+                Py_DECREF(names);
+                return;
+            }
+        }
+    }
+    
+    /* the rest of the code here is adapted from format_missing from
+       Python/ceval.c */
+    
+    len = PyList_GET_SIZE(names);
+    assert(len);
+
+    switch(len) {
+    case 1:
+        name_str = PyList_GET_ITEM(names,0);
+        Py_INCREF(name_str);
+        break;
+    case 2:
+        name_str = PyUnicode_FromFormat(
+            "%U and %U",
+            PyList_GET_ITEM(names,0),
+            PyList_GET_ITEM(names,1));
+        break;
+    default:
+        name_str = NULL;
+
+        if(!(tail = PyUnicode_FromFormat(
+            ", %U, and %U",
+            PyList_GET_ITEM(names,len - 2),
+            PyList_GET_ITEM(names,len - 1)))) break;
+
+        if(PyList_SetSlice(names,len - 2,len,NULL) < 0) {
+            Py_DECREF(tail);
+            break;
+        }
+        
+        if(!(comma = PyUnicode_FromString(", "))) {
+            Py_DECREF(tail);
+            break;
+        }
+        
+        tmp = PyUnicode_Join(comma,names);
+        Py_DECREF(comma);
+        if(!tmp) {
+            Py_DECREF(tail);
+            break;
+        }
+        
+        name_str = PyUnicode_Concat(tmp,tail);
+        Py_DECREF(tmp);
+        Py_DECREF(tail);
+        break;
+    }
+    
+    Py_DECREF(names);
+    
+    if(!name_str) return;
+    
+    PyErr_Format(
+        PyExc_TypeError,
+        "%U() missing %i required argument%s: %U",
+        f->name,
+        len,
+        len == 1 ? "" : "s",
+        name_str);
+    Py_DECREF(name_str);
 }
 
 
@@ -1225,6 +1584,10 @@ static OffsetStruct member_offsets[] = {
             M_OFFSET(PyMethodObject,im_self),
             M_OFFSET(PyMethodObject,im_func),
             {NULL}}},
+    {"Function",(OffsetMember[]){
+            M_OFFSET(Function,defaults),
+            M_OFFSET(Function,kwdefaults),
+            {NULL}}},
     {NULL}
 };
 
@@ -1237,8 +1600,8 @@ PyInit_pyinternals(void) {
 
     if(PyType_Ready(&CompiledCodeType) < 0) return NULL;
     
-    FunctionType.tp_new = PyType_GenericNew;
-    if(PyType_Ready(&FunctionType) < 0) return NULL;
+    FunctionBodyType.tp_new = PyType_GenericNew;
+    if(PyType_Ready(&FunctionBodyType) < 0) return NULL;
 
     m = PyModule_Create(&this_module);
     if(!m) return NULL;
@@ -1352,6 +1715,8 @@ PyInit_pyinternals(void) {
         ADD_ADDR(_EnterRecursiveCall),
         ADD_ADDR(_LeaveRecursiveCall),
         
+        ADD_ADDR(missing_arguments),
+        ADD_ADDR(too_many_positional),
         ADD_ADDR(append_tuple_for_call),
         ADD_ADDR(append_dict_for_call),
         ADD_ADDR(format_exc_check_arg),
@@ -1410,6 +1775,9 @@ PyInit_pyinternals(void) {
 
     Py_INCREF(&CompiledCodeType);
     if(PyModule_AddObject(m,"CompiledCode",(PyObject*)&CompiledCodeType) == -1) return NULL;
+    
+    Py_INCREF(&FunctionBodyType);
+    if(PyModule_AddObject(m,"FunctionBody",(PyObject*)&FunctionBodyType) == -1) return NULL;
     
     Py_INCREF(&FunctionType);
     if(PyModule_AddObject(m,"Function",(PyObject*)&FunctionType) == -1) return NULL;
