@@ -1,3 +1,17 @@
+#  Copyright 2015 Rouslan Korneychuk
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
 
 import binascii
 from itertools import islice
@@ -33,8 +47,8 @@ class SearchLimitReachedError(MachineCodeParseError):
 
 MOD_ANY = True
 
-# enforcing the memory-only and register-only varients of the ModRM byte are not
-# necessary for parsing, but it was easy to implement and having a stricter
+# enforcing the memory-only and register-only varients of the ModRM byte are
+# not necessary for parsing, but it was easy to implement and having a stricter
 # parser makes it easier to verify correctness
 MEM_ONLY = True + 1
 REG_ONLY = True + 2
@@ -228,8 +242,8 @@ one_byte_map = [
 # 0F is for AMD 3DNow! opcodes
 
 # when used without a prefix, B8 represents the JMPE instruction, which is not
-# supported here (because it is used to switch to IA-64 mode which is not useful
-# for applications and is not supported by native x86 processors anyway)
+# supported here (because it is used to switch to IA-64 mode which is not
+# useful for applications and is not supported by native x86 processors anyway)
 two_byte_map = [
 #    0   1   2   3   4   5   6   7   8   9   A   B   C   D   E   F
     MX, MX, MX, MX,  _,  _,  X,  _,  X,  X,  _,  _,  _, MX,  X, MB,   # 0
@@ -328,8 +342,8 @@ class FindOps:
         been visited, this iterator will produce zero items).
 
         Note: this class assumes that nothing else modifies 'visited' while a
-        instance of this class is iterated over, otherwise any changes made will
-        not be seen until set_position is called.
+        instance of this class is iterated over, otherwise any changes made
+        will not be seen until set_position is called.
 
         """
         assert mode == MODE_32 or mode == MODE_64
@@ -500,9 +514,9 @@ def find_move_1_addr_pair(position,mode,max_depth=0,visited=None):
                 if (ma & 0b111) == 0 and isinstance(mb,Address) and imm[0] == 1 and not any(imm[1:]):
                     mb.normalize(find_ops.position)
 
-                    # We do not handle the case where the address depends on any
-                    # register (except rip). If such a case is encountered, the
-                    # parser will need to be made more complex.
+                    # We do not handle the case where the address depends on
+                    # any register (except rip). If such a case is encountered,
+                    # the parser will need to be made more complex.
                     if not (mb.base is None and mb.index is None):
                         raise MachineCodeParseError()
 

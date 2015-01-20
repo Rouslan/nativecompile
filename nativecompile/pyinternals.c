@@ -1,3 +1,17 @@
+/* Copyright 2015 Rouslan Korneychuk
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 #include <Python.h>
 #include <structmember.h>
@@ -65,17 +79,11 @@
 #define NO_LOCALS_STORE_MSG "no locals found when storing %R"
 #define NO_LOCALS_DELETE_MSG "no locals when deleting %R"
 #define BUILD_CLASS_ERROR_MSG "__build_class__ not found"
-#define CANNOT_IMPORT_MSG "cannot import name %S"
+#define CANNOT_IMPORT_MSG "cannot import name %R"
 #define IMPORT_NOT_FOUND_MSG "__import__ not found"
 #define BAD_EXCEPTION_MSG "'finally' pops bad exception"
 #define UNEXPECTED_KW_ARG_MSG "%U() got an unexpected keyword argument '%S'"
 #define DUPLICATE_VAL_MSG "%U() got multiple values for argument '%S'"
-
-
-static int call_trace(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
-                      int what, PyObject *arg);
-static int call_trace_protected(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
-                                int what, PyObject *arg);
 
 
 #define GETLOCAL(i)     (fastlocals[i])
@@ -433,9 +441,9 @@ static int FunctionBody_init(FunctionBody *self,PyObject *args,PyObject *kwds) {
     CompiledCode *code;
     PyObject *name, *names, *consts;
     Py_ssize_t offset;
-    int pos_params, var_pos, kw_params, var_kw;
+    int pos_params, var_pos, kwonly_params, var_kw;
     
-    static char *kwlist[] = {"code","offset","name","names","pos_params","var_pos","kw_params","var_kw","consts",NULL};
+    static char *kwlist[] = {"code","offset","name","names","pos_params","var_pos","kwonly_params","var_kw","consts",NULL};
     
     if(self->code) {
         PyErr_SetString(PyExc_ValueError,"an instance of FunctionBody can only be initialized once");
@@ -449,7 +457,7 @@ static int FunctionBody_init(FunctionBody *self,PyObject *args,PyObject *kwds) {
         &names,
         &pos_params,
         &var_pos,
-        &kw_params,
+        &kwonly_params,
         &var_kw,
         &consts)) return -1;
     
@@ -470,7 +478,7 @@ static int FunctionBody_init(FunctionBody *self,PyObject *args,PyObject *kwds) {
     self->offset = offset;
     self->pos_params = pos_params;
     self->var_pos = var_pos;
-    self->kw_params = kw_params;
+    self->kwonly_params = kwonly_params;
     self->var_kw = var_kw;
 
     return 0;
@@ -562,7 +570,7 @@ static PyObject *Function_call(Function *self,PyObject *args,PyObject *kwds) {
     Py_DECREF(dummy_code);
     
     if(f) {
-        r = (*(PyObject *(*)(PyFrameObject*,Function*,PyObject*,PyObject*))(self->code->data + self->offset))(f,self,args,kwds);
+        r = (*(PyObject *(*)(PyFrameObject*,Function*,PyObject*,PyObject*))(self->body->code->data + self->body->offset))(f,self,args,kwds);
         Py_DECREF(f);
     }
     
@@ -574,7 +582,7 @@ static PyObject *Function_call(Function *self,PyObject *args,PyObject *kwds) {
     X(self->doc); \
     X(self->globals); \
     X(self->defaults); \
-    { \
+    if(self->kwdefaults) { \
         int i; \
         for(i=0; i<self->body->kwonly_params; ++i) X(self->kwdefaults[i]); \
     } \
@@ -601,59 +609,62 @@ static void Function_dealloc(Function *self) {
 
 static PyObject *Function_new(PyTypeObject *type,PyObject *args,PyObject *kwds) {
     Function *self;
-    PyObject *kwdefaults;
+    FunctionBody *body;
+    PyObject *name, *globals, *doc=NULL, *defaults=NULL, *kwdefaults=NULL, *annotations=NULL;
     
     static char *kwlist[] = {"body","name","globals","doc","defaults","kwdefaults","annotations",NULL};
+
+    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O!UO!|OO!O!O!",kwlist,
+            &FunctionBodyType,&body,
+            &name,
+            &PyDict_Type,&globals,
+            &doc,
+            &PyTuple_Type,&defaults,
+            &PyDict_Type,&kwdefaults,
+            &PyDict_Type,&annotations)) {
+        return NULL;
+    }
+    
+    if(!body->code) {
+        PyErr_SetString(PyExc_ValueError,"\"body\" was not initialized");
+        return NULL;
+    }
     
     self = (Function*)type->tp_alloc(type,0);
     if(!self) return NULL;
-
-    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O!UO!|OO!O!O!",kwlist,
-            &FunctionBodyType,&self->body,
-            &self->name,
-            &PyDict_Type,&self->globals,
-            &self->doc,
-            &PyTuple_Type,&self->defaults,
-            &PyDict_Type,&kwdefaults,
-            &PyDict_Type,&self->annotations)) {
-        Py_DECREF(self);
-        return NULL;
-    }
     
-    if(!self->body->code) {
-        PyErr_SetString(PyExc_ValueError,"\"body\" was not initialized");
-        Py_DECREF(self);
-        return NULL;
-    }
-    
-    if(!self->defaults) {
-        if(self->body->pos_params) {
+    if(!defaults) {
+        if(body->pos_params) {
             self->defaults = PyTuple_New(0);
             if(!self->defaults) {
                 Py_DECREF(self);
                 return NULL;
             }
         }
-    } else if(PyTuple_GET_SIZE(self->defaults) > self->body->pos_params) {
-        PyErr_SetString(PyExc_ValueError,"there cannot be more default positional arguments than positional parameters");
-        Py_DECREF(self);
-        return NULL;
+    } else {
+        if(PyTuple_GET_SIZE(defaults) > body->pos_params) {
+            PyErr_SetString(PyExc_ValueError,"there cannot be more default positional arguments than positional parameters");
+            Py_DECREF(self);
+            return NULL;
+        }
+        self->defaults = defaults;
+        Py_INCREF(defaults);
     }
     
     if(kwdefaults) {
         PyObject *k, *v;
         Py_ssize_t pos = 0;
         
-        if(self->body->kwonly_params) {
-            self->kwdefaults = PyMem_Malloc(sizeof(PyObject*)*self->body->kwonly_params);
+        if(body->kwonly_params) {
+            self->kwdefaults = PyMem_Malloc(sizeof(PyObject*)*body->kwonly_params);
         }
         
         while(PyDict_Next(kwdefaults,&pos,&k,&v)) {
             int i;
-            int kwoffset = self->body->pos_params + self->body->var_pos;
+            int kwoffset = body->pos_params + body->var_pos;
             
-            for(i=0; i<self->body->kwonly_params; ++i) {
-                PyObject *kwname = self->body->names[kwoffset+i];
+            for(i=0; i<body->kwonly_params; ++i) {
+                PyObject *kwname = PyTuple_GET_ITEM(body->names,kwoffset+i);
                 int cmp = PyObject_RichCompareBool(kwname,k,Py_EQ);
                 
                 if(cmp < 0) {
@@ -676,9 +687,24 @@ static PyObject *Function_new(PyTypeObject *type,PyObject *args,PyObject *kwds) 
         }
     }
     
+    self->body = body;
+    Py_INCREF(body);
+    self->name = name;
+    Py_INCREF(name);
+    self->globals = globals;
+    Py_INCREF(globals);
+    if(doc) {
+        self->doc = doc;
+        Py_INCREF(doc);
+    }
+    if(annotations) {
+        self->annotations = annotations;
+        Py_INCREF(annotations);
+    }
+    
     /* TODO: store interned unicode object in this module */
-    self->module = PyDict_GetItemString(self->globals,"__name__");
-    if(self->module) Py_INCREF(module);
+    self->module = PyDict_GetItemString(globals,"__name__");
+    if(self->module) Py_INCREF(self->module);
 
     return (PyObject*)self;
 }
@@ -747,8 +773,10 @@ static PyTypeObject FunctionType = {
 PyDoc_STRVAR(read_address_doc,
 "read_address(address,length) -> bytes\n\
 \n\
-Get the contents of memory at an arbitary address. Warning: this function is\n\
-very unsafe. Improper use can easily cause a segmentation fault.");
+Get the contents of memory at an arbitary address.\n\
+\n\
+Warning: this function is very unsafe. Improper use can easily cause a\n\
+segmentation fault.");
 
 static PyObject *read_address(PyObject *self,PyObject *args) {
     unsigned long addr;
@@ -857,7 +885,7 @@ static PyObject *append_dict_for_call(PyObject *func,PyObject *args,PyObject *st
 }
 
 static void too_many_positional(Function *f,long excess,PyObject *kwds) {
-    PyObject *sig, kw_sig;
+    PyObject *sig, *kw_sig;
     int plural, given, start, i;
     int kwonly = 0;
     
@@ -877,7 +905,7 @@ static void too_many_positional(Function *f,long excess,PyObject *kwds) {
     
     start = f->body->pos_params + f->body->var_pos;
     for(i=start; i<start+f->body->kwonly_params; ++i) {
-        int c = PyDict_Contains(kwds,f->body->names[i]);
+        int c = PyDict_Contains(kwds,PyTuple_GET_ITEM(f->body->names,i));
         if(c < 0) return;
         kwonly += c;
     }
@@ -911,6 +939,32 @@ static void too_many_positional(Function *f,long excess,PyObject *kwds) {
     Py_DECREF(sig);
 }
 
+static void excess_keyword(Function *f,PyObject *kwds) {
+    PyObject *k, *v;
+    int i, r;
+    Py_ssize_t pos = 0;
+    
+    while(PyDict_Next(kwds,&pos,&k,&v)) {
+        for(i=0; i<f->body->pos_params+f->body->var_pos+f->body->kwonly_params; ++i) {
+            if(f->body->var_pos && i == f->body->pos_params) continue;
+            r = PyObject_RichCompareBool(k,PyTuple_GET_ITEM(f->body->names,i),Py_EQ);
+            if(r < 0) return;
+            if(r) goto keep_looking;
+        }
+        
+        PyErr_Format(
+            PyExc_TypeError,
+            "%U() got an unexpected keyword argument '%S'",
+            f->name,
+            k);
+        return;
+        
+    keep_looking:
+        ;
+    }
+    assert(0);
+}
+
 /* Note: we report missing arguments slightly differently from CPython. CPython
    first checks positional arguments and then keyword-only arguments and
    mentions whether the arguments are positional or keyword-only in the error
@@ -924,7 +978,7 @@ static void missing_arguments(Function *f,PyObject **locals) {
     PyObject *names = PyList_New(0);
     if(!names) return;
     
-    for(i=0; i<f->body->pos_params; ++i) {
+    for(i=0; i<n_count; ++i) {
         /* FUNCTION_BODY_NAME_ORDER
            it doesn't matter if the "*" parameter is set */
         if(!locals[i] && !(f->body->var_pos && i == f->body->pos_params)) {
@@ -937,7 +991,7 @@ static void missing_arguments(Function *f,PyObject **locals) {
             }
             
             r = PyList_Append(names,name);
-            PyDECREF(name);
+            Py_DECREF(name);
             if(r < 0) {
                 Py_DECREF(names);
                 return;
@@ -1118,8 +1172,6 @@ Error:
     return 0;
 }
 
-
-
 static PyObject *_exception_cmp(PyObject *exc,PyObject *type) {
     PyObject *ret;
 
@@ -1146,7 +1198,6 @@ static PyObject *_exception_cmp(PyObject *exc,PyObject *type) {
     Py_INCREF(ret);
     return ret;
 }
-
 
 static PyObject*
 _do_raise(PyObject *exc, PyObject *cause)
@@ -1307,10 +1358,10 @@ special_lookup(PyObject *o, _Py_Identifier *id)
 }
 
 static int
-call_trace(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
+call_trace(Py_tracefunc func, PyObject *obj,
+           PyThreadState *tstate, PyFrameObject *frame,
            int what, PyObject *arg)
 {
-    register PyThreadState *tstate = frame->f_tstate;
     int result;
     if (tstate->tracing)
         return 0;
@@ -1324,13 +1375,14 @@ call_trace(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
 }
 
 static int
-call_trace_protected(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
+call_trace_protected(Py_tracefunc func, PyObject *obj,
+                     PyThreadState *tstate, PyFrameObject *frame,
                      int what, PyObject *arg)
 {
     PyObject *type, *value, *traceback;
     int err;
     PyErr_Fetch(&type, &value, &traceback);
-    err = call_trace(func, obj, frame, what, arg);
+    err = call_trace(func, obj, tstate, frame, what, arg);
     if (err == 0)
     {
         PyErr_Restore(type, value, traceback);
@@ -1345,29 +1397,31 @@ call_trace_protected(Py_tracefunc func, PyObject *obj, PyFrameObject *frame,
 }
 
 static void
-call_exc_trace(Py_tracefunc func, PyObject *self, PyFrameObject *f)
+call_exc_trace(Py_tracefunc func, PyObject *self,
+               PyThreadState *tstate, PyFrameObject *f)
 {
-    PyObject *type, *value, *traceback, *arg;
+    PyObject *type, *value, *traceback, *orig_traceback, *arg;
     int err;
-    PyErr_Fetch(&type, &value, &traceback);
+    PyErr_Fetch(&type, &value, &orig_traceback);
     if (value == NULL) {
         value = Py_None;
         Py_INCREF(value);
     }
-    PyErr_NormalizeException(&type, &value, &traceback);
+    PyErr_NormalizeException(&type, &value, &orig_traceback);
+    traceback = (orig_traceback != NULL) ? orig_traceback : Py_None;
     arg = PyTuple_Pack(3, type, value, traceback);
     if (arg == NULL) {
-        PyErr_Restore(type, value, traceback);
+        PyErr_Restore(type, value, orig_traceback);
         return;
     }
-    err = call_trace(func, self, f, PyTrace_EXCEPTION, arg);
+    err = call_trace(func, self, tstate, f, PyTrace_EXCEPTION, arg);
     Py_DECREF(arg);
     if (err == 0)
-        PyErr_Restore(type, value, traceback);
+        PyErr_Restore(type, value, orig_traceback);
     else {
         Py_XDECREF(type);
         Py_XDECREF(value);
-        Py_XDECREF(traceback);
+        Py_XDECREF(orig_traceback);
     }
 }
 
@@ -1413,7 +1467,6 @@ unicode_concatenate(PyObject *v, PyObject *w, PyFrameObject *f,
     PyUnicode_Append(&res, w);
     return res;
 }
-
 
 static int _print_expr(PyObject *expr) {
     PyObject *args, *hook, *eval_ret;
@@ -1471,6 +1524,8 @@ static PyObject *_load_build_class(PyObject *f_builtins) {
     return x;
 }
 
+/* end of functions copied from Python/ceval.c */
+
 
 
 /* Py_EnterRecursiveCall and Py_LeaveRecursiveCall are somewhat complicated
@@ -1502,7 +1557,7 @@ static struct PyModuleDef this_module = {
     PyModuleDef_HEAD_INIT,
     "pyinternals",
     NULL,
-    -1,
+    0,
     functions,
     NULL,
     NULL,
@@ -1562,7 +1617,6 @@ static OffsetStruct member_offsets[] = {
             M_OFFSET(PyFrameObject,f_exc_type),
             M_OFFSET(PyFrameObject,f_exc_value),
             M_OFFSET(PyFrameObject,f_exc_traceback),
-            M_OFFSET(PyFrameObject,f_tstate),
             M_OFFSET(PyFrameObject,f_lasti),
             {NULL}}},
     {"PyThreadState",(OffsetMember[]){
@@ -1585,6 +1639,7 @@ static OffsetStruct member_offsets[] = {
             M_OFFSET(PyMethodObject,im_func),
             {NULL}}},
     {"Function",(OffsetMember[]){
+            M_OFFSET(Function,name),
             M_OFFSET(Function,defaults),
             M_OFFSET(Function,kwdefaults),
             {NULL}}},
@@ -1602,6 +1657,8 @@ PyInit_pyinternals(void) {
     
     FunctionBodyType.tp_new = PyType_GenericNew;
     if(PyType_Ready(&FunctionBodyType) < 0) return NULL;
+    
+    if(PyType_Ready(&FunctionType) < 0) return NULL;
 
     m = PyModule_Create(&this_module);
     if(!m) return NULL;
@@ -1643,6 +1700,9 @@ PyInit_pyinternals(void) {
         ADD_ADDR(PyDict_GetItem),
         ADD_ADDR(PyDict_SetItem),
         ADD_ADDR(PyDict_GetItemString),
+        ADD_ADDR(PyDict_Size),
+        ADD_ADDR(PyDict_Copy),
+        ADD_ADDR(PyDict_New),
         ADD_ADDR(_PyDict_NewPresized),
         ADD_ADDR(_PyDict_LoadGlobal),
         ADD_ADDR(_PyDict_GetItemId),
@@ -1717,6 +1777,7 @@ PyInit_pyinternals(void) {
         
         ADD_ADDR(missing_arguments),
         ADD_ADDR(too_many_positional),
+        ADD_ADDR(excess_keyword),
         ADD_ADDR(append_tuple_for_call),
         ADD_ADDR(append_dict_for_call),
         ADD_ADDR(format_exc_check_arg),
@@ -1747,6 +1808,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR(PyExc_SystemError),
         ADD_ADDR(PyExc_ImportError),
         ADD_ADDR(PyExc_AttributeError),
+        ADD_ADDR(PyExc_TypeError),
         ADD_ADDR_OF(_PyThreadState_Current),
         ADD_ADDR(NAME_ERROR_MSG),
         ADD_ADDR(GLOBAL_NAME_ERROR_MSG),
@@ -1759,6 +1821,8 @@ PyInit_pyinternals(void) {
         ADD_ADDR(CANNOT_IMPORT_MSG),
         ADD_ADDR(IMPORT_NOT_FOUND_MSG),
         ADD_ADDR(BAD_EXCEPTION_MSG),
+        ADD_ADDR(UNEXPECTED_KW_ARG_MSG),
+        ADD_ADDR(DUPLICATE_VAL_MSG),
         ADD_ADDR_STR("__build_class__"),
         ADD_ADDR_OF(PyId___import__),
         ADD_ADDR_OF(PyId___exit__),

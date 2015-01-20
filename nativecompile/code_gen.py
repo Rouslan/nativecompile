@@ -1,3 +1,17 @@
+#  Copyright 2015 Rouslan Korneychuk
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
 
 import sys
 import operator
@@ -138,9 +152,21 @@ for i,suf in enumerate(TEST_MNEMONICS):
 
 PTR_SIZE = AbiConstant(lambda abi: abi.ptr_size)
 
-_ADDRESS = AbiConstant(lambda abi: abi.Address)
-def addr(offset=0,base=None,index=None,scale=1):
-    return _ADDRESS.call(offset,base,index,scale)
+class AbiAddress(StitchValue):
+    def __init__(self,offset=0,base=None,index=None,scale=1):
+        self.offset = offset
+        self.base = base
+        self.index = index
+        self.scale = scale
+    
+    def __call__(self,s):
+        return s.abi.Address(
+            make_value(s,self.offset),
+            make_value(s,self.base),
+            make_value(s,self.index),
+            make_value(s,self.scale))
+
+addr = AbiAddress
 
 
 class CType:
@@ -296,6 +322,8 @@ def _andor_regcmp(x,type):
     return r
 
 def _abivalue_to_regcmp(x):
+    if isinstance(x,(RegCmp,RegAnd,RegOr)):
+        return x
     if isinstance(x,OpValue):
         if x.op is operator.eq:
             return RegCmp(x.args[0],x.args[1],CMP_EQ)
@@ -304,11 +332,7 @@ def _abivalue_to_regcmp(x):
         
         assert x.op not in [operator.gt,operator.ge,operator.lt,operator.le], 'ordered comparison requires specifying signedness'
     
-    if isinstance(x,StitchValue):
-        return RegCmp(x,0,CMP_NE)
-    
-    assert isinstance(x,(RegCmp,RegAnd,RegOr))
-    return x
+    return RegCmp(x,0,CMP_NE)
 
 def code_join(x):
     if isinstance(x[0],bytes):
@@ -322,18 +346,35 @@ class JumpTarget:
 
 
 if __debug__:
+    def _get_origin():
+        f = sys._getframe(2)
+        while f:
+            if f.f_code.co_filename != __file__:
+                return (f.f_lineno,f.f_code.co_filename)
+            
+            f = f.f_back
+        
+        return None
+    
     class SaveOrigin(type):
         def __new__(cls,name,bases,namespace,**kwds):
             old_init = namespace.get('__init__')
             if old_init:
                 def __init__(self,*args,**kwds):
                     old_init(self,*args,**kwds)
-                    
-                    # determine where this was defined
-                    f = sys._getframe(1)
-                    while f and f.f_code.co_filename == __file__: f = f.f_back
-                    
-                    if f: self._origin = (f.f_lineno,f.f_code.co_filename)
+                    self._origin = _get_origin()
+                
+                namespace['__init__'] = __init__
+            
+            return type.__new__(cls,name,bases,namespace)
+    
+    class SaveOriginWithCompile(type):
+        def __new__(cls,name,bases,namespace,**kwds):
+            old_init = namespace.get('__init__')
+            if old_init:
+                def __init__(self,*args,**kwds):
+                    old_init(self,*args,**kwds)
+                    self._origin = _get_origin()
                 
                 namespace['__init__'] = __init__
                 
@@ -351,12 +392,12 @@ if __debug__:
                     namespace['compile'] = compile
             
             return type.__new__(cls,name,bases,namespace)
-    
-    class DelayedCompileEarly(metaclass=SaveOrigin):
-        pass
 else:
-    class DelayedCompileEarly:
-        pass
+    SaveOrigin = SaveOriginWithCompile = type
+
+
+class DelayedCompileEarly(metaclass=SaveOriginWithCompile):
+    pass
 
 class JumpSource(DelayedCompileEarly):
     def __init__(self,op,abi,target):
@@ -484,11 +525,14 @@ def deferred_values(s,op,args):
     return op(*args)
 
 class JumpTable(DelayedCompileEarly):
-    def __init__(self,abi,reg,tmp_reg,targets):
+    # tmp_reg2 can be the same as reg, in which case the value of reg is simply
+    # not preserved
+    def __init__(self,abi,reg,targets,tmp_reg1,tmp_reg2):
         self.abi = abi
         self.reg = reg
-        self.tmp_reg
         self.targets = targets
+        self.tmp_reg1 = tmp_reg1
+        self.tmp_reg2 = tmp_reg2
     
     def normal_table(self,displacement):
         jmp_size = self.abi.op.JMP_DISP_MIN_LEN
@@ -517,25 +561,33 @@ class JumpTable(DelayedCompileEarly):
         scale = 1
         if diff in (1,2,4,8):
             scale = diff
+            index = self.reg
         else:
-            s.mul(diff,self.reg)
+            s.imul(self.reg,diff,self.tmp_reg2)
+            index = self.tmp_reg2
         
         rip = getattr(self.abi,'r_rip',None)
         if rip:
-            s.jmp(addr(base=rip,index=self.reg,scale=scale))
-        else:
-            pop = code_join(self.abi.op.pop(self.tmp_reg))
+            # RIP addresses cannot have indexes so we have to load the start
+            # address into a register first
             
+            jmp = code_join(
+                self.abi.op.lea(self.abi.Address(0,self.tmp_reg1,index,scale),self.tmp_reg1)
+                + self.abi.op.jmp(self.tmp_reg1))
+            s.lea(addr(len(jmp),rip),self.tmp_reg1)(jmp)
+        else:
             # the offset of the JMP instruction needs to include its own size
-            tmp_jmp = code_join(self.abi.op.jmp(addr(127,self.tmp_reg,self.reg,scale)))
-            jmp = code_join(self.abi.op.jmp(addr(len(pop) + len(tmp_jmp),self.tmp_reg,self.reg,scale)))
+            tmp_jmp = code_join(self.abi.op.jmp(self.abi.Address(127,self.tmp_reg,self.reg,scale)))
+            
+            pop = code_join(self.abi.op.pop(self.tmp_reg1))
+            jmp = code_join(self.abi.op.jmp(addr(len(pop) + len(tmp_jmp),self.tmp_reg1,index,scale)))
             
             assert len(jmp) == len(tmp_jmp)
             
-            # It might be better to use elf.RelocBuffer to allow using an
-            # absolute address offset instead of this CALL + POP chicanery. It
-            # could be done by changing pyinternals to always support
-            # relocation and tracking the location of individual instructions.
+            # TODO: use RelocBuffer to allow using an absolute address offset
+            # instead of this CALL + POP chicanery. It could be done by
+            # changing pyinternals to always support relocation and tracking
+            # the location of relocatable offsets.
             
             s.call(self.abi.Displacement(0))(pop + jmp)
         
@@ -549,7 +601,7 @@ class JumpTable(DelayedCompileEarly):
                 self.abi.op.test(self.reg,self.reg) +
                 self.abi.op.jnz(self.abi.Displacement(displacement - self.targets[0].displacement)))
         
-        diff1 = self.targets[1] - self.targets[0]
+        diff1 = self.targets[1].displacement - self.targets[0].displacement
         for i in range(2,len(self.targets)):
             if (self.targets[i] - self.targets[i-1]) != diff1:
                 return self.normal_table(displacement)
@@ -694,7 +746,7 @@ def auto_ne(self,b):
     return not r
 
 
-class CountedValue(StitchValue):
+class CountedValue(StitchValue,metaclass=SaveOrigin):
     def borrow(self):
         return BorrowedValue(self) if self.owned else self
     
@@ -737,7 +789,10 @@ class CountedValue(StitchValue):
     if __debug__:
         def __del__(self):
             if getattr(self,'owned',False):
-                warnings.warn('ref-counted value not freed (in the generated machine code, not the running interpreter)')
+                msg = 'Ref-counted value not freed (in the generated machine code, not the running interpreter).'
+                if self._origin:
+                    msg += ' Origin: {1}:{0}'.format(*self._origin)
+                warnings.warn(msg)
 
 class BorrowedValue(CountedValue):
     def __init__(self,value):
@@ -769,15 +824,13 @@ class RawStackValue(StitchValue):
         self.offset = offset
     
     def discard(self,s,**kwds):
-        if self.owned:
-            assert self.offset is not None
-            
-            s.state.stack[self.offset] = None
-            self.owned = False
+        assert self.offset is not None
         
+        s.state.stack[self.offset] = None
         self.offset = None
     
     def __call__(self,s):
+        assert self.offset is not None
         return stack_location(s,self.offset)
 
 
@@ -797,12 +850,13 @@ class StackValue(RawStackValue,CountedValue):
         self.owned = True
     
     def discard(self,s,**kwds):
+        assert self.offset is not None
+        
         if self.owned:
-            assert self.offset is not None
-
             discard_stack_value(s,self.offset,**kwds)
             self.owned = False
         
+        s.state.stack[self.offset] = None
         self.offset = None
 
 class PendingStackValue(StitchValue):
@@ -1177,6 +1231,10 @@ class Stitch:
 
         assert self.state.unreserved_offset is not None
         
+        self.def_stack_offset.base = aligned_size(
+                (len(self.state.stack) + max(MAX_ARGS-len(self.abi.r_arg),0)) * self.abi.ptr_size + self.abi.shadow
+            ) // self.abi.ptr_size
+        
         (self
             .add(DeferredOffset(self.def_stack_offset,self.state.unreserved_offset,self.abi.ptr_size),self.abi.r_sp)
             .annotation(debug.EPILOG_START,self.state.unreserved_offset))
@@ -1267,6 +1325,12 @@ class Stitch:
         e_target = self.jmp_target
         self.jmp_target = JumpTarget()
         if __debug__: self.state_if = self.state
+        
+        if len(self.state.stack) > len(self.outer.state.stack):
+            # the length of the stack array determines how much actual stack
+            # space to allocate
+            self.outer.state.stack += [None] * (len(self.state.stack) - len(self.outer.state.stack))
+        
         self.state = self.outer.state.copy()
         self.last_op_is_uncond_jmp_if = self.last_op_is_uncond_jmp
         if not self.last_op_is_uncond_jmp:
@@ -1393,8 +1457,16 @@ class Stitch:
                 .mov(R_SCRATCH1,self.special_addrs['temp_cx'])
                 .mov(R_SCRATCH2,self.special_addrs['temp_dx']))
             
+            uregs = self.state.used_regs
+            scratch = self.state.scratch
+            self.state.used_regs = set()
+            self.state.scratch = set()
+            
             for _ in range(amount):
                 self.invoke('Py_IncRef',reg)
+                
+            self.state.used_regs = uregs
+            self.state.scratch = scratch
             
             return (self
                 .mov(self.special_addrs['temp_dx'],R_SCRATCH2)
@@ -1587,31 +1659,45 @@ class Stitch:
         
         return self.mov(a,b)
     
-    def jump_table(self,reg,targets,tmp_reg=None):
+    def jump_table(self,reg,targets,tmp_reg1=None,tmp_reg2=None):
         """Create a jump table using "reg" as the index and "targets" as the
         destinations.
         
         "targets" isn't used until the code is passed to resolve_jumps, so an
         empty sequence can be passed, to be filled later.
         
+        "tmp_reg2" can be the same as "reg", in which case "reg" is simply not
+        preserved.
+        
         """
         reg = make_value(self,reg)
-        if tmp_reg is None:
-            tmp_reg = self.unused_reg()
+        if tmp_reg1 is None:
+            if tmp_reg2 is None:
+                tmp_reg1,tmp_reg2 = self.unused_regs(2)
+            else:
+                tmp_reg1 = self.unused_reg()
+                tmp_reg2 = make_value(self,tmp_reg2)
         else:
-            tmp_reg = make_value(self,tmp_reg)
+            tmp_reg1 = make_value(self,tmp_reg1)
+            if tmp_reg2 is None:
+                tmp_reg2 = self.unused_reg()
+            else:
+                tmp_reg2 = make_value(self,tmp_reg2)
         
-        return self(JumpTable(self.abi,reg,tmp_reg,targets))
+        return self(JumpTable(self.abi,reg,targets,tmp_reg1,tmp_reg2))
 
     def __getattr__(self,name):
-        xcc = None
-        if name.startswith('j'): xcc = self.jcc
-        elif name.startswith('cmov'): xcc = self.cmovcc
+        if name.startswith('j'):
+            xcc = self.jcc
+            suffix = name[1:]
+        elif name.startswith('cmov'):
+            xcc = self.cmovcc
+            suffix = name[4:]
         else:
             return lambda *args: self.append(deferred_values(self,getattr(self.abi.op,name),args))
         
         try:
-            test = self.abi.Test(_TEST_LOOKUP[name[-2:]])
+            test = self.abi.Test(_TEST_LOOKUP[suffix])
         except KeyError:
             assert getattr(self.abi.op,name,None) is None
             raise AttributeError(name)

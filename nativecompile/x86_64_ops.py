@@ -1,3 +1,17 @@
+#  Copyright 2015 Rouslan Korneychuk
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
 
 from . multimethod import mmtype,multimethod
 from . import x86_ops
@@ -5,11 +19,11 @@ from .x86_ops import (
     TEST_MNEMONICS,Displacement,Test,al,cl,dl,bl,eax,ecx,edx,ebx,esp,ebp,esi,
     edi,test_O,test_NO,test_B,test_NB,test_E,test_Z,test_NE,test_NZ,test_BE,
     test_A,test_S,test_NS,test_P,test_NP,test_L,test_GE,test_LE,test_G,add,
-    addb,addl,cmp,cmpb,cmpl,decb,decl,incb,incl,jcc,JCC_MIN_LEN,JCC_MAX_LEN,
-    jmp,lea,leave,loop,loopz,loope,loopnz,loopne,mov,movb,movl,nop,pop,ret,shl,
-    shlb,shll,shr,shrb,shrl,sub,subb,subl,test,testb,testl,xor,xorb,xorl,
-    CALL_DISP_LEN,JMP_DISP_MIN_LEN,JMP_DISP_MAX_LEN,LOOP_LEN,SIZE_B,SIZE_D,
-    SIZE_Q,with_new_imm_dword
+    addb,addl,cmp,cmpb,cmpl,decb,decl,imul,incb,incl,jcc,JCC_MIN_LEN,
+    JCC_MAX_LEN,jmp,lea,leave,loop,loopz,loope,loopnz,loopne,mov,movb,movl,neg,
+    nop,pop,ret,shl,shlb,shll,shr,shrb,shrl,sub,subb,subl,test,testb,testl,xor,
+    xorb,xorl,CALL_DISP_LEN,JMP_DISP_MIN_LEN,JMP_DISP_MAX_LEN,LOOP_LEN,SIZE_B,
+    SIZE_D,SIZE_Q,with_new_imm_dword
 )
 
 
@@ -153,6 +167,14 @@ def incq(x : Address):
 
 
 @multimethod
+def jmp(x : Address):
+    return x86_ops._jmp_addr(x,SIZE_D)
+
+jmp.inherit(x86_ops.jmp)
+
+
+
+@multimethod
 def mov(a : int,b : Register):
     if b.size == SIZE_Q:
         return x86_ops.rex(None,b) + bytes([0b10111000 | b.reg]) + immediate_data(True,a)
@@ -164,6 +186,12 @@ mov.inherit(x86_ops.mov)
 def movq(a,b):
     assert mmtype(b.__class__) is x86_ops.Address
     return x86_ops.mov_imm_addr(a,b,SIZE_Q)
+
+
+
+@multimethod
+def negq(x : Address):
+    return x86_ops.neg_addr(x,SIZE_Q)
 
 
 

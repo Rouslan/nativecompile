@@ -1,8 +1,23 @@
+#  Copyright 2015 Rouslan Korneychuk
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
 
 import struct
 import collections
 import re
-import io
+
+from .reloc_buffer import RelocAbsAddress,RelocBuffer,NonRelocWrapper
 
 
 # these must be powers of 2
@@ -97,7 +112,7 @@ def write_symtab_entry_with_addr(mode,out,name,value,size,bind,type,sh_index):
     if isinstance(out,RelocBuffer):
         out.addrs.append((out.tell() + (
                 ELF64_SYMTAB_PREADDR if mode == MODE_64 else SYMTAB_PREADDR
-            ),RelocAddress(value)))
+            ),RelocAbsAddress(value)))
     out.write(symbol_table_entry(mode,name,value,size,bind,type,sh_index))
 
 
@@ -144,55 +159,6 @@ def align_fo(f,alignment):
     if alignment > 1:
         pad = alignment - (f.tell() % alignment)
         if pad: f.write(b'\0' * pad)
-
-
-class RelocAddress:
-    def __init__(self,val):
-        self.val = val
-
-    def get(self,addr_size,offset=0):
-        return (self.val + offset).to_bytes(addr_size,byteorder='little',signed=False)
-
-
-class RelocBuffer:
-    """A file-like object containing addresses that can be rebased"""
-    def __init__(self,addr_size):
-        self.addr_size = addr_size
-        self.buff = io.BytesIO()
-        self.addrs = []
-
-    def seek(self,*args):
-        return self.buff.seek(*args)
-
-    def tell(self):
-        return self.buff.tell()
-
-    def write(self,data):
-        if isinstance(data,RelocAddress):
-            self.addrs.append((self.buff.tell(),data))
-            self.buff.write(data.get(self.addr_size))
-        else:
-            self.buff.write(data)
-
-    def rebase(self,offset):
-        with self.buff.getbuffer() as b:
-            for pos,a in self.addrs:
-                addr = a.get(self.addr_size,offset)
-                b[pos:pos+len(addr)] = addr
-
-class NonRelocWrapper:
-    def __init__(self,dest,addr_size):
-        self.dest = dest
-        self.addr_size = addr_size
-
-    def seek(self,*args):
-        return self.dest.seek(*args)
-
-    def tell(self):
-        return self.dest.tell()
-
-    def write(self,data):
-        self.dest.write(data.get(self.addr_size) if isinstance(data,RelocAddress) else data)
 
 
 def write_shared_object(mode,out,sections):

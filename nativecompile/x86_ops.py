@@ -1,8 +1,21 @@
+#  Copyright 2015 Rouslan Korneychuk
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
 
 # To avoid repeating code, most of the functions and classes defined in this
 # module handle both 32 and 64 bit machine code, but this module should only be
 # used for writing 32 bit code. Use x86_64_ops for correct 64 bit code.
-
 
 import binascii
 import copy
@@ -622,6 +635,39 @@ def decl(x : Address):
 
 
 @multimethod
+def imul(a : Register,b : Register):
+    assert a.size == b.size
+    if b.code == 0:
+        return rex(None,a) + bytes([0b11110110 | bool(a.size),0b11101000 | a.code.reg])
+    
+    assert a.size > SIZE_B
+    return rex(b,a) + bytes([0b00001111,0b10101111,0b11000000 | (b.reg << 3) | a.reg])
+
+@multimethod
+def imul(a : Address,b : Register):
+    if b.code == 0:
+        return rex(b.size,a) + bytes([0b11110110 | bool(a.size)]) + a.mod_rm_sib_disp(0b101)
+    
+    assert a.size > SIZE_B
+    return rex(b,a) + b'\x0F\xAF' + a.mod_rm_sib_disp(b.reg)
+
+@multimethod
+def imul(a : Register,b : int,dest : Register):
+    assert a.size == dest.size and a.size > SIZE_B
+    
+    fits = fits_in_sbyte(b)
+    return rex(dest,a) + bytes([0b01101001 | (fits << 1),0b11000000 | (dest.reg << 3) | a.reg]) + immediate_data(not fits,b)
+
+@multimethod
+def imul(a : Address,b : int,dest : Register):
+    assert a.size == dest.size and a.size > SIZE_B
+    
+    fits = fits_in_sbyte(b)
+    return rex(dest,a) + bytes([0b01101001 | (fits << 1)]) + a.mod_rm_sib_disp(dest.reg) + immediate_data(not fits,b)
+
+
+
+@multimethod
 def inc(x : Register):
     # REX omitted; inc is redefined in x86_64_ops
     if x.w:
@@ -672,9 +718,12 @@ def jmp(x : Register):
         0b11111111,
         0b11100000 | x.reg])
 
+def _jmp_addr(x,size):
+    return rex(size,x) + b'\xFF' + x.mod_rm_sib_disp(0b100)
+
 @multimethod
 def jmp(x : Address):
-    return rex(None,x) + b'\xFF' + x.mod_rm_sib_disp(0b100)
+    return _jmp_addr(x,SIZE_D)
 
 
 
@@ -744,6 +793,22 @@ def movb(a,b):
 def movl(a,b):
     assert mmtype(b.__class__) is Address
     return mov_imm_addr(a,b,SIZE_D)
+
+
+
+def neg(x : Register):
+    return rex(None,x) + bytes([0b11110110 | x.w, 0b11011000 | x.reg])
+
+def neg_addr(x,size):
+    return rex(size,x) + bytes([0b11110110 | bool(size)]) + x.mod_rm_sib_disp(0b011)
+
+@multimethod
+def negb(x : Address):
+    return neg_addr(x,SIZE_B)
+
+@multimethod
+def negl(x : Address):
+    return neg_addr(x,SIZE_D)
 
 
 

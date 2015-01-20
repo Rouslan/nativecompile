@@ -1,3 +1,16 @@
+#  Copyright 2015 Rouslan Korneychuk
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
 
 
 # subclasses tuple for easy immutability
@@ -31,7 +44,7 @@ class Interval(tuple):
         return 'Interval({},{})'.format(*self)
 
     def __str__(self):
-        return '∅' if self.is_empty() else '[{},{})'.format(*self)
+        return '\u2205' if self.is_empty() else '[{},{})'.format(*self)
 
 
 class DInterval:
@@ -122,4 +135,4 @@ class DInterval:
         return self._parts[lo].start if lo < len(self._parts) else float('inf')
 
     def __str__(self):
-        return '∅' if not self._parts else ' ∪ '.join(map(str,self._parts))
+        return '\u2205' if not self._parts else ' \u222a '.join(map(str,self._parts))

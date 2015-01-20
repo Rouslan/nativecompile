@@ -1,3 +1,17 @@
+#  Copyright 2015 Rouslan Korneychuk
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
 
 import copy
 import ast
@@ -9,6 +23,7 @@ from functools import partial
 from collections import namedtuple, OrderedDict
 
 from . import pyinternals
+from . import astloader
 from . import debug
 from . import abi
 from .code_gen import *
@@ -42,14 +57,18 @@ class UtilityFunctions:
         self.swap_exc_state = JumpTarget()
 
 
+def ast_and_symtable_map(code,filename,compile_type):
+    ast,tables = astloader.symtable(code,filename,compile_type)
+
+    return ast,{id : symtable._newSymbolTable(tab,filename) for id,tab in tables.items()}
+
+
 def create_uninitialized(t):
     return t.__new__(t)
 
 def check_context_load(node):
     if not isinstance(node.ctx,ast.Load):
         raise NCompileError('{} node has assign/delete context type but is not in assign/delete statement'.format(node.__class__.__name__))
-
-FunctionInput = namedtuple('FunctionInput',['func','name','args','returns','body'])
 
 class _ParsedValue:
     """A fake AST node to allow inserting arbitrary values into AST trees"""
@@ -58,14 +77,15 @@ class _ParsedValue:
         self.value = value
 
 class ExprCompiler(ast.NodeVisitor):
-    def __init__(self,code,s_table=None,util_funcs=None,global_scope=False):
+    def __init__(self,code,s_table=None,s_map=None,util_funcs=None,global_scope=False,entry_points=None):
         self.code = code
         self.stable = s_table
+        self.sym_map = s_map
         self.util_funcs = util_funcs
         self.global_scope = global_scope
+        self.entry_points = entry_points
         self.consts = {}
         self.names = OrderedDict()
-        self.func_nodes = []
         self.local_addrs = None
         self.local_addr_start = None
         self.visit_depth = 0
@@ -86,12 +106,13 @@ class ExprCompiler(ast.NodeVisitor):
         return b,a
     
     def allocate_locals(self,args):
-        assert self.local_addrs is None and self.stable is not None
+        assert (self.local_addrs is None
+            and self.stable is not None
+            and (isinstance(self.stable,symtable.Function) != (args is None))
+            and (isinstance(self.stable,symtable.Function) == self.stable.is_optimized()))
 
         self.local_addrs = {}
-        if self.stable.is_optimized() and isinstance(self.stable,symtable.Function):
-            assert args is not None
-            
+        if isinstance(self.stable,symtable.Function):
             # FUNCTION_BODY_NAME_ORDER
             # the order of the arguments must match the order in
             # pyinternals.FunctionBody.names which is described in
@@ -100,16 +121,16 @@ class ExprCompiler(ast.NodeVisitor):
             locals = [a.arg for a in args.args]
             if args.vararg: locals.append(args.vararg.arg)
             locals.extend(a.arg for a in args.kwonlyargs)
-            if args.kwarg: local.append(args.kwarg.arg)
+            if args.kwarg: locals.append(args.kwarg.arg)
             
             the_rest = set(self.stable.get_locals())
-            the_rest.update_difference(locals)
+            the_rest.difference_update(locals)
             locals.extend(the_rest)
             
             for n in locals:
                 self.names[n] = address_of(n)
             
-            tmp = self.unused_reg(self)
+            tmp = self.code.unused_reg()
             self.code.mov(0,tmp)
  
             # locals is reversed because each stack value has a lower address
@@ -133,7 +154,6 @@ class ExprCompiler(ast.NodeVisitor):
                 .if_(R_RET)
                     .decref(R_RET)
                 .endif())
-            loc.discard(s)
         
         self.local_addrs = None
         self.local_addr_start = None
@@ -215,8 +235,6 @@ class ExprCompiler(ast.NodeVisitor):
                    .exc_cleanup()
                 .endif())
         
-        hit_count.discard(s)
-        
         s.else_()
         
         if args.kwarg:
@@ -259,9 +277,12 @@ class ExprCompiler(ast.NodeVisitor):
                 .exc_cleanup()
             .endif())
         
+        hit_count.discard(s)
         miss_flag.discard(s)
     
-    def handle_args_optimized(self,args,func_self,func_args,func_kwds):
+    def handle_args(self,args,func_self,func_args,func_kwds):
+        assert self.local_addrs is not None
+        
         if args.args:
             # a short-cut to the part where positional arguments are moved
             arg_target1 = JumpTarget()
@@ -311,9 +332,9 @@ class ExprCompiler(ast.NodeVisitor):
             targets = []
             
             (self.code
-                .jump_table(R_PRES3,targets,R_SCRATCH2))
+                .jump_table(R_PRES3,targets,R_SCRATCH2,R_RET))
             
-            for i,a in reversed(enumerate(args.args)):
+            for i,a in reversed(list(enumerate(args.args))):
                 target = JumpTarget() if targets else arg_target1
                 targets.append(target)
                 
@@ -330,7 +351,7 @@ class ExprCompiler(ast.NodeVisitor):
             # set keyword arguments
             
             def with_dict(s,mark_miss,mark_hit):
-                default_item = tuple_item(R_PRES2,0)(c)
+                default_item = tuple_item(R_PRES2,0)
                 default_item.index = R_RET
                 default_item.scale = self.abi.ptr_size
                 
@@ -351,7 +372,7 @@ class ExprCompiler(ast.NodeVisitor):
                                 .exc_cleanup()
                             .endif()
                             .mov(R_RET,self.local_addrs[a.arg])
-                            .incref(R_RET),
+                            .incref(R_RET)
                             [mark_hit(name)]
                         .else_()
                             .mov(i,R_RET)
@@ -378,7 +399,7 @@ class ExprCompiler(ast.NodeVisitor):
                         [mark_miss]
                         .mov(R_SCRATCH1,R_RET)
                     .endif()
-                    .jump_table(R_RET,targets,R_SCRATCH2))
+                    .jump_table(R_RET,targets,R_SCRATCH2,R_RET))
                 
                 for i,a in enumerate(args.args):
                     target = JumpTarget()
@@ -419,7 +440,7 @@ class ExprCompiler(ast.NodeVisitor):
                     .else_()
                         .invoke('PyDict_New')
                     .check_err()
-                    .mov(R_RET,self.get_name(args.kwarg.arg))
+                    .mov(R_RET,self.local_addrs[args.kwarg.arg])
                     .endif())
             else:
                 (self.code
@@ -430,37 +451,6 @@ class ExprCompiler(ast.NodeVisitor):
                             .invoke('excess_keyword',func_self,R_PRES1)
                         .endif()
                     .endif())
-    
-    def handle_args_unoptimized(self,args,func_self,func_args,func_kwds):
-        dict_addr = self.code.fit_addr('PyDict_Type',R_SCRATCH2)
-
-        (self.code
-            .mov(self.code.special_addrs['locals'],R_PRES1)
-            .if_(not_(R_PRES1))
-                .invoke('PyErr_Format','PyExc_SystemError','NO_LOCALS_STORE_MSG')
-                .exc_cleanup()
-            .endif()
-            .mov(dict_addr,R_SCRATCH1)
-            .mov('PyObject_SetItem',R_PRES2)
-            .push_arg(R_RET,n=0)
-            .if_(R_SCRATCH1 == type_of(R_PRES1))
-                .mov('PyDict_SetItem',R_PRES2)
-            .endif())
-        
-    
-        if args.args:
-            pass
-        elif args.vararg:
-            (self.code
-                .invoke(R_PRES2,R_PRES1,self.get_name(args.vararg.arg),func_args)
-                .check_err())
-    
-    def handle_args(self,args,func_self,func_args,func_kwds):
-        assert self.local_addrs is not None
-        
-        if args is None or not (args.args or args.vararg or args.kwonlyargs or args.kwarg): return
-        
-        (self.handle_args_optimized if if self.stable.is_optimized() else self.handle_args_unoptimized)(args,func_self,func_args,func_kwds)
     
     def basic_binop(self,func,arg1,arg2):
         (self.code
@@ -559,6 +549,10 @@ class ExprCompiler(ast.NodeVisitor):
     def visit__ParsedValue(self,node):
         return node.value
     
+    def generic_visit(self,node):
+        # all types need their own handler
+        raise NotImplementedError()
+    
     def visit_Module(self,node):
         for stmt in node.body: self.visit(stmt)
         (self.code
@@ -566,8 +560,9 @@ class ExprCompiler(ast.NodeVisitor):
             .incref(R_RET))
     
     def visit_FunctionDef(self,node):
-        func = create_uninitialized(pyinternals.Function)
-        self.func_nodes.append(FunctionInput(func,node.name,node.args,node.returns,node.body))
+        func = create_uninitialized(pyinternals.FunctionBody)
+        
+        compile_eval(node,self.sym_map,self.abi,self.util_funcs,self.entry_points,False,node.name,func,node.args)
         
         fobj = self.get_const(func)
         
@@ -579,6 +574,20 @@ class ExprCompiler(ast.NodeVisitor):
             alt_node = ast.Call(d,[alt_node],[],None,None,lineno=d.lineno,col_offset=d.col_offset)
         
         self.visit(ast.Assign([ast.Name(node.name,ast.Store())],alt_node,lineno=node.lineno,col_offset=node.col_offset))
+    
+    def visit_Return(self,node):
+        if node.value:
+            val = self.visit(node.value)
+        else:
+            val = self.get_const(None)
+        
+        for ld in self.code.state.stack:
+            if ld is not None and ld[1]:
+                ld[0].discard(self.code)
+        
+        loc = val(self.code)
+        val.steal(self.code)
+        self.code.mov(loc,R_RET)
     
     def visit_Assign(self,node):
         expr = self.visit(node.value)
@@ -598,25 +607,26 @@ class ExprCompiler(ast.NodeVisitor):
                         # if whether the local is assigned to, depended on a
                         # branch, and inside exception handlers).
                         
-                        with self.unused_reg_temp() as tmp:
-                            item = self.local_addrs[t.id]
-                            self.code.mov(item,tmp.reg)
-                            
-                            tmp2 = expr(self.code)
-                            if not isinstance(tmp2,self.abi.Register):
-                                tmp2 = self.unused_reg()
-                                self.code.mov(expr,tmp2)
-                            
-                            if expr.owned:
-                                expr.owned = False
-                            else:
-                                self.code.incref(tmp2)
-                            
-                            (self.code
-                                .mov(tmp2,item)
-                                .if_(tmp.reg)
-                                    .decref(tmp.reg)
-                                .endif())
+                        tmp1,r_tmp2 = self.code.unused_regs(2)
+                        
+                        item = self.local_addrs[t.id]
+                        self.code.mov(item,tmp1)
+                        
+                        tmp2 = expr(self.code)
+                        if not isinstance(tmp2,self.abi.Register):
+                            tmp2 = r_tmp2
+                            self.code.mov(expr,tmp2)
+                        
+                        if expr.owned:
+                            expr.owned = False
+                        else:
+                            self.code.incref(tmp2)
+                        
+                        (self.code
+                            .mov(tmp2,item)
+                            .if_(tmp1)
+                                .decref(tmp1)
+                            .endif())
                     else:
                         dict_addr = self.code.fit_addr('PyDict_Type',R_SCRATCH2)
                         
@@ -1023,17 +1033,34 @@ class ExprCompiler(ast.NodeVisitor):
         return r
 
 
+def reserve_debug_temps(s):
+    if pyinternals.REF_DEBUG:
+        # a place to store r_ret, r_scratch[0] and r_scratch[1] when increasing
+        # reference counts (which calls a function when ref_debug is True)
+        s.new_stack_value(True,name='temp_ax')
+        s.new_stack_value(True,name='temp_cx')
+        s.new_stack_value(True,name='temp_dx')
+    elif pyinternals.COUNT_ALLOCS:
+        # when COUNT_ALLOCS is True and REF_DEBUG is not, an extra space is
+        # needed to save a temporary value
+        s.new_stack_value(True,name='count_allocs_temp')
+
+
 def simple_frame(func_name):
     def decorator(func_name,f):
         def inner(abi,end_targets,*extra):
             s = Stitch(abi)
-            s.def_stack_offset.base = aligned_size((MAX_ARGS + 1) * abi.ptr_size) // abi.ptr_size
             
-            s.new_stack_value(True) # the return address added by CALL
-
+            # the return address added by CALL
+            s.new_stack_value(True)
             s.annotation(debug.RETURN_ADDRESS)
             
-            r = resolve_jumps(abi.op,destitch(f(s,*extra)),end_targets)
+            s.reserve_stack()
+            reserve_debug_temps(s)
+            
+            s = f(s,*extra).release_stack().ret()
+            
+            r = resolve_jumps(abi.op,destitch(s),end_targets)
             r.name = func_name
             return r
         
@@ -1055,7 +1082,6 @@ def local_name_func(s):
     frame = CType('PyFrameObject',R_PRES3)
 
     return (s
-        .reserve_stack()
         .mov(frame.f_locals,R_RET)
         .if_(not_(R_RET))
             .invoke('PyErr_Format','PyExc_SystemError','NO_LOCALS_LOAD_MSG',R_PRES1)
@@ -1104,9 +1130,7 @@ def local_name_func(s):
 
         (inc_ret)
         .incref(R_RET)
-        (ret)
-        .release_stack()
-        .ret())
+        (ret))
 
 @simple_frame('global_name')
 def global_name_func(s):
@@ -1123,7 +1147,6 @@ def global_name_func(s):
     frame = CType('PyFrameObject',R_PRES3)
 
     return (s
-        .reserve_stack()
         .mov(frame.f_globals,R_SCRATCH2)
         .mov(frame.f_builtins,R_PRES2)
         .if_(and_(d_addr == type_of(R_SCRATCH2),d_addr == type_of(R_PRES2)))
@@ -1153,27 +1176,45 @@ def global_name_func(s):
                 .endif()
             .endif()
         .endif()
-        (ret)
-        .release_stack()
-        .ret())
-
-@simple_frame('get_arg')
-def get_arg_func(s):
-    # TODO: have just one copy shared by all compiled modules
+        (ret))
 
 
 ProtoFunction = namedtuple('ProtoFunction',['name','code'])
 
 class PyFunction:
-    def __init__(self,func,names,consts):
+    def __init__(self,fb_obj,func,names,args,consts):
+        self.fb_obj = fb_obj or create_uninitialized(pyinternals.FunctionBody)
         self.func = func
         
         self.names = names
+        self.args = args
         self.consts = consts
     
     @property
     def name(self):
         return self.func.name
+    
+    def build(self,compiled_code):
+        args = 0
+        vararg = False
+        kwargs = 0
+        varkw = False
+        if self.args:
+            args = len(self.args.args)
+            vararg = self.args.vararg
+            kwargs = len(self.args.kwonlyargs)
+            varkw = self.args.kwarg
+        
+        self.fb_obj.__init__(
+            compiled_code,
+            self.func.offset,
+            self.name,
+            self.names,
+            args,
+            vararg,
+            kwargs,
+            varkw,
+            self.consts)
 
 
 def func_arg_addr(ec,i):
@@ -1188,7 +1229,7 @@ def func_arg_addr(ec,i):
 
 def func_arg_bind(ec,arg):
     if isinstance(arg,PendingStackValue):
-        sv = ec.new_stack_value()
+        sv = ec.code.new_stack_value()
         sv.owned = False
         arg.bind(sv)
         return sv
@@ -1196,17 +1237,11 @@ def func_arg_bind(ec,arg):
     return BorrowedValue(arg)
 
 
-def compile_eval(code,abi,util_funcs,entry_points,global_scope,name='<module>',args=None):
-    # TODO: create and use extension function that creates the SymbolTable
-    # object from the AST object (symtable.symtable generates an AST and then
-    # discards it)
-    mod_ast = ast.parse(code,'<string>')
-    mod_sym = symtable.symtable(code,'<string>','exec')
-    
+def compile_eval(scope_ast,sym_map,abi,util_funcs,entry_points,global_scope,name='<module>',fb_obj=None,args=None):
     #move_throw_flag = (code.co_flags & CO_GENERATOR and len(abi.r_arg) >= 2)
     mov_throw_flag = False
     
-    ec = ExprCompiler(Stitch(abi),mod_sym,util_funcs,global_scope)
+    ec = ExprCompiler(Stitch(abi),sym_map[scope_ast._raw_id],sym_map,util_funcs,global_scope,entry_points)
     
     # the stack will have following items:
     #     - return address
@@ -1215,7 +1250,6 @@ def compile_eval(code,abi,util_funcs,entry_points,global_scope,name='<module>',a
     #     - old value of R_PRES3
     #     - Frame object
     #     - globals
-    #     - locals
     #     - miscellaneous temp value
     #     - temp_ax (if pyinternals.REF_DEBUG)
     #     - temp_cx (if pyinternals.REF_DEBUG)
@@ -1264,26 +1298,15 @@ def compile_eval(code,abi,util_funcs,entry_points,global_scope,name='<module>',a
         .get_threadstate(R_SCRATCH1)
 
         .mov(f_obj.f_globals,R_SCRATCH2)
-        .mov(f_obj.f_locals,R_RET)
 
         .push_stack_prolog(R_PRES1,'frame',debug.PushVariable('f'))
         .push_stack_prolog(R_SCRATCH2,'globals')
-        .push_stack_prolog(R_RET,'locals')
 
         .mov(R_PRES1,tstate.frame))
     
-    ec.code.new_stack_value(True,'temp')
+    ec.code.new_stack_value(True,name='temp')
     
-    if pyinternals.REF_DEBUG:
-        # a place to store r_ret, r_scratch[0] and r_scratch[1] when increasing
-        # reference counts (which calls a function when ref_debug is True)
-        ec.code.new_stack_value(True,'temp_ax')
-        ec.code.new_stack_value(True,'temp_cx')
-        ec.code.new_stack_value(True,'temp_dx')
-    elif pyinternals.COUNT_ALLOCS:
-        # when COUNT_ALLOCS is True and REF_DEBUG is not, an extra space is
-        # needed to save a temporary value
-        ec.code.new_stack_value(True,'count_allocs_temp')
+    reserve_debug_temps(ec.code)
 
     naddr = ec.code.fit_addr('Py_None',R_RET)
     
@@ -1359,15 +1382,16 @@ def compile_eval(code,abi,util_funcs,entry_points,global_scope,name='<module>',a
         func_args.discard(ec.code)
         func_kwds.discard(ec.code)
     
-    ec.visit(mod_ast)
-    
-    stack_len = len(ec.code.state.stack)
+    for n in scope_ast.body:
+        ec.visit(n)
 
     tstate = CType('PyThreadState',R_SCRATCH1)
     f_obj = CType('PyFrameObject',R_SCRATCH2)
 
     # return R_RET
     (ec.code
+        .mov(ec.get_const(None),R_RET)
+        .incref(R_RET)
         (ec.code.cleanup.dest[0])
         .comment('epilogue')
         .mov(R_RET,ret_temp_store)
@@ -1385,10 +1409,7 @@ def compile_eval(code,abi,util_funcs,entry_points,global_scope,name='<module>',a
         .mov(R_SCRATCH2,tstate.frame)
         .ret())
 
-    ec.code.def_stack_offset.base = aligned_size(
-        (stack_len + max(MAX_ARGS-len(abi.r_arg),0)) * abi.ptr_size + abi.shadow) // abi.ptr_size
-
-    return PyFunction(ProtoFunction(name,ec.code.code),tuple(ec.names.keys()),tuple(ec.consts.keys()))
+    entry_points.append(PyFunction(fb_obj,ProtoFunction(name,ec.code.code),tuple(ec.names.keys()),args,tuple(ec.consts.keys())))
 
 
 def compile_raw(code,abi):
@@ -1399,22 +1420,8 @@ def compile_raw(code,abi):
     unwind_exc_tail = JumpTarget()
 
     entry_points = []
-
-    # if this ever gets ported to C or C++, this will be a prime candidate for
-    # parallelization
-    #def compile_code_constants(code):
-    #    for c in code:
-    #        if isinstance(c,types.CodeType) and id(c) not in entry_points:
-    #            # reserve the entry
-    #            entry_points[id(c)] = None
-
-    #            compile_code_constants(c.co_consts)
-    #            entry_points[id(c)] = (
-    #                pyinternals.create_compiled_entry_point(c),
-    #                ceval(c))
-
-    #compile_code_constants(_code)
-    entry_points.append(compile_eval(code,abi,ufuncs,entry_points,True))
+    mod_ast,sym_map = ast_and_symtable_map(code,'<string>','exec')
+    compile_eval(mod_ast,sym_map,abi,ufuncs,entry_points,True)
 
     functions = []
     end_targets = []
@@ -1483,7 +1490,7 @@ def native_abi(*,assembly=False):
     raise Exception("native compilation is not supported on this CPU")
 
 
-def compile(code):
+def compile(code,globals=None):
     global DUMP_OBJ_FILE
     
     abi = native_abi()
@@ -1500,8 +1507,17 @@ def compile(code):
     
     compiled = pyinternals.CompiledCode(out)
     
-    head = entry_points[0]
-    return pyinternals.Function(compiled,head.func.offset,head.name,head.names,head.consts)
+    for e in entry_points: e.build(compiled)
+    
+    if globals is None:
+        globals = {'__builtins__':__builtins__}
+    elif '__builtins__' not in globals:
+        # it would be slightly more efficient to use the setdefault method of
+        # dict objects, but since globals doesn't have to be a dict, we can't
+        # assume that method is defined (__contains__ is a safer bet)
+        globals['__builtins__'] = __builtins__
+    
+    return pyinternals.Function(entry_points[0].fb_obj,entry_points[0].name,globals)
 
 
 def compile_asm(code):

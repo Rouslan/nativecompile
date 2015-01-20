@@ -1,3 +1,17 @@
+#  Copyright 2015 Rouslan Korneychuk
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
 
 import collections
 from itertools import groupby
@@ -5,6 +19,7 @@ from itertools import groupby
 from . import pyinternals
 from . import elf
 from . import dwarf
+from .reloc_buffer import RelocBuffer
 
 
 GDB_JIT_SUPPORT = getattr(pyinternals,'GDB_JIT_SUPPORT',False)
@@ -294,7 +309,7 @@ def generate(abi,cu,entry_points):
         SymbolSection(emode,sym_strtab,cu.functions),
         sym_strtab] + dwarf.elf_sections(dmode,dcu,st,callframes,pres_regs)
 
-    out = elf.RelocBuffer(abi.ptr_size)
+    out = RelocBuffer(abi.ptr_size)
     c_offset = elf.write_shared_object(emode,out,sections)[0].offset
 
     # adjust the entry points by the code segment's offset

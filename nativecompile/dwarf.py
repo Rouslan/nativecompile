@@ -1,7 +1,22 @@
+#  Copyright 2015 Rouslan Korneychuk
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
 
 import struct
 
 from . import elf
+from .reloc_buffer import RelocAbsAddress
 
 
 MODE_32 = 32
@@ -169,7 +184,7 @@ def get_ref(self,d):
     assert r is not None, 'Only back-references are supported' # for now
     return r
 
-make_form('addr',CLASS_address,0x01,(lambda self,d: elf.RelocAddress(self.val)))
+make_form('addr',CLASS_address,0x01,(lambda self,d: RelocAbsAddress(self.val)))
 make_form('block2',CLASS_block,0x03,enc_block_n(2))
 make_form('block4',CLASS_block,0x04,enc_block_n(4))
 make_form('data2',CLASS_constant,0x05,(lambda self,d: d.mode.enc_int(self.val,2)))
@@ -824,8 +839,8 @@ class DebugInfo:
             mapping[ar] = out.tell() - baseloc
 
             for addr,size in ar.values():
-                out.write(elf.RelocAddress(addr))
-                out.write(elf.RelocAddress(size))
+                out.write(RelocAbsAddress(addr))
+                out.write(RelocAbsAddress(size))
             out.write(b'\0' * (self.mode.ptr_size * 2))
 
     def write_debug_loclist(self,out):
@@ -877,7 +892,7 @@ class DebugInfo:
     def fde(self,out,addr,range,instr):
         start = out.tell()
         out.write(b'\0' * self.mode.ref_size)
-        out.write(elf.RelocAddress(addr))
+        out.write(RelocAbsAddress(addr))
         out.write(self.mode.enc_int(range))
         out.write(instr)
         self._cf_pad(out,out.tell() - start)
