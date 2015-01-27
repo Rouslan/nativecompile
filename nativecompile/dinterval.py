@@ -59,7 +59,7 @@ class DInterval:
         self._parts = []
         if x is not None:
             if isinstance(x,DInterval):
-                self._parts = DInterval._parts[:]
+                self._parts = x._parts[:]
             elif isinstance(x,Interval):
                 self._parts.append(x)
             else:

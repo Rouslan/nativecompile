@@ -98,7 +98,7 @@ class ModuleVisitor(ConcreteTypeVisitor):
     def visitModule(self,mod):
         self.emit(r"""
 PyDoc_STRVAR(symtable_doc,
-"symtable(code,filename,compile_type) -> tuple\n\
+"symtable(code : str,filename : str,compile_type : str) -> tuple\n\
 \n\
 Return the abstract syntax tree and a mapping of AST nodes to symbol tables for\n\
 the Python source \"code\".\n\

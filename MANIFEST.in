@@ -1,0 +1,2 @@
+include LICENSE NOTICE make_ast_loader.py
+recursive-include cpython *.py README LICENSE Python.asdl

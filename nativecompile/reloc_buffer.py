@@ -20,6 +20,8 @@ class RelocAddress:
     __slots__ = 'val'
     def __init__(self,val):
         self.val = val
+    def get(self,addr_size,pos,base=0):
+        raise NotImplementedError()
 
 class RelocAbsAddress(RelocAddress):
     __slots__ = ()
@@ -32,7 +34,7 @@ class RelocRelAddress(RelocAddress):
         return (self.val + pos + base).to_bytes(addr_size,byteorder='little',signed=False)
 
 def _offset_addrs(addrs,amount):
-    return ((p + pos,a) for p,a in data.addrs)
+    return ((p + amount,a) for p,a in addrs)
 
 class RelocBytes:
     __slots__ = 'data','addrs'
@@ -42,7 +44,7 @@ class RelocBytes:
     
     def __add__(self,b):
         if isinstance(b,RelocBytes):
-            return RelocBytes(self.data+b.data,self.addrs + _offset_addrs(b.addrs,len(self.data)))
+            return RelocBytes(self.data+b.data,self.addrs + tuple(_offset_addrs(b.addrs,len(self.data))))
         
         return RelocBytes(self.data+b,self.addrs)
     
@@ -96,7 +98,7 @@ class NonRelocWrapper:
 
     def write(self,data):
         if isinstance(data,RelocAddress):
-            data = data.get(self.addr_size)
+            data = data.get(self.addr_size,self.tell())
         elif isinstance(data,RelocBytes):
             data = data.data
         

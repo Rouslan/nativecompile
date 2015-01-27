@@ -47,7 +47,7 @@ class SearchLimitReachedError(MachineCodeParseError):
 
 MOD_ANY = True
 
-# enforcing the memory-only and register-only varients of the ModRM byte are
+# enforcing the memory-only and register-only variants of the ModRM byte are
 # not necessary for parsing, but it was easy to implement and having a stricter
 # parser makes it easier to verify correctness
 MEM_ONLY = True + 1
@@ -576,7 +576,7 @@ def take(itr,n):
     return list(islice(itr,0,n))
 
 def swap(x):
-    return tuple(x[1],x[0])
+    return x[1],x[0]
 
 def find_async_flag_addresses(mode):
     """Get the addresses of "gil_drop_request", "pendingcalls_to_do" and

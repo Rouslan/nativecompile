@@ -638,7 +638,7 @@ def decl(x : Address):
 def imul(a : Register,b : Register):
     assert a.size == b.size
     if b.code == 0:
-        return rex(None,a) + bytes([0b11110110 | bool(a.size),0b11101000 | a.code.reg])
+        return rex(None,a) + bytes([0b11110110 | bool(a.size),0b11101000 | a.reg])
     
     assert a.size > SIZE_B
     return rex(b,a) + bytes([0b00001111,0b10101111,0b11000000 | (b.reg << 3) | a.reg])
