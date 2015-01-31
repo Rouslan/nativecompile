@@ -59,21 +59,21 @@ PYTHON_STACK_START = 'PYTHON_STACK_START'
 class SaveReg:
     def __init__(self,reg):
         self.reg = reg
-    
+
     def __repr__(self):
         return 'SaveReg({})'.format(self.reg)
 
 class RestoreReg:
     def __init__(self,reg):
         self.reg = reg
-    
+
     def __repr__(self):
         return 'RestoreReg({})'.format(self.reg)
 
 class PushVariable:
     def __init__(self,name):
         self.name = name
-    
+
     def __repr__(self):
         return 'PushVariable({})'.format(self.name)
 
@@ -156,7 +156,7 @@ class PyFrameLocListEntry(dwarf.FORM_loclist_offset):
     def values(self,op):
         regend = self.start
         for a in self.annot:
-            if isinstance(a.descr,PushVariable) and a.descr.name == 'f':
+            if isinstance(a.descr,PushVariable) and a.descr.name == '__f':
                 yield self.start,regend,op.reg(dwarf_reg(self.mode,self.abi.r_arg[0]))
                 yield regend,self.end - regend + self.start,op.fbreg(a.stack * -self.abi.ptr_size)
                 break

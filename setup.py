@@ -18,6 +18,7 @@ import os.path
 from setuptools import setup,Extension
 from setuptools.command.build_ext import build_ext
 from distutils import log
+from distutils.util import split_quoted
 from distutils.dep_util import newer
 from distutils.dir_util import mkpath
 
@@ -29,10 +30,22 @@ base_dir = os.path.dirname(os.path.realpath(__file__))
 
 
 class CustomBuildExt(build_ext):
+    user_options = build_ext.user_options + [
+        ('cflags=',None,
+            'extra command line arguments for the C compiler')]
+
+    def initialize_options(self):
+        build_ext.initialize_options(self)
+
+        self.cflags = ''
+
     def finalize_options(self):
         build_ext.finalize_options(self)
 
+        self.cflags = split_quoted(self.cflags)
+
         for e in self.extensions:
+            e.extra_compile_args += self.cflags
             for i,s in enumerate(e.sources):
                 if s is DUMMY_PATH:
                     e.sources[i] = os.path.join(self.build_temp,'astloader.c')
@@ -45,7 +58,7 @@ class CustomBuildExt(build_ext):
             if not self.dry_run:
                 mkpath(self.build_temp)
                 make_ast_loader.create(input,output)
-        
+
         build_ext.build_extensions(self)
 
 

@@ -38,16 +38,16 @@ def aligned_size(x):
 class CompareByIdWrapper:
     def __init__(self,obj):
         self._obj = obj
-    
+
     def __eq__(self,b):
         if isinstance(b,CompareByIdWrapper):
             b = b._obj
-        
+
         return self._obj is b
-    
+
     def __hash__(self):
         return id(self._obj)
-    
+
     def __getattr__(self,name):
         return getattr(self._obj,name)
 
@@ -60,34 +60,34 @@ def try_len(code):
         f = getattr(piece,'__len__',None)
         if f is None: return None
         tot += f()
-    
+
     return tot
 
 class StitchValue:
     """A register or address dependent on the ABI and state of a Stitch object.
-    
+
     This is a lazily evaluated value that can be used directly but also serves
     as a DSL for comparisons.
-    
+
     """
     def __lt__(self,b):
         return OpValue(operator.lt,self,b)
-    
+
     def __le__(self,b):
         return OpValue(operator.le,self,b)
-    
+
     def __eq__(self,b):
         return OpValue(operator.eq,self,b)
-    
+
     def __ne__(self,b):
         return OpValue(operator.ne,self,b)
-    
+
     def __gt__(self,b):
         return OpValue(operator.gt,self,b)
-    
+
     def __ge__(self,b):
         return OpValue(operator.ge,self,b)
-    
+
     def call(self,*args):
         return OpValue((lambda x,*args: x(*args)),self,*args)
 
@@ -97,7 +97,7 @@ class StitchValue:
 class AbiConstant(StitchValue):
     def __init__(self,get):
         self.get = get
-    
+
     def __call__(self,s):
         return self.get(s.abi)
 
@@ -105,7 +105,7 @@ class OpValue(StitchValue):
     def __init__(self,op,*args):
         self.op = op
         self.args = args
-    
+
     def __call__(self,s):
         return self.op(*[make_value(s,a) for a in self.args])
 
@@ -161,7 +161,7 @@ class AbiAddress(StitchValue):
         self.base = base
         self.index = index
         self.scale = scale
-    
+
     def __call__(self,s):
         return s.abi.Address(
             make_value(s,self.offset),
@@ -197,7 +197,7 @@ class TupleItem(StitchValue):
     def __init__(self,r,n):
         self.addr = CType('PyTupleObject',r).ob_item
         self.n = n
-    
+
     def __call__(self,s):
         return self.addr(s) + s.abi.ptr_size * self.n
 
@@ -264,9 +264,9 @@ class RegCmp:
         a = make_value(stitch,self.a)
         b = make_value(stitch,self.b)
         cmp = self.cmp
-        
+
         assert isinstance(a,(stitch.abi.Register,int)) or isinstance(b,(stitch.abi.Register,int))
-        
+
         if ((a == 0 and not stitch.address_like(b)) or
                 stitch.address_like(a) or
                 (b != 0 and isinstance(b,int))):
@@ -283,7 +283,7 @@ class RegCmp:
         else:
             stitch.cmp(a,b)
         stitch.jcc(test,dest)
-    
+
     def inverse(self):
         return RegCmp(self.a,self.b,CMP_INVERSE[self.cmp],self.signed)
 
@@ -291,11 +291,11 @@ class RegAnd:
     def __init__(self,a,b):
         self.a = _abivalue_to_regcmp(a)
         self.b = _abivalue_to_regcmp(b)
-    
+
     def code(self,stitch,dest):
         self.a.code(stitch,dest)
         self.b.code(stitch,dest)
-    
+
     def inverse(self):
         return RegOr(self.a.inverse(),self.b.inverse())
 
@@ -303,12 +303,12 @@ class RegOr:
     def __init__(self,a,b):
         self.a = _abivalue_to_regcmp(a)
         self.b = _abivalue_to_regcmp(b)
-    
+
     def code(self,stitch,dest):
         r = stitch.if_(self.a.inverse())
         self.b.code(r,dest)
         return r.endif()
-    
+
     def inverse(self):
         return RegAnd(self.a.inverse(),self.b.inverse())
 
@@ -326,9 +326,9 @@ def _abivalue_to_regcmp(x):
             return RegCmp(x.args[0],x.args[1],CMP_EQ)
         if x.op is operator.ne:
             return RegCmp(x.args[0],x.args[1],CMP_NE)
-        
+
         assert x.op not in [operator.gt,operator.ge,operator.lt,operator.le], 'ordered comparison requires specifying signedness'
-    
+
     return RegCmp(x,0,CMP_NE)
 
 def code_join(x):
@@ -348,11 +348,11 @@ if __debug__:
         while f:
             if f.f_code.co_filename != __file__:
                 return f.f_lineno,f.f_code.co_filename
-            
+
             f = f.f_back
-        
+
         return None
-    
+
     class SaveOrigin(type):
         def __new__(cls,name,bases,namespace,**kwds):
             old_init = namespace.get('__init__')
@@ -360,11 +360,11 @@ if __debug__:
                 def __init__(self,*args,**kwds):
                     old_init(self,*args,**kwds)
                     self._origin = _get_origin()
-                
+
                 namespace['__init__'] = __init__
-            
+
             return type.__new__(cls,name,bases,namespace)
-    
+
     class SaveOriginWithCompile(type):
         def __new__(cls,name,bases,namespace,**kwds):
             old_init = namespace.get('__init__')
@@ -372,9 +372,9 @@ if __debug__:
                 def __init__(self,*args,**kwds):
                     old_init(self,*args,**kwds)
                     self._origin = _get_origin()
-                
+
                 namespace['__init__'] = __init__
-                
+
                 old_compile = namespace.get('compile')
                 if old_compile:
                     def compile(self,displacement):
@@ -385,9 +385,9 @@ if __debug__:
                             if o:
                                 e.args += ('origin: {1}:{0}'.format(*o),)
                             raise
-                    
+
                     namespace['compile'] = compile
-            
+
             return type.__new__(cls,name,bases,namespace)
 else:
     SaveOrigin = SaveOriginWithCompile = type
@@ -424,12 +424,12 @@ class StackCleanupSection(DelayedCompileEarly):
         self.locations = frozenset(locations)
         self.dest = dest
         self.start = JumpTarget()
-    
+
     @property
     def displacement(self):
         assert self.start.displacement is not None
         return self.start.displacement
-    
+
     def compile(self,displacement):
         s = Stitch(self.abi)(self.start)
         best = None
@@ -443,31 +443,31 @@ class StackCleanupSection(DelayedCompileEarly):
                 if (best is None or len(next_.locations) >= len(best.locations)) and self.locations >= next_.locations:
                     best = next_
                 next_ = next_.next
-            
+
             clean_here = self.locations
             if best is not None: clean_here -= best.locations
 
             # sorted so the output is deterministic
             for loc,free in sorted(clean_here,key=id): free(s,loc)
-            
+
         dis = displacement - (best.displacement if best else self.dest.displacement)
         if not best: s.mov(0,R_RET)
         if dis: s.jmp(self.abi.Displacement(dis))
-        
+
         return s.code
 
 class StackCleanup:
     def __init__(self,destination):
         self.dest = [destination]
         self.last = None
-    
+
     def push_dest(self,destination):
         assert destination not in self.dest
         self.dest.append(destination)
-    
+
     def pop_dest(self):
         self.dest.pop()
-    
+
     def new_section(self,s,locations):
         old = self.last
         self.last = StackCleanupSection(s,locations,self.dest[-1])
@@ -486,7 +486,7 @@ class DeferredOffsetAddress(DeferredValue):
         self.base = base
         self.index = index
         self.scale = scale
-    
+
     def __call__(self,abi):
         assert self.offset_arg is not None
         return abi.Address(self.offset.realize(self.offset_arg) * abi.ptr_size,self.base,self.index,self.scale)
@@ -496,18 +496,18 @@ class DeferredOffset(DeferredValue):
         self.base = base
         self.arg = arg
         self.factor = factor
-    
+
     def __call__(self,abi):
         return self.base.realize(self.arg) * self.factor
 
 class DeferredOffsetBase(DeferredValue):
     def __init__(self):
         self.base = None
-    
+
     def __call__(self,abi):
         assert self.base is not None
         return self.base
-    
+
     def realize(self,arg):
         assert self.base is not None
         return self.base - arg
@@ -517,7 +517,7 @@ class DeferredValueInstr(DelayedCompileEarly):
         self.abi = abi
         self.op = op
         self.args = args
-    
+
     def compile(self,dispacement):
         return self.op(*[a(self.abi) if isinstance(a,DeferredValue) else a for a in self.args])
 
@@ -525,7 +525,7 @@ def deferred_values(s,op,args):
     args = tuple(make_value(s,a) for a in args)
     if any(isinstance(a,DeferredValue) for a in args):
         return [DeferredValueInstr(s.abi,op,args)]
-    
+
     return op(*args)
 
 class JumpTable(DelayedCompileEarly):
@@ -537,11 +537,11 @@ class JumpTable(DelayedCompileEarly):
         self.targets = targets
         self.tmp_reg1 = tmp_reg1
         self.tmp_reg2 = tmp_reg2
-    
+
     def normal_table(self,displacement):
         jmp_size = self.abi.op.JMP_DISP_MIN_LEN
         force_wide = False
-        
+
         # can we use short jumps?
         dist_extra = 0
         for t in reversed(self.targets):
@@ -550,16 +550,16 @@ class JumpTable(DelayedCompileEarly):
                 force_wide = True
                 break
             dist_extra += jmp_size
-        
+
         r = []
         dist_extra = 0
         for t in reversed(self.targets):
             r = self.abi.op.jmp(self.abi.Displacement(displacement - t.displacement + dist_extra,force_wide)) + r
             dist_extra += jmp_size
-        
+
         return self.simple_table(jmp_size) + r
-        
-    
+
+
     def simple_table(self,diff):
         s = Stitch(self.abi)
         scale = 1
@@ -569,12 +569,12 @@ class JumpTable(DelayedCompileEarly):
         else:
             s.imul(self.reg,diff,self.tmp_reg2)
             index = self.tmp_reg2
-        
+
         rip = getattr(self.abi,'r_rip',None)
         if rip:
             # RIP addresses cannot have indexes so we have to load the start
             # address into a register first
-            
+
             jmp = code_join(
                 self.abi.op.lea(self.abi.Address(0,self.tmp_reg1,index,scale),self.tmp_reg1)
                 + self.abi.op.jmp(self.tmp_reg1))
@@ -582,38 +582,38 @@ class JumpTable(DelayedCompileEarly):
         else:
             # the offset of the JMP instruction needs to include its own size
             tmp_jmp = code_join(self.abi.op.jmp(self.abi.Address(127,self.tmp_reg1,self.reg,scale)))
-            
+
             pop = code_join(self.abi.op.pop(self.tmp_reg1))
             jmp = code_join(self.abi.op.jmp(addr(len(pop) + len(tmp_jmp),self.tmp_reg1,index,scale)))
-            
+
             assert len(jmp) == len(tmp_jmp)
-            
+
             # TODO: use RelocBuffer to allow using an absolute address offset
             # instead of this CALL + POP chicanery. It could be done by
             # changing pyinternals to always support relocation and tracking
             # the location of relocatable offsets.
-            
+
             s.call(self.abi.Displacement(0))(pop + jmp)
-        
+
         return s.code
-    
+
     def compile(self,displacement):
         if len(self.targets) < 2:
             if not self.targets: return []
-            
+
             return (
                 self.abi.op.test(self.reg,self.reg) +
                 self.abi.op.jnz(self.abi.Displacement(displacement - self.targets[0].displacement)))
-        
+
         diff1 = self.targets[1].displacement - self.targets[0].displacement
         for i in range(2,len(self.targets)):
             if (self.targets[i] - self.targets[i-1]) != diff1:
                 return self.normal_table(displacement)
-        
+
         # If the targets are spaced equally far apart, then the sequence of JMP
         # instructions can be omitted and the target operations can take their
         # place.
-        return self.simple_table(diff1)
+        return self.simple_table(-diff1)
 
 
 class DelayedCompileLate:
@@ -669,7 +669,7 @@ class InnerCall(DelayedCompileLate):
 class Function:
     def __init__(self,code,padding=0,offset=0,name=None,pyfunc=False,annotation=None):
         self.code = code
-        
+
         # the size, in bytes, of the trailing padding (nop instructions) in
         # "code"
         self.padding = padding
@@ -698,10 +698,10 @@ def resolve_jumps(op,chunks,end_targets=()):
     pad_size = 0
     annot_size = 0
     annots = []
-    
+
     # this item will be replaced with padding if needed
     late_chunks = [None]
-    
+
     def early_compile(chunks):
         for c in reversed(chunks):
             if isinstance(c,DelayedCompileEarly):
@@ -756,35 +756,41 @@ def auto_ne(self,b):
     return not r
 
 
-class CountedValue(StitchValue,metaclass=SaveOrigin):
+class TrackedValue(StitchValue):
+    def discard(self,s):
+        raise NotImplementedError()
+
+class CountedValue(TrackedValue,metaclass=SaveOrigin):
     def to_addr_movable_val(self,s):
         """If this value is in an address, move it to a register and return the
         new value object, otherwise return self.
-        
+
         A MOV instruction can't have an address as both a source and
         destination, so if eg: a value needs to be moved to an address and then
         freed, calling this will make sure the value can be moved and wont need
         to be loaded into a register a second time to decrement the reference
         counter.
-        
+
         """
-        
+
         loc = self(s)
         if s.address_like(loc):
             dest = RegObj(s,s.unused_reg(),self.owned)
             s.mov(loc,dest)
-            
+
             # this test is needed because self.owned is not always assignable,
             # but a value of True guarantees that it is
             if self.owned: self.owned = False
-            
+
             self.discard(s)
             return dest
-        
+
         return self
-    
-    cleanup_free_func = staticmethod(pyobj_free)
-    
+
+    @property
+    def cleanup_free_func(self):
+        return pyobj_free if self.owned else None
+
     if __debug__:
         def __del__(self):
             if getattr(self,'owned',False):
@@ -793,13 +799,13 @@ class CountedValue(StitchValue,metaclass=SaveOrigin):
                     msg += ' Origin: {1}:{0}'.format(*self._origin)
                 warnings.warn(msg)
 
-class BorrowedValue(StitchValue):
+class BorrowedValue(TrackedValue):
     def __init__(self,value):
         self.value = value
-    
+
     def __call__(self,s):
         return self.value(s)
-    
+
     def discard(self,s,**kwds):
         pass
 
@@ -815,11 +821,11 @@ class StolenValue(StitchValue):
     def __init__(self,val):
         self.val = val
         self.loc = None
-    
+
     def __call__(self,s):
         if self.loc is None:
             self.loc = self.val(s)
-            
+
             if isinstance(self.val,CountedValue):
                 # this test is needed because self.val.owned is not always
                 # assignable, but a value of True guarantees that it is
@@ -827,8 +833,11 @@ class StolenValue(StitchValue):
                     self.val.owned = False
                 else:
                     s.incref(self)
-            
-            self.val.discard(s)
+
+                self.val.discard(s)
+            else:
+                assert getattr(self.val,'valid',True)
+                self.val.valid = False
         return self.loc
 
 steal = StolenValue
@@ -854,53 +863,53 @@ def discard_stack_value(s,offset,**kwds):
 class PendingStackObj(StitchValue):
     """A Python object with a position on the stack that is yet to be
     determined"""
-    
+
     def __init__(self):
         self.loc = None
         self.offset = None
-    
+
     def bind(self,value):
         self.offset = value.offset
         if self.loc:
             self.loc.offset_arg = stack_index_to_offset(self.offset)
-    
+
     def __call__(self,s):
         if self.loc is None: self.loc = stack_location(s,self.offset)
         return self.loc
 
-class RegValue(StitchValue):
+class RegValue(TrackedValue):
     """A value stored in a register"""
-    
+
     def __init__(self,s,reg=None,force=False):
         if reg is None:
             reg = s.unused_reg()
         else:
             reg = make_value(s,reg)
             if force: s.free_regs(reg)
-            assert s.state.regs[reg] is None
-        
+            assert s.state.regs.get(reg) is None
+
         s.state.regs[reg] = self
         self.reg = reg
-    
+
     def discard(self,s):
         assert self.reg and s.state.regs.get(self.reg) is self
         s.state.regs[self.reg] = None
         self.reg = None
-    
+
     def free_reg(self,s):
         return False
-    
+
     def __call__(self,s):
         assert self.reg is not None
         return self.reg
 
 class RegObj(CountedValue,RegValue):
     """A Python object stored in a register"""
-    
+
     def __init__(self,s,reg=None,owned=True,force=False):
         super().__init__(s,reg,force)
         self.owned = owned
-    
+
     def discard(self,s,**kwds):
         if self.owned:
             assert self.reg is not None
@@ -908,63 +917,68 @@ class RegObj(CountedValue,RegValue):
             self.owned = False
         super().discard(s)
 
-class StackValue(StitchValue):
+class StackValue(TrackedValue):
     """A value stored in a register that can be pushed to the stack on demand
     """
-    
+
     def __init__(self,s,reg=None):
         self.reg = make_value(s,reg)
         self.offset = None
-        
+
         if self.reg is not None:
             assert not self.in_register(s)
             s.state.regs[self.reg] = self
-    
+
     def in_register(self,s):
         return s.state.regs.get(self.reg) is self
-    
+
+    def in_stack(self,s):
+        if self.offset is None: return False
+        entry = s.state.stack[self.offset]
+        return entry and entry[0] is self
+
     def discard(self,s):
         if self.in_register(s):
             s.state.regs[self.reg] = None
-        
-        if self.offset:
+
+        if self.offset is not None:
             s.state.stack[self.offset] = None
-    
+
     def __call__(self,s):
         return self.reg if self.in_register(s) else stack_location(s,self.offset)
-    
+
     def _set_offset(self,offset):
         self.offset = offset
         return self
-    
+
     def reload_reg(self,s,r=None):
         r = make_value(s,r)
-        
+
         if not self.in_register(s):
             self.reg = r or s.unused_reg()
             s.state.regs[self.reg] = self
             s.mov(stack_location(s,self.offset),self.reg)
         else:
             assert r is None or self.reg == r
-    
+
     def free_reg(self,s):
         if self.in_register(s):
             s.state.regs[self.reg] = None
-        
-        if not self.offset:
+
+        if not self.in_stack(s):
             s.new_stack_value(value_t=self._set_offset)
             s.mov(self.reg,stack_location(s,self.offset))
-        
+
         return True
 
 class StackObj(CountedValue,StackValue):
     """A Python object stored in a register that can be pushed to the stack on
     demand"""
-    
+
     def __init__(self,s,reg=None,owned=True):
         super().__init__(s,reg)
         self.owned = owned
-    
+
     def discard(self,s,**kwds):
         if self.owned: self.reload_reg(s)
         super().discard(s)
@@ -972,13 +986,13 @@ class StackObj(CountedValue,StackValue):
             s.decref(self.reg)
             self.owned = False
 
-class ConstValue(StitchValue):
+class ConstValue(TrackedValue):
     def __init__(self,addr):
         self.addr = addr
-    
+
     def __call__(self,s):
         return self.addr
-    
+
     def discard(self,s):
         pass
 
@@ -990,13 +1004,13 @@ class BorrowedTempValue(StitchValue):
     def __init__(self,s,val):
         self.s = s
         self.val = val(s) if isinstance(val,type) else val
-    
+
     def __enter__(self):
         return self.val
-    
+
     def __exit__(self,*exc):
         pass
-    
+
     def __call__(self,s):
         return self.val(s)
 
@@ -1005,31 +1019,31 @@ class TempValue(BorrowedTempValue):
         self.val.discard(self.s)
 
 
-class RegCache(StitchValue):
+class RegCache(TrackedValue):
     """A value stored in a register that doesn't need to be preserved"""
     def __init__(self,s,reg=None):
         if reg is None: self.value = None
         else: self.validate(s,None if reg is True else reg)
-    
+
     def validate(self,s,reg=None):
         if reg is None:
             reg = s.unused_reg()
         else:
             reg = make_value(s,reg)
-        
+
         self.value = RegValue(s,reg)
-    
+
     def discard(self,s):
         if self.valid: self.value.discard(s)
-    
+
     @property
     def valid(self):
         return self.value is not None
-    
+
     def __call__(self,s):
         assert self.valid
         return self.value(s)
-    
+
     def free_reg(self,s):
         self.discard(s)
         return True
@@ -1040,9 +1054,11 @@ def objarray_free(s,loc):
 
 class ObjArrayValue(StackValue):
     cleanup_free_func = staticmethod(objarray_free)
-    
+    valid = True
+
     def discard(self,s):
-        objarray_free(s,self)
+        if self.valid:
+            objarray_free(s,self)
         super().discard(s)
 
 
@@ -1052,18 +1068,18 @@ class State:
         self.regs = regs if regs is not None else {}
         self.args = args
         self.unreserved_offset = unreserved_offset
-    
+
     def __eq__(self,b):
         if isinstance(b,State):
             return (self.stack == b.stack
                 and self.regs == b.regs
                 and self.args == b.args
                 and self.unreserved_offset == b.unreserved_offset)
-        
+
         return NotImplemented
-    
+
     __ne__ = auto_ne
-    
+
     def copy(self):
         return State(self.stack[:],self.regs.copy(),self.args,self.unreserved_offset)
 
@@ -1072,43 +1088,45 @@ def annot_with_comment(abi,descr,stack):
 
 class Stitch:
     """Create machine code concisely using method chaining"""
-    
+
     def __init__(self,abi,outer=None,jmp_target=None,in_elif=False):
         self.abi = abi
         self.outer = outer
         self.jmp_target = jmp_target
         self.in_elif = in_elif
         self._code = []
+
+        # this is True when the last instruction was an unconditional jump
+        # (even if that instruction comes from a DelayedCompiled* object and
+        # hasn't been generated yet)
         self.last_op_is_uncond_jmp = False
-        self.last_op_is_uncond_jmp_if = False
-        
+
         if outer:
             self.state = outer.state.copy()
+            self.state_if = outer.state
             self.cleanup = outer.cleanup
             self.def_stack_offset = outer.def_stack_offset
             self.special_addrs = outer.special_addrs
-            
+
             self.usable_tmp_regs = outer.usable_tmp_regs
         else:
             self.state = State()
+            self.state_if = None
             self.cleanup = StackCleanup(JumpTarget())
             self.def_stack_offset = DeferredOffsetBase()
             self.special_addrs = {}
-            
+
             self.usable_tmp_regs = list(abi.r_scratch)
             self.usable_tmp_regs.append(abi.r_ret)
             self.usable_tmp_regs.extend(abi.r_pres)
-        
-        if __debug__:
-            self.state_if = None
-    
+
     def address_like(self,x):
         return isinstance(x,(self.abi.Address,DeferredOffsetAddress))
-    
+
     @property
     def exc_depth(self):
         return len(self.cleanup.dest)
-    
+
     def new_stack_value(self,prolog=False,value_t=None,name=None):
         if prolog:
             depth = 0
@@ -1122,58 +1140,58 @@ class Stitch:
                 r = value_t(i)
                 self.state.stack[i] = (r,depth)
                 return r
-        
+
         r = value_t(len(self.state.stack))
         self.state.stack.append((r,depth))
         if name: self.special_addrs[name] = r
         return r
-    
+
     def unused_reg(self):
         for r in self.usable_tmp_regs:
             if self.state.regs.get(r) is None: return r
-        
+
         for r in reversed(self.usable_tmp_regs):
             if self.state.regs[r].free_reg(self): return r
 
         assert False,"no free registers"
-    
+
     def unused_regs(self,num):
         assert num >= 0
         regs = []
-        
+
         for r in self.usable_tmp_regs:
             if len(regs) == num: return regs
             if self.state.regs.get(r) is None: regs.append(r)
-        
+
         for r in reversed(self.usable_tmp_regs):
             if len(regs) == num: return regs
             if self.state.regs[r] is not None and self.state.regs[r].free_reg(self): regs.append(r)
 
         assert len(regs) == num,"not enough free registers"
-        
+
         return regs
-    
+
     def temp_reg(self):
         return TempValue(self,RegValue(self,self.unused_reg()))
-    
+
     def temp_reg_for(self,value):
         loc = value(self)
         if isinstance(loc,self.abi.Register): return BorrowedTempValue(self,value)
-        
+
         r = self.temp_reg()
         self.mov(loc,r)
         return r
-    
+
     def invalidate_scratch(self):
         """Make sure there are no scratch registers used.
-        
+
         This is typically called before issuing function call instructions,
         since scratch registers, by definition, are not preserved across
         function calls.
-        
+
         """
         self.free_regs(*(self.abi.r_scratch + [self.abi.r_ret]))
-    
+
     def free_regs(self,*regs):
         for r in regs:
             r = make_value(self,r)
@@ -1181,23 +1199,23 @@ class Stitch:
             if val is not None:
                 freed = val.free_reg(self)
                 assert freed,"register will not be preserved"
-    
+
     def exc_cleanup(self):
         """Free the stack items created at the current exception handler depth
         """
-        
+
         self.invalidate_scratch()
-        
+
         self(self.cleanup.new_section(self,(
             CleanupItem(make_value(self,ld[0]),ld[0].cleanup_free_func)
             for ld in self.state.stack
-            if ld is not None and ld[1] == self.exc_depth and hasattr(ld[0],'cleanup_free_func'))))
+            if ld is not None and ld[1] == self.exc_depth and getattr(ld[0],'cleanup_free_func',None))))
         self.last_op_is_uncond_jmp = True
         return self
 
     def check_err(self,inverted=False):
         return self.if_(R_RET if inverted else not_(R_RET)).exc_cleanup().endif()
-    
+
     def reserve_stack(self,move_sp=True):
         """Advance the stack pointer so that self.stack_size * abi.ptr_size
         bytes are reserved and annotate it.
@@ -1213,7 +1231,7 @@ class Stitch:
         assert self.state.unreserved_offset is None
 
         self.state.unreserved_offset = len(self.state.stack)
-        
+
         if move_sp:
             self.sub(DeferredOffset(self.def_stack_offset,len(self.state.stack),self.abi.ptr_size),self.abi.r_sp)
 
@@ -1221,7 +1239,7 @@ class Stitch:
             self.abi,
             partial(annot_with_comment,self.abi,debug.PROLOG_END),
             [self.def_stack_offset]))
-        
+
         return self
 
     def release_stack(self):
@@ -1229,20 +1247,20 @@ class Stitch:
         were before reserve_stack was called."""
 
         assert self.state.unreserved_offset is not None
-        
+
         self.def_stack_offset.base = aligned_size(
                 (len(self.state.stack) + max(MAX_ARGS-len(self.abi.r_arg),0)) * self.abi.ptr_size + self.abi.shadow
             ) // self.abi.ptr_size
-        
+
         (self
             .add(DeferredOffset(self.def_stack_offset,self.state.unreserved_offset,self.abi.ptr_size),self.abi.r_sp)
             .annotation(debug.EPILOG_START,self.state.unreserved_offset))
-        
+
         self.state.stack = self.state.stack[0:self.state.unreserved_offset]
         self.state.unreserved_offset = None
-        
+
         return self
-    
+
     def save_reg(self,r):
         self.new_stack_value(True)
         return self.push(r).annotation(debug.SaveReg(make_value(self,r)))
@@ -1251,17 +1269,17 @@ class Stitch:
         item,depth = self.state.stack.pop()
         assert depth == 0
         return self.pop(r).annotation(debug.RestoreReg(make_value(self,r)))
-    
+
     def annotation(self,descr,stack=None):
         if stack is None: stack = len(self.state.stack)
         return self.append(annot_with_comment(self.abi,descr,stack))
-    
+
     def push_stack_prolog(self,reg,name,descr=None):
         self.mov(reg,self.new_stack_value(True,name=name))
         if descr is not None:
             self.annotation(descr)
         return self
-    
+
     def func_arg(self,n):
         """Return the address or register where argument n of the current
         function is stored.
@@ -1271,35 +1289,39 @@ class Stitch:
 
         """
         return self.abi.r_arg[n] if n < len(self.abi.r_arg) else DeferredOffsetAddress(self.def_stack_offset,-n,self.abi.r_sp)
-    
+
     def append(self,x,is_jmp=None):
         self.last_op_is_uncond_jmp = is_jmp
         self._code.extend(x)
-        
+
         return self
 
     def branch(self,jmp_target=None,in_elif=False):
         return Stitch(self.abi,self,jmp_target,in_elif)
 
     def end_branch(self):
+        last_op_is_uncond_jmp = self.last_op_is_uncond_jmp
         if self.jmp_target: self(self.jmp_target)
- 
-        assert self.state_if is None or self.state == self.state_if
-        
-        self.outer.last_op_is_uncond_jmp = self.last_op_is_uncond_jmp_if and self.last_op_is_uncond_jmp
+
         self.outer.append(self._code)
-        
-        self.outer.state = self.state
-        
+
+        if last_op_is_uncond_jmp:
+            self.outer.state = self.state_if
+            if self.state_if is None:
+                self.outer.last_of_is_uncond_jmp = True
+        else:
+            assert self.state_if is None or self.state == self.state_if
+            self.outer.state = self.state
+
         return self.outer.end_branch() if self.in_elif else self.outer
 
     def get_code(self):
         assert self.outer is None
         return self._code
-    
+
     def set_code(self,c):
         self._code = c
-    
+
     code = property(get_code,set_code)
 
     def clear_args(self):
@@ -1311,32 +1333,34 @@ class Stitch:
         after = JumpTarget()
         self.jcc(~test,after)
         return self.branch(after,in_elif)
-    
+
     def if_cond(self,test):
         return self._if_cond(test,False)
 
     def endif(self):
         assert self.jmp_target
         return self.end_branch()
-    
+
     def else_(self):
         assert self.jmp_target
         e_target = self.jmp_target
         self.jmp_target = JumpTarget()
-        if __debug__: self.state_if = self.state
-        
+
         if len(self.state.stack) > len(self.outer.state.stack):
             # the length of the stack array determines how much actual stack
             # space to allocate
             self.outer.state.stack += [None] * (len(self.state.stack) - len(self.outer.state.stack))
-        
-        self.state = self.outer.state.copy()
-        self.last_op_is_uncond_jmp_if = self.last_op_is_uncond_jmp
-        if not self.last_op_is_uncond_jmp:
+
+        if self.last_op_is_uncond_jmp:
+            self.state_if = None
+        else:
+            self.state_if = self.state
             self.jmp(self.jmp_target)
 
+        self.state = self.outer.state.copy()
+
         return self(e_target)
-    
+
     def elif_cond(self,test):
         return self.else_()._if_cond(test,True)
 
@@ -1344,26 +1368,26 @@ class Stitch:
         after = JumpTarget()
         _abivalue_to_regcmp(test).code(self,after)
         return self.branch(after,in_elif)
-    
+
     def if_(self,test):
         return self._if_(test,False)
-    
+
     def elif_(self,test):
         return self.else_()._if_(test,True)
-    
+
     def do(self):
         return self.branch()
-    
+
     def while_cond(self,cond):
         cond = make_value(self,cond)
-        
+
         clen = try_len(self._code)
-        
+
         if clen is not None:
             jsize = self.abi.op.JCC_MAX_LEN
             if fits_in_sbyte(clen + self.abi.op.JCC_MIN_LEN):
                 jsize = self.abi.op.JCC_MIN_LEN
-            
+
             self.outer._code += self._code
             self.outer.jcc(cond,self.abi.Displacement(-(clen + jsize)))
         else:
@@ -1371,40 +1395,40 @@ class Stitch:
             self.outer(start)
             self.outer._code += self._code
             self.outer(JumpRSource(partial(self.abi.op.jcc,cond),self.abi,self.abi.op.JCC_MAX_LEN,start))
-        
+
         return self.outer
 
     def comment(self,c,*args):
         return self.append(self.abi.comment(c,*args))
-    
+
     def inline_comment(self,c):
         assert self._code
         if self.abi.assembly:
             assert self._code[-1].ops and not self._code[-1].ops[-1].annot
             self._code[-1].ops[-1].annot = c
-        
+
         return self
-    
+
     def unwind_handler(self,down_to=0):
         # since subsequent exception-unwinds overwrite previous exception-
         # unwinds, we could skip everything before the last except block at
         # the cost of making the functions at unwind_exc and unwind_finally
         # check for nulls when freeing the other stack items
-        
+
         is_exc = param('hblock').type == BLOCK_EXCEPT
         h_free = just(len)(STATE.stack.pstack) - param('hblock').stack
-        
+
         @just
         def get_handler_blocks(state,down_to):
             for hblock in reversed(state.handler_blocks):
                 assert hblock.stack is not None and len(state.stack.pstack) >= hblock.stack
-        
+
                 if (hblock.stack - (3 if hblock.type == BLOCK_EXCEPT else 6)) < down_to: break
-                
+
                 state.stack.pstack.protected_items.pop()
-                
+
                 yield hblock
-        
+
         return self.append_for(get_handler_blocks(STATE,down_to),'hblock',Stitch(self)
             .lea(STACK[h_free],R_PRES1)
             .mov(-h_free,R_SCRATCH1)
@@ -1426,9 +1450,9 @@ class Stitch:
         block = state.current_except_or_finally()
         if block:
             pre_stack = block.stack - EXCEPT_VALUES
-        
+
         extra = len(STATE.stack.pstack) - pre_stack
-        
+
         self.unwind_handler(pre_stack)
         if block:
             assert extra >= 0
@@ -1442,7 +1466,7 @@ class Stitch:
                 .jmp(block.target))
         else:
             self.end_func()
-        
+
         return self
 
     def incref(self,reg=R_RET,amount=1):
@@ -1455,19 +1479,19 @@ class Stitch:
                 .mov(R_RET,self.special_addrs['temp_ax'])
                 .mov(R_SCRATCH1,self.special_addrs['temp_cx'])
                 .mov(R_SCRATCH2,self.special_addrs['temp_dx']))
-            
+
             # call make_value before fiddling with self.state.regs, in case reg
             # depends on self.state.regs
             reg = make_value(self,reg)
-            
+
             sregs = self.state.regs
             self.state.regs = {}
-            
+
             for _ in range(amount):
                 self.invoke('Py_IncRef',reg)
-                
+
             self.state.regs = sregs
-            
+
             return (self
                 .mov(self.special_addrs['temp_dx'],R_SCRATCH2)
                 .mov(self.special_addrs['temp_cx'],R_SCRATCH1)
@@ -1478,7 +1502,7 @@ class Stitch:
     def decref(self,reg=R_RET,preserve_reg=None,amount=1):
         """Generate instructions equivalent to Py_DECREF"""
         assert amount > 0
-        
+
         preserve_reg = make_value(self,preserve_reg)
 
         if pyinternals.REF_DEBUG:
@@ -1488,9 +1512,9 @@ class Stitch:
 
             if amount > 1:
                 self.mov(reg,self.special_addrs['temp_cx'])
-            
+
             self.invoke('Py_DecRef',reg)
-            
+
             for _ in range(amount-1):
                 self.invoke('Py_DecRef',self.special_addrs['temp_cx'])
 
@@ -1501,15 +1525,15 @@ class Stitch:
                 self.mov(0,R_RET)
 
             return self
-        
+
         instr = (self
             .sub(amount,CType('PyObject',reg).ob_refcnt)
             .if_cond(TEST_Z))
-        
+
         if preserve_reg:
             instr.mov(preserve_reg,self.special_addrs['temp'])
             used = self.state.regs.get(preserve_reg)
-        
+
         instr.mov(CType('PyObject',reg).ob_type,R_SCRATCH1)
 
         if pyinternals.COUNT_ALLOCS:
@@ -1519,24 +1543,24 @@ class Stitch:
 
         if pyinternals.COUNT_ALLOCS:
             instr.invoke('inc_count',self.special_addrs['count_allocs_temp'])
-        
+
         if preserve_reg:
             instr.mov(self.special_addrs['temp'],preserve_reg)
             if used: self.state.regs[preserve_reg] = used
         elif preserve_reg == 0:
             instr.mov(0,R_RET)
-        
+
         return instr.endif()
-    
+
     def fit_addr(self,addr,reg=None,obj=False):
         """If the pyinternals.raw_addresses[addr] can fit into a 32-bit
         immediate value without sign-extension, return an instance of
         Const(Value/Obj), otherwise load the address into reg and return an
         instance of Reg(Value/Obj)."""
-        
+
         addr = pyinternals.raw_addresses[addr]
         if fits_imm32(self.abi,addr): return (ConstObj if obj else ConstValue)(addr)
-        
+
         if reg is None: reg = self.unused_reg()
         self.mov(addr,reg)
         return (RegObj if obj else RegValue)(self,reg)
@@ -1550,7 +1574,7 @@ class Stitch:
 
     def push_arg(self,x,tempreg=None,n=None):
         x = make_value(self,x)
-        
+
         if not tempreg: tempreg = self.unused_reg()
 
         if n is None:
@@ -1585,11 +1609,11 @@ class Stitch:
                 .inline_comment(func))
 
         return self.append(self.abi.op.call(func))
-    
+
     def invoke(self,func,*args,tmpreg=None):
         for a in args:
             self.push_arg(a,tmpreg)
-        
+
         return self.call(func)
 
     def arg_reg(self,tempreg=None,n=None):
@@ -1607,11 +1631,11 @@ class Stitch:
         if n is None: n = self.state.args
         return (self.abi.r_arg[n] if n < len(self.abi.r_arg)
                 else (tempreg or self.unused_reg()))
-    
+
     def inner_call(self,target,jump_instead=False):
         self.invalidate_scratch()
         return self(InnerCall(self.abi,target,jump_instead),is_jmp=jump_instead)
-    
+
     def get_threadstate(self,reg):
         # as far as I can tell, after expanding the macros and removing the
         # "dynamic annotations" (see dynamic_annotations.h in the CPython
@@ -1620,7 +1644,7 @@ class Stitch:
         if fits_imm32(self.abi,ts):
             return self.mov(addr(ts),reg)
         return self.op.mov(ts,reg).mov(addr(base=reg),reg)
-    
+
     def jmp(self,target):
         target = make_value(self,target)
         if isinstance(target,JumpTarget):
@@ -1630,43 +1654,43 @@ class Stitch:
 
         self.last_op_is_uncond_jmp = True
         return self
-    
+
     def jcc(self,test,target):
         test = make_value(self,test)
         target = make_value(self,target)
-        
+
         op = self.abi.op.jcc
         return self(JumpSource(partial(op,test),self.abi,target) if isinstance(target,JumpTarget) else op(test,target))
-    
+
     def cmovcc(self,test,a,b):
         test = make_value(self,test)
         a = make_value(self,a)
         b = make_value(self,b)
-        
+
         if self.abi.has_cmovcc:
             return self.append(self.abi.op.cmovcc(test,a,b))
-        
+
         return self.if_cond(test).mov(a,b).endif()
-    
+
     def mov_addrs(self,a,b,tmp_reg=None):
         a = make_value(self,a)
         b = make_value(self,b)
         if self.address_like(a) and self.address_like(b):
             if tmp_reg is None: tmp_reg = self.unused_reg()
             return self.mov(a,tmp_reg).mov(tmp_reg,b)
-        
+
         return self.mov(a,b)
-    
+
     def jump_table(self,reg,targets,tmp_reg1=None,tmp_reg2=None):
         """Create a jump table using "reg" as the index and "targets" as the
         destinations.
-        
+
         "targets" isn't used until the code is passed to resolve_jumps, so an
         empty sequence can be passed, to be filled later.
-        
+
         "tmp_reg2" can be the same as "reg", in which case "reg" is simply not
         preserved.
-        
+
         """
         reg = make_value(self,reg)
         if tmp_reg1 is None:
@@ -1681,7 +1705,7 @@ class Stitch:
                 tmp_reg2 = self.unused_reg()
             else:
                 tmp_reg2 = make_value(self,tmp_reg2)
-        
+
         return self(JumpTable(self.abi,reg,targets,tmp_reg1,tmp_reg2))
 
     def __getattr__(self,name):
@@ -1693,13 +1717,13 @@ class Stitch:
             suffix = name[4:]
         else:
             return lambda *args: self.append(deferred_values(self,getattr(self.abi.op,name),args))
-        
+
         try:
             test = self.abi.Test(_TEST_LOOKUP[suffix])
         except KeyError:
             assert getattr(self.abi.op,name,None) is None
             raise AttributeError(name)
-        
+
         return partial(xcc,test)
 
     def __call__(self,op,*,is_jmp=False):
@@ -1707,13 +1731,13 @@ class Stitch:
         self._code.append(op)
         self.last_op_is_uncond_jmp = is_jmp
         return self
-    
+
     def __getitem__(self,b):
         """Equivalent to b(self); return self.
-        
+
         This is to allow calling arbitrary functions on chains of Stitch
         operations without breaking the sequential flow.
-        
+
         """
         b(self)
         return self
