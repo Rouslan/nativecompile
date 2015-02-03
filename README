@@ -1,17 +1,14 @@
-Experimental bytecode to machine code compiler
+JIT Python compiler
 
-CPython 3.3 is required. Higher versions are unlikely to work.
+CPython 3.4 is required. Higher versions are unlikely to work.
 
 The compiler supports the x86 and x86-64 instruction sets.
-
-The YIELD_FROM instruction is not yet implemented.
 
 
 Basic Usage:
 
 >>> import nativecompile
->>> bcode = compile('print("Hello World!")','<string>','exec')
->>> mcode = nativecompile.compile(bcode)
+>>> mcode = nativecompile.compile('print("Hello World!")')
 >>> mcode()
 Hello World!
 
@@ -31,8 +28,7 @@ Usage:
 >>> import nativecompile.importer
 >>> nativecompile.importer.install_importer()
 >>> import mymodule
->>> bcode = compile('mymodule.myfunction()','<string>','exec')
->>> mcode = nativecompile.compile(bcode)
+>>> mcode = nativecompile.compile('mymodule.myfunction()')
 >>> mcode()
 
 Calling install_importer will install a path hook (see
@@ -41,22 +37,6 @@ module inside a folder (the hook does not currently handle modules inside ZIP
 files). Any module that is handled by another path or meta-path hook will not be
 compiled (but will still run).
 
-The compiled code from a module is stored in the module's globals under the name
-__nativecompile_compiled_code__. If this object is deleted, the compiled code
-will be gone, but the bytecode will remain and everything in the module will
-still work. The variable is never referenced after being set, so as long as you
-preserve the compiled code object, the name can be reassigned to or unset
-without affecting the compiled code.
-
-
-This is a very unsophisticated compiler. The bytecode is translated into the
-equivalent machine code with very little optimization. However, this does remove
-the overhead of the interpreter loop and thus should result in a modest
-performance boost.
-
-
-Implementation note:
-
-Since code and function objects cannot be subclassed, the most significant bit
-in co_flags in a PyCodeObject is used by this package to indicate the presence
-of compiled code instead.
+This is a very unsophisticated compiler. No type inference and very little
+optimization is done. However, this does remove the overhead of the interpreter
+loop and thus should result in a modest performance boost.

@@ -19,6 +19,9 @@ import warnings
 from collections import namedtuple
 from functools import partial,reduce
 
+if __debug__:
+    import weakref
+
 from . import pyinternals
 from . import debug
 from .abi import fits_imm32
@@ -64,7 +67,8 @@ def try_len(code):
     return tot
 
 class StitchValue:
-    """A register or address dependent on the ABI and state of a Stitch object.
+    """A value (usually a register or address) dependent on the ABI and state
+    of a Stitch object.
 
     This is a lazily evaluated value that can be used directly but also serves
     as a DSL for comparisons.
@@ -649,6 +653,10 @@ class InnerCall(DelayedCompileLate):
     source's function and the target function, which cannot be determined until
     the length of the entire source function is determined.
 
+    :type abi: abi.Abi
+    :type target: JumpTarget
+    :type jump_instead: bool | None
+
     """
     def __init__(self,abi,target,jump_instead=False):
         self.op = abi.op.jmp if jump_instead else abi.op.call
@@ -771,33 +779,34 @@ class CountedValue(TrackedValue,metaclass=SaveOrigin):
         to be loaded into a register a second time to decrement the reference
         counter.
 
-        """
+        :type s: Stitch
 
+        """
         loc = self(s)
         if s.address_like(loc):
-            dest = RegObj(s,s.unused_reg(),self.owned)
+            dest = RegObj(s,s.unused_reg(),s.state.owned(self))
             s.mov(loc,dest)
 
-            # this test is needed because self.owned is not always assignable,
-            # but a value of True guarantees that it is
-            if self.owned: self.owned = False
-
+            s.state.disown(self)
             self.discard(s)
             return dest
 
         return self
 
-    @property
-    def cleanup_free_func(self):
-        return pyobj_free if self.owned else None
+    def to_addr(self,s):
+        loc = self(s)
+        if s.address_like(loc):
+            return self
 
-    if __debug__:
-        def __del__(self):
-            if getattr(self,'owned',False):
-                msg = 'Ref-counted value not freed (in the generated machine code, not the running interpreter).'
-                if self._origin:
-                    msg += ' Origin: {1}:{0}'.format(*self._origin)
-                warnings.warn(msg)
+        dest = s.new_stack_value()
+        s.mov(loc,dest)
+
+        s.state.disown(self)
+        self.discard(s)
+        return dest
+
+    def cleanup_free_func(self,s):
+        return pyobj_free if s.state.owned(self) else None
 
 class BorrowedValue(TrackedValue):
     def __init__(self,value):
@@ -810,7 +819,7 @@ class BorrowedValue(TrackedValue):
         pass
 
 class BorrowedObj(CountedValue,BorrowedValue):
-    owned = False
+    pass
 
 def borrow(x):
     if isinstance(x,BorrowedValue): return x
@@ -827,10 +836,8 @@ class StolenValue(StitchValue):
             self.loc = self.val(s)
 
             if isinstance(self.val,CountedValue):
-                # this test is needed because self.val.owned is not always
-                # assignable, but a value of True guarantees that it is
-                if self.val.owned:
-                    self.val.owned = False
+                if s.state.owned(self.val):
+                    s.state.disown(self.val)
                 else:
                     s.incref(self)
 
@@ -878,8 +885,12 @@ class PendingStackObj(StitchValue):
         return self.loc
 
 class RegValue(TrackedValue):
-    """A value stored in a register"""
+    """A value stored in a register.
 
+    :type s: Stitch
+    :type force: bool | None
+
+    """
     def __init__(self,s,reg=None,force=False):
         if reg is None:
             reg = s.unused_reg()
@@ -894,7 +905,6 @@ class RegValue(TrackedValue):
     def discard(self,s):
         assert self.reg and s.state.regs.get(self.reg) is self
         s.state.regs[self.reg] = None
-        self.reg = None
 
     def free_reg(self,s):
         return False
@@ -904,23 +914,30 @@ class RegValue(TrackedValue):
         return self.reg
 
 class RegObj(CountedValue,RegValue):
-    """A Python object stored in a register"""
+    """A Python object stored in a register.
 
+    :type s: Stitch
+    :type owned: bool | None
+    :type force: bool | None
+
+    """
     def __init__(self,s,reg=None,owned=True,force=False):
         super().__init__(s,reg,force)
-        self.owned = owned
+        if owned: s.state.own(self)
 
     def discard(self,s,**kwds):
-        if self.owned:
+        if s.state.owned(self):
             assert self.reg is not None
             s.decref(self.reg,**kwds)
-            self.owned = False
+            s.disown(self)
         super().discard(s)
 
 class StackValue(TrackedValue):
-    """A value stored in a register that can be pushed to the stack on demand
-    """
+    """A value stored in a register that can be pushed to the stack on demand.
 
+    :type s: Stitch
+
+    """
     def __init__(self,s,reg=None):
         self.reg = make_value(s,reg)
         self.offset = None
@@ -956,6 +973,7 @@ class StackValue(TrackedValue):
 
         if not self.in_register(s):
             self.reg = r or s.unused_reg()
+            assert s.state.regs.get(self.reg) is None
             s.state.regs[self.reg] = self
             s.mov(stack_location(s,self.offset),self.reg)
         else:
@@ -973,18 +991,27 @@ class StackValue(TrackedValue):
 
 class StackObj(CountedValue,StackValue):
     """A Python object stored in a register that can be pushed to the stack on
-    demand"""
+    demand.
 
+    :type s: Stitch
+    :type owned: bool | None
+
+    """
     def __init__(self,s,reg=None,owned=True):
         super().__init__(s,reg)
-        self.owned = owned
+        if owned: s.state.own(self)
 
     def discard(self,s,**kwds):
-        if self.owned: self.reload_reg(s)
+        owned = s.state.owned(self)
+        if owned: self.reload_reg(s)
         super().discard(s)
-        if self.owned:
+        if owned:
             s.decref(self.reg)
-            self.owned = False
+            s.state.disown(self)
+
+    def to_addr(self,s):
+        self.free_reg(s)
+        return self
 
 class ConstValue(TrackedValue):
     def __init__(self,addr):
@@ -997,7 +1024,7 @@ class ConstValue(TrackedValue):
         pass
 
 class ConstObj(CountedValue,ConstValue):
-    owned = False
+    pass
 
 
 class BorrowedTempValue(StitchValue):
@@ -1053,7 +1080,6 @@ def objarray_free(s,loc):
     s.invoke('free_pyobj_array',loc)
 
 class ObjArrayValue(StackValue):
-    cleanup_free_func = staticmethod(objarray_free)
     valid = True
 
     def discard(self,s):
@@ -1061,11 +1087,44 @@ class ObjArrayValue(StackValue):
             objarray_free(s,self)
         super().discard(s)
 
+    @staticmethod
+    def cleanup_free_func(s):
+        return objarray_free
+
+
+if __debug__:
+    class CountedRef(weakref.ref):
+        __slots__ = 'origin','_id'
+
+        def __new__(cls,x,callback=None,origin=None):
+            r = weakref.ref.__new__(cls,x,callback)
+            r.origin = origin
+            r._id = id(x)
+            return r
+
+        def __init__(self,x,callback=None,origin=None):
+            weakref.ref.__init__(self,x,callback)
+
+        def __eq__(self,b):
+            if isinstance(b,CountedRef):
+                return self._id == b._id
+
+            if isinstance(b,weakref.ref):
+                return self._id == id(b())
+
+            return self._id == id(b)
+
+        def __ne__(self,b):
+            return not self.__eq__(b)
+
+        def __hash__(self):
+            return hash(self._id)
 
 class State:
-    def __init__(self,stack=None,regs=None,args=0,unreserved_offset=None):
+    def __init__(self,stack=None,regs=None,owned=None,args=0,unreserved_offset=None):
         self.stack = stack if stack is not None else []
         self.regs = regs if regs is not None else {}
+        self.owned_objs = owned if owned is not None else set()
         self.args = args
         self.unreserved_offset = unreserved_offset
 
@@ -1073,6 +1132,7 @@ class State:
         if isinstance(b,State):
             return (self.stack == b.stack
                 and self.regs == b.regs
+                and self.owned_objs == b.owned_objs
                 and self.args == b.args
                 and self.unreserved_offset == b.unreserved_offset)
 
@@ -1080,8 +1140,59 @@ class State:
 
     __ne__ = auto_ne
 
+    if __debug__:
+        def _check_ownership(self,val):
+            for x in self.owned_objs:
+                if x() is None:
+                    msg = 'Ref-counted value not freed (in the generated machine code, not the running interpreter).'
+                    if x.origin:
+                        msg += ' Origin: {1}:{0}'.format(*x.origin)
+                    warnings.warn(msg)
+
+    def own(self,x):
+        """Mark x as being owned.
+
+        :type x: CountedValue
+
+        """
+        if __debug__:
+            x = CountedRef(x,self._check_ownership,getattr(x,'_origin',None))
+        else:
+            x = id(x)
+
+        self.owned_objs.add(x)
+
+    def disown(self,x):
+        """Un-mark x as being owned.
+
+        x must be owned, prior to calling this.
+
+        :type x: CountedValue
+
+        """
+        if __debug__:
+            x = CountedRef(x)
+        else:
+            x = id(x)
+
+        self.owned_objs.remove(x)
+
+    def owned(self,x):
+        """Return true iff x is owned
+
+        :type x: CountedValue
+        :rtype: bool
+
+        """
+        if __debug__:
+            x = CountedRef(x)
+        else:
+            x = id(x)
+
+        return x in self.owned_objs
+
     def copy(self):
-        return State(self.stack[:],self.regs.copy(),self.args,self.unreserved_offset)
+        return State(self.stack[:],self.regs.copy(),self.owned_objs.copy(),self.args,self.unreserved_offset)
 
 def annot_with_comment(abi,descr,stack):
     return debug.annotate(stack,descr) + abi.comment('annotation: stack={}, {}',stack,descr)
@@ -1201,15 +1312,23 @@ class Stitch:
                 assert freed,"register will not be preserved"
 
     def exc_cleanup(self):
-        """Free the stack items created at the current exception handler depth
-        """
+        """Free the stack items created at the current exception handler depth.
 
+        :rtype: Stitch
+
+        """
         self.invalidate_scratch()
 
-        self(self.cleanup.new_section(self,(
-            CleanupItem(make_value(self,ld[0]),ld[0].cleanup_free_func)
-            for ld in self.state.stack
-            if ld is not None and ld[1] == self.exc_depth and getattr(ld[0],'cleanup_free_func',None))))
+        items = []
+        for ld in self.state.stack:
+            if ld is not None and ld[1] == self.exc_depth:
+                cleanup = getattr(ld[0],'cleanup_free_func',None)
+                if cleanup is not None:
+                    cleanup = cleanup(self)
+                    if cleanup is not None:
+                        items.append(CleanupItem(make_value(self,ld[0]),cleanup))
+
+        self(self.cleanup.new_section(self,items))
         self.last_op_is_uncond_jmp = True
         return self
 
@@ -1226,6 +1345,9 @@ class Stitch:
 
         If move_sp is False, no instructions are emitted, but an annotation is
         still created.
+
+        :type move_sp: bool
+        :rtype: Stitch
 
         """
         assert self.state.unreserved_offset is None
@@ -1244,8 +1366,11 @@ class Stitch:
 
     def release_stack(self):
         """Revert the stack pointer and len(self.state.stack) to what they
-        were before reserve_stack was called."""
+        were before reserve_stack was called.
 
+        :rtype: Stitch
+
+        """
         assert self.state.unreserved_offset is not None
 
         self.def_stack_offset.base = aligned_size(
@@ -1299,11 +1424,18 @@ class Stitch:
     def branch(self,jmp_target=None,in_elif=False):
         return Stitch(self.abi,self,jmp_target,in_elif)
 
+    def _accommodate_branch(self,stack):
+        if len(stack) > len(self.state.stack):
+            # the length of the stack array determines how much actual stack
+            # space to allocate
+            self.state.stack += [None] * (len(stack) - len(self.state.stack))
+
     def end_branch(self):
         last_op_is_uncond_jmp = self.last_op_is_uncond_jmp
         if self.jmp_target: self(self.jmp_target)
 
         self.outer.append(self._code)
+        self.outer._accommodate_branch(self.state.stack)
 
         if last_op_is_uncond_jmp:
             self.outer.state = self.state_if
@@ -1346,10 +1478,7 @@ class Stitch:
         e_target = self.jmp_target
         self.jmp_target = JumpTarget()
 
-        if len(self.state.stack) > len(self.outer.state.stack):
-            # the length of the stack array determines how much actual stack
-            # space to allocate
-            self.outer.state.stack += [None] * (len(self.state.stack) - len(self.outer.state.stack))
+        self.outer._accommodate_branch(self.state.stack)
 
         if self.last_op_is_uncond_jmp:
             self.state_if = None
@@ -1626,6 +1755,8 @@ class Stitch:
         stored in a register, arg_reg will return that register and when passed
         to push_arg, push_arg will emit nothing. If not, tempreg will be
         returned and push_arg will emit the appropriate MOV instruction.
+
+        :type n: int | None
 
         """
         if n is None: n = self.state.args

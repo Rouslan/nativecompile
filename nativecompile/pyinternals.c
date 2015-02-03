@@ -1870,6 +1870,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR(PySequence_Contains),
         ADD_ADDR(PyTraceBack_Here),
         ADD_ADDR(PyUnicode_Format),
+        ADD_ADDR(PyUnicode_Append),
         ADD_ADDR(PyCell_Get),
         ADD_ADDR(PyCell_Set),
         ADD_ADDR(PyCell_New),
