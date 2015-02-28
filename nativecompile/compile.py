@@ -17,6 +17,7 @@ import ast
 import symtable
 import os
 from collections import OrderedDict
+from functools import partial
 
 from . import astloader
 from . import abi
@@ -77,18 +78,50 @@ def ast_and_symtable_map(code,filename,compile_type):
 def create_uninitialized(t):
     return t.__new__(t)
 
-def check_context_load(node):
-    if not isinstance(node.ctx,ast.Load):
-        raise SyntaxTreeError('{} node has assign/delete context type but is not in assign/delete statement'.format(node.__class__.__name__))
+
+class ScopeContext:
+    def __init__(self,depth):
+        self.depth = depth
+        self.extra_callbacks = []
+
+class LoopContext(ScopeContext):
+    def __init__(self,depth):
+        super().__init__(depth)
+        self.begin = JumpTarget()
+        self.break_ = JumpTarget()
+
+class TryContext(ScopeContext):
+    def __init__(self,depth):
+        super().__init__(depth)
+        self.depth = depth
+        self.target = JumpTarget()
+
+class ExceptContext(ScopeContext):
+    def __init__(self,depth):
+        super().__init__(depth)
+        self.depth = depth
+        self.target = JumpTarget()
+
+class FinallyContext(ScopeContext):
+    def __init__(self,depth):
+        super().__init__(depth)
+        self.depth = depth
+        self.target = JumpTarget()
+
+        # A set of targets that the code jumps to, after the end of the finally
+        # block. Normally the finally block needs to be called as a function,
+        # but if there is only one target, we can just jump into the block and
+        # jump to the next target at the end.
+        self.next_targets = set()
+
 
 def maybe_unicode(node):
-    """Return False if node will definitely not produce an instance of str
+    """Return False iff node will definitely not produce an instance of str
 
     :type node: ast.AST
     :rtype: bool
 
     """
-
     return not isinstance(node,(ast.Num,ast.Bytes,ast.Ellipsis,ast.List,ast.Tuple))
 
 class _ParsedValue:
@@ -98,8 +131,8 @@ class _ParsedValue:
         self.value = value
 
 class ExprCompiler(ast.NodeVisitor):
-    def __init__(self,code,s_table=None,s_map=None,util_funcs=None,global_scope=False,entry_points=None):
-        self.code = code
+    def __init__(self,abi,s_table=None,s_map=None,util_funcs=None,global_scope=False,entry_points=None):
+        self.code = Stitch(abi)
         self.stable = s_table
         self.sym_map = s_map
         self.util_funcs = util_funcs
@@ -107,9 +140,12 @@ class ExprCompiler(ast.NodeVisitor):
         self.entry_points = entry_points
         self.consts = {}
         self.names = OrderedDict()
+        self.name_overrides = {}
         self.local_addrs = None
         self.local_addr_start = None
         self.visit_depth = 0
+        self.target_contexts = []
+        self.func_end = JumpTarget()
 
         self.free_var_indexes = {}
         if isinstance(s_table,symtable.Function):
@@ -221,7 +257,7 @@ class ExprCompiler(ast.NodeVisitor):
                 if args.kwarg:
                     (s
                         .invoke('PyDict_DelItem',r_kwds,name)
-                        .check_err(True))
+                        (self.check_err(True)))
                 else:
                     s.add(1,hit_count)
 
@@ -238,7 +274,7 @@ class ExprCompiler(ast.NodeVisitor):
         if args.kwarg:
             (s
                 .invoke('PyDict_Copy',r_kwds)
-                .check_err()
+                (self.check_err())
                 .mov(R_RET,r_kwds)
                 .mov(R_RET,self.get_name(args.kwarg.arg)))
 
@@ -276,7 +312,7 @@ class ExprCompiler(ast.NodeVisitor):
                 .invoke('PyDict_Size',r_kwds)
                 .if_(signed(R_RET) > hit_count)
                    .invoke('excess_keyword',func_self,r_kwds)
-                   .exc_cleanup()
+                (self.exc_cleanup())
                 .endif())
 
         s.else_().comment('without keyword dict')
@@ -284,7 +320,7 @@ class ExprCompiler(ast.NodeVisitor):
         if args.kwarg:
             (s
                 .invoke('PyDict_New')
-                .check_err()
+                (self.check_err())
                 .mov(R_RET,self.get_name(args.kwarg.arg)))
 
         if without_dict: without_dict(s,mark_miss)
@@ -317,7 +353,7 @@ class ExprCompiler(ast.NodeVisitor):
             .lea(self.local_addr_start,r_arg)
             .if_(miss_flag)
                 .invoke('missing_arguments',func_self,r_arg,tmpreg=R_SCRATCH1)
-                .exc_cleanup()
+            (self.exc_cleanup())
             .endif())
 
         hit_count.discard(s)
@@ -356,7 +392,7 @@ class ExprCompiler(ast.NodeVisitor):
 
                 (s
                         .invoke('PyTuple_New',len(args.args))
-                        .check_err()
+                        (self.check_err())
                         .do()
                             .sub(1,missing_args)
                             .mov(src_item,R_RET)
@@ -370,7 +406,7 @@ class ExprCompiler(ast.NodeVisitor):
             else:
                 (s
                     .invoke('too_many_positional',func_self,missing_args,func_kwds)
-                    .exc_cleanup())
+                    (self.exc_cleanup()))
 
             s.endif()
 
@@ -416,7 +452,7 @@ class ExprCompiler(ast.NodeVisitor):
                                     'DUPLICATE_VAL_MSG',
                                     c_func_self.name,
                                     name)
-                                .exc_cleanup()
+                        (self.exc_cleanup())
                             .endif()
                             .mov(R_RET,self.local_addrs[a.arg])
                             .incref(R_RET)
@@ -472,7 +508,7 @@ class ExprCompiler(ast.NodeVisitor):
                     .mov(func_args,R_RET)
                     .if_(CType('PyVarObject',R_RET).ob_size)
                         .invoke('too_many_positional',func_self,R_RET,func_kwds)
-                        .exc_cleanup()
+                    (self.exc_cleanup())
                     .endif())
 
             if args.kwonlyargs:
@@ -485,7 +521,7 @@ class ExprCompiler(ast.NodeVisitor):
                     .else_()
                         .invoke('PyDict_New')
                     .endif()
-                    .check_err()
+                    (self.check_err())
                     .mov(R_RET,self.local_addrs[args.kwarg.arg]))
             else:
                 (self.code
@@ -497,102 +533,101 @@ class ExprCompiler(ast.NodeVisitor):
                         .endif()
                     .endif())
 
+    def assign_name_expr(self,name,expr,*,check_dest=True):
+        s = self.stable.lookup(name)
+
+        if self.is_local(s):
+            if self.stable.is_optimized() or self.is_cell(s):
+                # TODO: this code checks to see if the local has a
+                # value and frees it if it does. This check could be
+                # eliminated in most cases if we were to track
+                # assignments and deletions (it would still be required
+                # if whether the local is assigned to depended on a
+                # branch, and inside exception handlers).
+
+                tmp1 = None
+                tmp3 = None
+
+                if s.is_free():
+                    assert self.is_cell(s)
+                    if tmp1 is None: tmp1 = RegValue(self.code)
+                    self.code.mov(self.code.special_addrs['free'],tmp1)
+                    item = addr(self.abi.ptr_size*self.free_var_indexes[name],tmp1)
+                else:
+                    item = self.local_addrs[name]
+
+                if check_dest:
+                    if tmp1 is None: tmp1 = RegValue(self.code)
+                    self.code.mov(item,tmp1)
+
+                if self.is_cell(s):
+                    if check_dest:
+                        tmp3 = tmp1
+                        tmp1 = RegValue(self.code)
+                    else:
+                        tmp3 = RegValue(self.code)
+                    item = CType('PyCellObject',tmp3).ob_ref
+
+                    if check_dest: self.code.mov(item,tmp1)
+
+                tmp2 = expr.to_addr_movable_val(self.code)
+                self.code.mov(steal(tmp2),item)
+
+                if tmp3: tmp3.discard(self.code)
+
+                if check_dest:
+                    r_1 = tmp1(self.code)
+                    tmp1.discard(self.code)
+                    self.code.if_(r_1).decref(r_1).endif()
+                elif tmp1 is not None:
+                    tmp1.discard(self.code)
+            else:
+                dict_addr = self.code.fit_addr('PyDict_Type',R_SCRATCH2)
+                locals,setitem = self.code.unused_regs(2)
+
+                (self.code
+                    .push_arg(steal(expr),n=2)
+                    .push_arg(self.get_name(name),n=1)
+                    .mov(self.code.special_addrs['locals'],locals)
+                    .if_(not_(locals))
+                        .clear_args()
+                        .invoke('PyErr_Format','PyExc_SystemError','NO_LOCALS_STORE_MSG')
+                    (self.exc_cleanup())
+                    .endif()
+                    .mov('PyObject_SetItem',setitem)
+                    .push_arg(locals,n=0)
+                    .if_(dict_addr == type_of(R_RET))
+                        .mov('PyDict_SetItem',setitem)
+                    .endif()
+                    .call(setitem)
+                    (self.check_err(True)))
+        else:
+            assert not (s.is_free() or self.is_cell(s))
+            (self.code
+                .invoke('PyDict_SetItem',self.code.special_addrs['globals'],self.get_name(name),steal(expr))
+                (self.check_err(True)))
+
     def assign_expr(self,target,expr,*,check_dest=True):
         if isinstance(target,ast.Name):
-            s = self.stable.lookup(target.id)
-
-            if self.is_local(s):
-                if self.stable.is_optimized() or self.is_cell(s):
-                    # TODO: this code checks to see if the local has a
-                    # value and frees it if it does. This check could be
-                    # eliminated in most cases if we were to track
-                    # assignments and deletions (it would still be required
-                    # if whether the local is assigned to depended on a
-                    # branch, and inside exception handlers).
-
-                    tmp1 = None
-                    tmp3 = None
-
-                    if s.is_free():
-                        assert self.is_cell(s)
-                        if tmp1 is None: tmp1 = RegValue(self.code)
-                        self.code.mov(self.code.special_addrs['free'],tmp1)
-                        item = addr(self.abi.ptr_size*self.free_var_indexes[target.id],tmp1)
-                    else:
-                        item = self.local_addrs[target.id]
-
-                    if check_dest:
-                        if tmp1 is None: tmp1 = RegValue(self.code)
-                        self.code.mov(item,tmp1)
-
-                    if self.is_cell(s):
-                        if check_dest:
-                            tmp3 = tmp1
-                            tmp1 = RegValue(self.code)
-                        else:
-                            tmp3 = RegValue(self.code)
-                        item = CType('PyCellObject',tmp3).ob_ref
-
-                        if check_dest: self.code.mov(item,tmp1)
-
-                    tmp2 = expr.to_addr_movable_val(self.code)
-
-                    self.code.mov(steal(tmp2),item)
-
-                    if tmp3: tmp3.discard(self.code)
-
-                    if check_dest:
-                        r_1 = tmp1(self.code)
-                        tmp1.discard(self.code)
-                        self.code.if_(r_1).decref(r_1).endif()
-                    elif tmp1 is not None:
-                        tmp1.discard(self.code)
-                else:
-                    dict_addr = self.code.fit_addr('PyDict_Type',R_SCRATCH2)
-                    locals,setitem = self.code.unused_regs(2)
-
-                    (self.code
-                        .push_arg(steal(expr),n=2)
-                        .push_arg(self.get_name(target.id),n=1)
-                        .mov(self.code.special_addrs['locals'],locals)
-                        .if_(not_(locals))
-                            .clear_args()
-                            .invoke('PyErr_Format','PyExc_SystemError','NO_LOCALS_STORE_MSG')
-                            .exc_cleanup()
-                        .endif()
-                        .mov('PyObject_SetItem',setitem)
-                        .push_arg(locals,n=0)
-                        .if_(dict_addr == type_of(R_RET))
-                            .mov('PyDict_SetItem',setitem)
-                        .endif()
-                        .call(setitem)
-                        .check_err(True))
-            else:
-                assert not (s.is_free() or self.is_cell(s))
-                (self.code
-                    .invoke('PyDict_SetItem',self.code.special_addrs['globals'],self.get_name(target.id),steal(expr))
-                    .check_err(True))
-
+            self.assign_name_expr(target.id,expr,check_dest=check_dest)
         elif isinstance(target,ast.Attribute):
             obj = self.visit(target.value)
 
             (self.code
                 .invoke('PyObject_SetAttr',obj,self.get_name(target.attr),steal(expr))
-                .check_err(True))
+                (self.check_err(True)))
 
             obj.discard(self.code)
-
         elif isinstance(target,ast.Subscript):
             obj = self.visit(target.value)
             slice = self._visit_slice(target.slice)
 
             (self.code
                 .invoke('PyObject_SetItem',obj,slice,steal(expr))
-                .check_err(True))
+                (self.check_err(True)))
 
             slice.discard(self.code)
             obj.discard(self.code)
-
         elif isinstance(target,ast.Starred):
             raise NotImplementedError()
         elif isinstance(target,ast.List):
@@ -601,6 +636,110 @@ class ExprCompiler(ast.NodeVisitor):
             raise NotImplementedError()
         else:
             raise SyntaxTreeError('invalid expression in assignment')
+
+    def delete_name_check(self,name,must_exist,exc,msg):
+        s = (self.code
+            .if_(R_RET)
+                .invoke('PyErr_ExceptionMatches','PyExc_KeyError'))
+
+        if must_exist:
+            (s
+                .if_(R_RET)
+                    .invoke('PyErr_Clear')
+                    .invoke('format_exc_check_arg',exc,msg,self.get_name(name))
+                .endif()
+                (self.exc_cleanup()))
+        else:
+            (s
+                .if_(R_RET)
+                    .invoke('PyErr_Clear')
+                .else_()
+                (self.exc_cleanup())
+                .endif())
+
+        s.endif()
+
+    def delete_name(self,name,must_exist=True,s=None):
+        symbol = self.stable.lookup(name)
+
+        if s is None:
+            s = self.code
+
+        if self.is_local(symbol):
+            if self.stable.is_optimized() or self.is_cell(s):
+                # TODO: this code checks to see if the local has a
+                # value. This check could be eliminated in most cases
+                # if we were to track assignments and deletions (it
+                # would still be required if whether the local is
+                # assigned to depended on a branch, and inside
+                # exception handlers).
+
+                tmp1 = RegValue(s)
+                tmp2 = None
+
+                if symbol.is_free():
+                    assert self.is_cell(symbol)
+                    s.mov(s.special_addrs['free'],tmp1)
+                    item = addr(self.abi.ptr_size*self.free_var_indexes[name],tmp1)
+                else:
+                    item = self.local_addrs[name]
+
+                s.mov(item,tmp1)
+
+                if self.is_cell(symbol):
+                    tmp2 = tmp1
+                    tmp1 = RegValue(s)
+
+                    item = CType('PyCellObject',tmp2).ob_ref
+                    s.mov(item,tmp1)
+
+                s.mov(0,item)
+
+                if tmp2: tmp2.discard(s)
+
+                r_1 = tmp1(s)
+                tmp1.discard(s)
+                s.invalidate_scratch()
+                s = s.if_(r_1).decref(r_1)
+                if must_exist:
+                    if self.is_cell(s):
+                        exc = 'PyExc_NameError'
+                        msg = 'UNBOUNDFREE_ERROR_MSG'
+                    else:
+                        exc = 'PyExc_UnboundLocalError'
+                        msg = 'UNBOUNDLOCAL_ERROR_MSG'
+                    (s
+                        .else_()
+                        .invoke('format_exc_check_arg',exc,msg,self.get_name(name)))
+                s.endif()
+            else:
+                dict_addr = s.fit_addr('PyDict_Type',R_SCRATCH2)
+                locals,delitem = s.unused_regs(2)
+
+                (s
+                    .push_arg(self.get_name(name),n=1)
+                    .mov(s.special_addrs['locals'],locals)
+                    .if_(not_(locals))
+                        .clear_args()
+                        .invoke('PyErr_Format',
+                            'PyExc_SystemError',
+                            'NO_LOCALS_DELETE_MSG',
+                            self.get_name(name))
+                    (self.exc_cleanup())
+                    .endif()
+                    .mov('PyObject_DelItem',delitem)
+                    .push_arg(locals,n=0)
+                    .if_(dict_addr == type_of(R_RET))
+                        .mov('PyDict_DelItem',delitem)
+                    .endif()
+                    .call(delitem))
+
+                self.delete_name_check(name,must_exist,'PyExc_UnboundLocalError','UNBOUNDLOCAL_ERROR_MSG')
+        else:
+            assert not (symbol.is_free() or self.is_cell(symbol))
+
+            s.invoke('PyDict_DelItem',s.special_addrs['globals'],self.get_name(name))
+            self.delete_name_check(name,must_exist,'PyExc_NameError','GLOBAL_NAME_ERROR_MSG')
 
     def add_for_assign(self,a,b,fallback,delete):
         # perform the same optimization that unicode_concatenate() from
@@ -641,7 +780,7 @@ class ExprCompiler(ast.NodeVisitor):
         (s
                 .mov(steal(tmp),R_RET)
             .endif()
-            .check_err())
+            (self.check_err()))
 
         r = StackObj(self.code,R_RET)
 
@@ -662,6 +801,93 @@ class ExprCompiler(ast.NodeVisitor):
             c = address_of(n)
             self.names[n] = c
         return ConstObj(c)
+
+    def top_context(self,c_type):
+        for c in reversed(self.target_contexts):
+            if isinstance(c,c_type): return c
+        return None
+
+    def new_context(self,c_type):
+        self.code.cleanup.depth += 1
+        c = c_type(self.code.cleanup.depth)
+        self.target_contexts.append(c)
+        return c
+
+    def end_context(self,c):
+        self.code.cleanup.depth -= 1
+        last = self.target_contexts.pop()
+        assert c is last
+
+    def finally_itr(self,until=None):
+        for c in reversed(self.target_contexts):
+            if c is until: break
+            if isinstance(c,FinallyContext): yield c
+
+    def add_jump_target(self,target,until=None):
+        for c in self.finally_itr(until):
+            c.next_targets.add(target)
+
+    def unwind_to(self,target,until=None,s=None,last_action=None):
+        assert not isinstance(until,FinallyContext)
+
+        if s is None: s = self.code
+
+        s.invalidate_scratch()
+
+        item_groups = []
+        callbacks = []
+        max_depth = None
+
+        def clean_context(depth):
+            nonlocal  max_depth
+
+            items = []
+            for ld in s.state.stack:
+                if ld is not None and ld[1] >= depth and (max_depth is None or ld[1] < max_depth):
+                    cleanup = getattr(ld[0],'cleanup_free_func',None)
+                    if cleanup is not None:
+                        cleanup = cleanup(s)
+                        if cleanup is not None:
+                            items.append(CleanupItem(make_value(s,ld[0]),cleanup))
+
+            items.extend(callbacks)
+            max_depth = depth
+            return items
+
+        for c in reversed(self.target_contexts):
+            for ec in c.extra_callbacks: callbacks.append(ec)
+
+            if isinstance(c,FinallyContext):
+                item_groups.append((
+                    clean_context(c.depth),
+                    (lambda s,target=c.target: s.call(target))))
+                callbacks.clear()
+            if c is until:
+                item_groups.append((clean_context(c.depth),None))
+                break
+        else:
+            assert until is None
+            item_groups.append((clean_context(1),last_action))
+
+        for items,action in reversed(item_groups):
+            target = s.cleanup.new_section(s,items,target,action)
+
+        s(target)
+        s.last_op_is_uncond_jmp = True
+
+    def exc_cleanup(self):
+        """Free the stack items created at the current exception handler depth.
+        """
+        def inner(s):
+            dest = self.func_end
+            top = self.top_context(ExceptContext)
+            if top: dest = top.target
+            self.unwind_to(dest,top,s,(lambda s: s.mov(0,R_RET)))
+        return inner
+
+    def check_err(self,inverted=False):
+        return (lambda s:
+            s.if_(R_RET if inverted else not_(R_RET))(self.exc_cleanup()).endif())
 
 
     #### VISITOR METHODS ####
@@ -718,7 +944,7 @@ class ExprCompiler(ast.NodeVisitor):
                     start or 0,
                     end or 0,
                     step or 0)
-                .check_err())
+                (self.check_err()))
 
             r = StackObj(self.code,R_RET)
 
@@ -763,7 +989,7 @@ class ExprCompiler(ast.NodeVisitor):
         if node.args.kw_defaults:
             (self.code
                 .invoke('PyMem_Malloc',len(node.args.kwonlyargs)*self.abi.ptr_size)
-                .check_err())
+                (self.check_err()))
 
             kwdefaults = ObjArrayValue(self.code,R_RET)
 
@@ -781,7 +1007,7 @@ class ExprCompiler(ast.NodeVisitor):
         if func.free_names:
             (self.code
                 .invoke('PyMem_Malloc',len(func.free_names)*self.abi.ptr_size)
-                .check_err())
+                (self.check_err()))
 
             free_items = ObjArrayValue(self.code,R_RET)
 
@@ -838,7 +1064,7 @@ class ExprCompiler(ast.NodeVisitor):
                 kwdefaults and steal(kwdefaults),
                 free_items and steal(free_items),
                 annots)
-            .check_err())
+            (self.check_err()))
 
         fobj = StackObj(self.code,R_RET)
 
@@ -867,94 +1093,32 @@ class ExprCompiler(ast.NodeVisitor):
                 ld[0].discard(self.code)
 
         self.code.mov(steal(val),R_RET)
-        self.code.jmp(self.code.cleanup.dest[0])
+        self.code.jmp(self.func_end)
+
+        return True
 
     def visit_Delete(self,node):
         for target in node.targets:
             if isinstance(target,ast.Name):
-                s = self.stable.lookup(target.id)
-
-                if self.is_local(s):
-                    if self.stable.is_optimized() or self.is_cell(s):
-                        # TODO: this code checks to see if the local has a
-                        # value. This check could be eliminated in most cases
-                        # if we were to track assignments and deletions (it
-                        # would still be required if whether the local is
-                        # assigned to depended on a branch, and inside
-                        # exception handlers).
-
-                        tmp1 = RegValue(self.code)
-                        tmp2 = None
-
-                        if s.is_free():
-                            assert self.is_cell(s)
-                            self.code.mov(self.code.special_addrs['free'],tmp1)
-                            item = addr(self.abi.ptr_size*self.free_var_indexes[target.id],tmp1)
-                        else:
-                            item = self.local_addrs[target.id]
-
-                        self.code.mov(item,tmp1)
-
-                        if self.is_cell(s):
-                            tmp2 = tmp1
-                            tmp1 = RegValue(self.code)
-
-                            item = CType('PyCellObject',tmp2).ob_ref
-                            self.code.mov(item,tmp1)
-
-                        self.code.mov(0,item)
-
-                        if tmp2: tmp2.discard(self.code)
-
-                        r_1 = tmp1(self.code)
-                        tmp1.discard(self.code)
-                        self.code.invalidate_scratch()
-                        self.code.if_(r_1).decref(r_1).endif()
-                    else:
-                        dict_addr = self.code.fit_addr('PyDict_Type',R_SCRATCH2)
-                        locals,delitem = self.code.unused_regs(2)
-
-                        (self.code
-                            .push_arg(self.get_name(target.id),n=1)
-                            .mov(self.code.special_addrs['locals'],locals)
-                            .if_(not_(locals))
-                                .clear_args()
-                                .invoke('PyErr_Format','PyExc_SystemError','NO_LOCALS_DELETE_MSG')
-                                .exc_cleanup()
-                            .endif()
-                            .mov('PyObject_DelItem',delitem)
-                            .push_arg(locals,n=0)
-                            .if_(dict_addr == type_of(R_RET))
-                                .mov('PyDict_DelItem',delitem)
-                            .endif()
-                            .call(delitem)
-                            .check_err(True))
-                else:
-                    assert not (s.is_free() or self.is_cell(s))
-                    (self.code
-                        .invoke('PyDict_DelItem',self.code.special_addrs['globals'],self.get_name(target.id))
-                        .check_err(True))
-
+                self.delete_name(target.id)
             elif isinstance(target,ast.Attribute):
                 obj = self.visit(target.value)
 
                 (self.code
                     .invoke('PyObject_DelAttr',obj,self.get_name(target.attr))
-                    .check_err(True))
+                    (self.check_err(True)))
 
                 obj.discard(self.code)
-
             elif isinstance(target,ast.Subscript):
                 obj = self.visit(target.value)
                 slice = self._visit_slice(target.slice)
 
                 (self.code
                     .invoke('PyObject_DelItem',obj,slice)
-                    .check_err(True))
+                    (self.check_err(True)))
 
                 slice.discard(self.code)
                 obj.discard(self.code)
-
             elif isinstance(target,ast.Starred):
                 raise NotImplementedError()
             elif isinstance(target,ast.List):
@@ -1011,11 +1175,11 @@ class ExprCompiler(ast.NodeVisitor):
             if op is ast.Pow:
                 (self.code
                     .invoke('PyNumber_InPlacePower',arg2,arg1,'Py_None')
-                    .check_err())
+                    (self.check_err()))
             else:
                 (self.code
                     .invoke(BINOP_IFUNCS[op],arg1,arg2)
-                    .check_err())
+                    (self.check_err()))
 
             expr = StackObj(self.code,R_RET)
 
@@ -1032,24 +1196,152 @@ class ExprCompiler(ast.NodeVisitor):
         self.code = (self.code
             .test(R_RET,R_RET)
             .if_cond(TEST_L)
-                .exc_cleanup()
+                (self.exc_cleanup())
             .endif()
             .if_cond(TEST_NZ))
 
+        if_quit = else_quit = False
+
         for stmt in node.body:
-            self.visit(stmt)
+            if self.visit(stmt):
+                if_quit = True
+                break
 
         if node.orelse:
             self.code.else_()
             for stmt in node.orelse:
-                self.visit(stmt)
+                if self.visit(stmt):
+                    else_quit = True
+                    break
 
         self.code = self.code.endif()
 
-    def visit_Nonlocal(self,node):
-        # this is handled by the symbol table, so we don't have to do anything
-        # here
+        return if_quit and else_quit
+
+    def visit_Try(self,node):
+        top_context = t_context = self.new_context(TryContext)
+        e_context = f_context = None
+
+        if node.finalbody:
+            top_context = f_context = self.new_context(FinallyContext)
+
+        if node.handlers:
+            e_context = self.new_context(ExceptContext)
+
+        for stmt in node.body:
+            if self.visit(stmt): break
+
+        if node.handlers:
+            self.end_context(e_context)
+
+        for stmt in node.orelse:
+            if self.visit(stmt): break
+        else:
+            self.unwind_to(t_context.target,t_context)
+
+        if node.handlers:
+            exc_vals = self.code.new_contiguous_stack_values(6)
+            exc_tb,exc_val,exc_type = exc_vals[3:]
+
+            tmp = self.code.arg_reg(n=0)
+            (self.code
+                (e_context.target)
+                .lea(exc_vals[5],tmp)
+                .invoke('prepare_exc_handler',tmp))
+
+            def do_handler(handlers):
+                exc = handlers.pop(0)
+                assert exc.type or not handlers
+
+                if exc.type:
+                    e_type = self.visit(exc.type)
+                    self.code.invoke('PyObject_IsSubclass',exc_type,e_type)
+                    issub = StackValue(self.code,R_RET)
+                    e_type.discard(self.code)
+                    self.code = self.code.if_(steal(issub))
+                    if exc.name:
+                        self.assign_name_expr(exc.name,exc_val)
+                        code = self.code.detached_branch()
+                        self.delete_name(exc.name,False,code)
+                        cleanup = lambda s: s.append(code.code)
+                        top_context.extra_callbacks.append(cleanup)
+
+                for val in exc_vals[3:]: val.discard(self.code)
+
+
+                for stmt in exc.body:
+                    if self.visit(stmt): break
+
+                if exc.type:
+                    if exc.name:
+                        top_context.extra_callbacks.remove(cleanup)
+                        cleanup(self.code)
+                    self.code.else_()
+
+                    if handlers:
+                        do_handler(handlers)
+                    else:
+                        (self.code
+                            .invoke('PyErr_Restore',
+                                steal(exc_type),
+                                steal(exc_val),
+                                steal(exc_tb))
+                            (self.exc_cleanup()))
+
+                    self.code = self.code.endif()
+
+            do_handler(node.handlers[:])
+
+            tmp = self.code.arg_reg(n=0)
+            (self.code
+                .lea(exc_vals[2],tmp)
+                .invoke('end_exc_handler',tmp))
+
+            for val in exc_vals[0:3]: val.discard(self.code)
+
+            self.unwind_to(t_context.target,t_context)
+
+        if node.finalbody:
+            self.end_context(f_context)
+            self.code(f_context.target)
+
+            self.code.pop(R_RET)
+            ret_addr = StackValue(self.code,R_RET)
+
+            exc_vals = [self.code.new_stack_value(value_t=StackValue.new_from_offset) for _ in range(3)]
+
+            for val in exc_vals:
+                tmp = self.code.arg_reg()
+                self.code.lea(val,tmp).push_arg(tmp)
+
+            self.code.call('PyErr_Fetch')
+
+            for stmt in node.finalbody:
+                if self.visit(stmt): break
+            else:
+                (self.code
+                    .if_(exc_vals[0])
+                        .invoke('PyErr_Restore',
+                            exc_vals[0],
+                            exc_vals[1],
+                            exc_vals[2])
+                    .endif())
+
+                for v in exc_vals:
+                    v.discard(self.code)
+
+                self.code.jmp(ret_addr)
+
+        self.end_context(t_context)
+        self.code(t_context.target)
+
+    def visit_Pass(self,node):
         pass
+
+    # these are handled by the symbol table, so we don't have to do anything
+    # here
+    visit_Global = visit_Pass
+    visit_Nonlocal = visit_Pass
 
     def visit_Expr(self,node):
         self.visit(node.value).discard(self.code)
@@ -1093,7 +1385,7 @@ class ExprCompiler(ast.NodeVisitor):
                     .mov('PyUnicode_Concat',f)
                 .endif()
                 .invoke(f,arg1,arg2)
-                .check_err())
+                (self.check_err()))
         elif op is ast.Mod:
             if isinstance(arg1(self.code),self.abi.Register):
                 r_arg1 = borrow(arg1)
@@ -1111,15 +1403,15 @@ class ExprCompiler(ast.NodeVisitor):
                     .mov('PyNumber_Remainder',func)
                 .endif()
                 .invoke(steal(func),steal(r_arg1),arg2)
-                .check_err())
+                (self.check_err()))
         elif op is ast.Pow:
             (self.code
                 .invoke('PyNumber_Power',arg2,arg1,'Py_None')
-                .check_err())
+                (self.check_err()))
         else:
             (self.code
                 .invoke(BINOP_FUNCS[op],arg1,arg2)
-                .check_err())
+                (self.check_err()))
 
         r = StackObj(self.code,R_RET)
 
@@ -1140,7 +1432,7 @@ class ExprCompiler(ast.NodeVisitor):
                 .if_cond(TEST_G)
                     .mov('Py_False',R_RET)
                 .elif_cond(TEST_NZ)
-                    .exc_cleanup()
+                (self.exc_cleanup())
                 .endif()
                 .incref())
         else:
@@ -1153,12 +1445,11 @@ class ExprCompiler(ast.NodeVisitor):
             else:
                 raise SyntaxTreeError('unrecognized unary operation type encountered')
 
-            self.code.invoke(func,arg).check_err()
+            self.code.invoke(func,arg)(self.check_err())
 
         r = StackObj(self.code,R_RET)
         arg.discard(self.code)
         return r
-
 
     def visit_Lambda(self,node):
         raise NotImplementedError()
@@ -1167,7 +1458,7 @@ class ExprCompiler(ast.NodeVisitor):
     def visit_Dict(self,node):
         (self.code
             .invoke('_PyDict_NewPresized',len(node.keys))
-            .check_err())
+            (self.check_err()))
 
         r = StackObj(self.code,R_RET)
 
@@ -1177,7 +1468,7 @@ class ExprCompiler(ast.NodeVisitor):
 
             (self.code
                 .invoke('PyDict_SetItem',r,kobj,vobj)
-                .check_err(True))
+                (self.check_err(True)))
 
             kobj.discard(self.code)
             vobj.discard(self.code)
@@ -1203,11 +1494,11 @@ class ExprCompiler(ast.NodeVisitor):
     def visit_Call(self,node):
         fobj = self.visit(node.func)
 
-        args_obj = 0
+        args_obj = None
         if node.args:
             (self.code
                 .invoke('PyTuple_New',len(node.args))
-                .check_err())
+                (self.check_err()))
 
             args_obj = StackObj(self.code,R_RET)
 
@@ -1226,7 +1517,7 @@ class ExprCompiler(ast.NodeVisitor):
 
             (self.code
                 .invoke('append_tuple_for_call',fobj,args_obj,s_args_obj)
-                .check_err())
+                (self.check_err()))
 
             args_obj = StackObj(self.code,R_RET)
 
@@ -1236,7 +1527,7 @@ class ExprCompiler(ast.NodeVisitor):
         if node.keywords:
             (self.code
                 .invoke('_PyDict_NewPresized',len(node.keywords))
-                .check_err())
+                (self.check_err()))
 
             args_kwds = StackObj(self.code,R_RET)
 
@@ -1245,7 +1536,7 @@ class ExprCompiler(ast.NodeVisitor):
 
                 (self.code
                     .invoke('PyDict_SetItem',args_kwds,self.get_name(kwds.arg),obj)
-                    .check_err(True))
+                    (self.check_err(True)))
 
                 obj.discard(self.code)
 
@@ -1257,7 +1548,7 @@ class ExprCompiler(ast.NodeVisitor):
 
             (self.code
                 .invoke('append_dict_for_call',fobj,args_kwds,s_kwds)
-                .check_err())
+                (self.check_err()))
 
             args_kwds = StackObj(self.code,R_RET)
 
@@ -1267,8 +1558,8 @@ class ExprCompiler(ast.NodeVisitor):
             .invoke('PyObject_Call',
                 fobj,
                 args_obj or self.get_const(()),
-                args_kwds or 0)
-            .check_err())
+                args_kwds)
+            (self.check_err()))
 
         r = StackObj(self.code,R_RET)
 
@@ -1293,13 +1584,11 @@ class ExprCompiler(ast.NodeVisitor):
         return self.get_const(...)
 
     def visit_Attribute(self,node):
-        #check_context_load(node)
-
         obj = self.visit(node.value)
 
         (self.code
             .invoke('PyObject_GetAttr',obj,self.get_name(node.attr))
-            .check_err())
+            (self.check_err()))
 
         r = StackObj(self.code,R_RET)
 
@@ -1308,14 +1597,12 @@ class ExprCompiler(ast.NodeVisitor):
         return r
 
     def visit_Subscript(self,node):
-        #check_context_load(node)
-
         value = self.visit(node.value)
         slice = self._visit_slice(node.slice)
 
         (self.code
             .invoke('PyObject_GetItem',value,slice)
-            .check_err())
+            (self.check_err()))
 
         r = StackObj(self.code,R_RET)
 
@@ -1327,30 +1614,32 @@ class ExprCompiler(ast.NodeVisitor):
     def visit_Starred(self,node):
         raise NotImplementedError()
     def visit_Name(self,node):
-        #check_context_load(node)
-
+        ovr = self.name_overrides.get(node.id)
         s = self.stable.lookup(node.id)
 
-        if s.is_free() or (self.is_local(s) and self.stable.is_optimized()) or self.is_cell(s):
+        if ovr is not None or s.is_free() or (self.is_local(s) and self.stable.is_optimized()) or self.is_cell(s):
             r = self.code.unused_reg()
 
-            if s.is_free():
-                (self.code
-                    .mov(self.code.special_addrs['free'],r)
-                    .mov(addr(self.free_var_indexes[node.id]*self.abi.ptr_size,r),r))
+            if ovr is not None:
+                self.code.mov(ovr,r)
             else:
-                self.code.mov(self.local_addrs[node.id],r)
+                if s.is_free():
+                    (self.code
+                        .mov(self.code.special_addrs['free'],r)
+                        .mov(addr(self.free_var_indexes[node.id]*self.abi.ptr_size,r),r))
+                else:
+                    self.code.mov(self.local_addrs[node.id],r)
 
-            if self.is_cell(s):
-                self.code.mov(CType('PyCellObject',r).ob_ref,r)
+                if self.is_cell(s):
+                    self.code.mov(CType('PyCellObject',r).ob_ref,r)
 
             (self.code
                 .if_(not_(r))
-                    .invoke('format_exc_check_arg',
+                    .invoke('PyErr_Format',
                         'PyExc_UnboundLocalError',
                         'UNBOUNDLOCAL_ERROR_MSG',
                         self.get_name(node.id))
-                    .exc_cleanup()
+                (self.exc_cleanup())
                 .endif())
 
             return StackObj(self.code,r,owned=False)
@@ -1360,17 +1649,15 @@ class ExprCompiler(ast.NodeVisitor):
             .mov(self.get_name(node.id),R_PRES1)
             .mov(self.code.special_addrs['frame'],R_PRES3)
             .inner_call(self.util_funcs.local_name if self.is_local(s) else self.util_funcs.global_name)
-            .check_err())
+            (self.check_err()))
         return StackObj(self.code,R_RET)
 
     def visit_List(self,node):
-        #check_context_load(node)
-
         item_offset = pyinternals.member_offsets['PyListObject']['ob_item']
 
         (self.code
             .invoke('PyList_New',len(node.elts))
-            .check_err())
+            (self.check_err()))
 
         r = StackObj(self.code,R_RET)
 
@@ -1380,23 +1667,21 @@ class ExprCompiler(ast.NodeVisitor):
 
                 if not tmp.valid:
                     src = r(self.code)
-                    tmp.validate()
+                    tmp.validate(self.code)
                     if not isinstance(src,self.abi.Register):
-                        self.code.mov(src,tmp.reg)
-                        src = tmp.reg
-                    self.code.mov(addr(item_offset,src),tmp.reg)
+                        self.code.mov(src,tmp)
+                        src = tmp
+                    self.code.mov(addr(item_offset,src),tmp)
 
 
-                self.code.mov(obj.steal(self.code),addr(self.abi.ptr_size * i,tmp.reg))
+                self.code.mov(steal(obj),addr(self.abi.ptr_size * i,tmp))
 
         return r
 
     def visit_Tuple(self,node):
-        #check_context_load(node)
-
         (self.code
             .invoke('PyTuple_New',len(node.elts))
-            .check_err())
+            (self.check_err()))
 
         r = StackObj(self.code,R_RET)
 
@@ -1634,7 +1919,7 @@ def compile_eval(scope_ast,sym_map,abi,util_funcs,entry_points,global_scope,name
     #move_throw_flag = (code.co_flags & CO_GENERATOR and len(abi.r_arg) >= 2)
     mov_throw_flag = False
 
-    ec = ExprCompiler(Stitch(abi),sym_map[scope_ast._raw_id],sym_map,util_funcs,global_scope,entry_points)
+    ec = ExprCompiler(abi,sym_map[scope_ast._raw_id],sym_map,util_funcs,global_scope,entry_points)
 
     # the stack will have following items:
     #     - return address
@@ -1691,7 +1976,7 @@ def compile_eval(scope_ast,sym_map,abi,util_funcs,entry_points,global_scope,name
 
     (ec.code
         .call('_EnterRecursiveCall')
-        .check_err(True)
+        (ec.check_err(True))
 
         .get_threadstate(R_SCRATCH1)
 
@@ -1798,10 +2083,10 @@ def compile_eval(scope_ast,sym_map,abi,util_funcs,entry_points,global_scope,name
 
     # return R_RET
     (ec.code
-        (ec.code.cleanup.dest[0])
+        (ec.func_end)
         .comment('epilogue')
         .mov(R_RET,ret_temp_store)
-        [ec.deallocate_locals]
+        (ec.deallocate_locals)
         (fast_end)
         .call('_LeaveRecursiveCall')
         .mov(ret_temp_store,R_RET)
@@ -1883,6 +2168,7 @@ def compile_raw(code,abi):
         pyfunc.func = resolve_jumps(abi.op,fcode,end_targets)
         pyfunc.func.name = name
         pyfunc.func.pyfunc = True
+        pyfunc.func.returns = debug.TPtr(debug.t_void)
         functions.insert(0,pyfunc.func)
 
     offset = 0
@@ -1957,7 +2243,6 @@ def compile_asm(code):
     :rtype: str
 
     """
-
     abi = native_abi(assembly=True)
 
     parts = []

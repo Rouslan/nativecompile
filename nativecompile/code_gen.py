@@ -18,6 +18,7 @@ import operator
 import warnings
 from collections import namedtuple
 from functools import partial,reduce
+from itertools import chain
 
 if __debug__:
     import weakref
@@ -413,7 +414,13 @@ class JumpSource(DelayedCompileEarly):
         return self.op(self.abi.Displacement(dis)) if dis else [] # omit useless jumps
 
 
-CleanupItem = namedtuple('CleanupItem','loc free')
+class CleanupItem:
+    def __init__(self,loc,free):
+        self.loc = loc
+        self.free = free
+
+    def __call__(self,s):
+        self.free(s,self.loc)
 
 def pyobj_free(s,loc):
     if not isinstance(loc,s.abi.Register):
@@ -422,11 +429,12 @@ def pyobj_free(s,loc):
     s.decref(loc)
 
 class StackCleanupSection(DelayedCompileEarly):
-    def __init__(self,s,locations,dest):
+    def __init__(self,s,locations,dest,action):
         self.next = None
         self.abi = s.abi
         self.locations = frozenset(locations)
         self.dest = dest
+        self.action = action
         self.start = JumpTarget()
 
     @property
@@ -434,8 +442,25 @@ class StackCleanupSection(DelayedCompileEarly):
         assert self.start.displacement is not None
         return self.start.displacement
 
+    def __eq__(self,b):
+        if isinstance(b,StackCleanupSection):
+            assert self.abi is b.abi
+            return self.action == b.action and self.locations == b.locations and self.dest == b.dest
+
+        return NotImplemented
+
+    def __ne__(self,b):
+        if isinstance(b,StackCleanupSection):
+            assert self.abi is b.abi
+            return self.action != b.action or self.locations != b.locations or self.dest != b.dest
+
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(self.action) ^ hash(self.locations) ^ hash(self.dest)
+
     def compile(self,displacement):
-        s = Stitch(self.abi)(self.start)
+        s = Stitch(self.abi).comment('cleanup start')(self.start)
         best = None
         if self.locations:
             next_ = self.next
@@ -452,31 +477,31 @@ class StackCleanupSection(DelayedCompileEarly):
             if best is not None: clean_here -= best.locations
 
             # sorted so the output is deterministic
-            for loc,free in sorted(clean_here,key=id): free(s,loc)
+            for free in sorted(clean_here,key=id): free(s)
 
-        dis = displacement - (best.displacement if best else self.dest.displacement)
-        if not best: s.mov(0,R_RET)
-        if dis: s.jmp(self.abi.Displacement(dis))
+        if best:
+            s.jmp(self.abi.Displacement(displacement - best.displacement))
+        else:
+            if self.action: self.action(s)
+            if isinstance(self.dest,StackCleanupSection):
+                s.append(self.dest.compile(displacement))
+            else:
+                dis = displacement - self.dest.displacement
+                if dis: s.jmp(self.abi.Displacement(dis))
 
-        return s.code
+        return s.comment('cleanup end').code
 
 class StackCleanup:
-    def __init__(self,destination):
-        self.dest = [destination]
-        self.last = None
+    def __init__(self):
+        self.depth = 1
+        self.last = {}
 
-    def push_dest(self,destination):
-        assert destination not in self.dest
-        self.dest.append(destination)
-
-    def pop_dest(self):
-        self.dest.pop()
-
-    def new_section(self,s,locations):
-        old = self.last
-        self.last = StackCleanupSection(s,locations,self.dest[-1])
-        if old is not None and self.dest[-1] is old.dest: old.next = self.last
-        return self.last
+    def new_section(self,s,locations,destination,action=None):
+        old = self.last.get(destination)
+        last = StackCleanupSection(s,locations,destination,action)
+        if old is not None: old.next = last
+        self.last[destination] = last
+        return last
 
 
 class DeferredValue:
@@ -675,7 +700,7 @@ class InnerCall(DelayedCompileLate):
 
 
 class Function:
-    def __init__(self,code,padding=0,offset=0,name=None,pyfunc=False,annotation=None):
+    def __init__(self,code,padding=0,offset=0,name=None,pyfunc=False,annotation=None,returns=None,params=None):
         self.code = code
 
         # the size, in bytes, of the trailing padding (nop instructions) in
@@ -686,6 +711,8 @@ class Function:
         self.name = name
         self.pyfunc = pyfunc
         self.annotation = annotation or []
+        self.returns = returns
+        self.params = params or []
 
     def __len__(self):
         return len(self.code)
@@ -939,10 +966,11 @@ class StackValue(TrackedValue):
 
     """
     def __init__(self,s,reg=None):
-        self.reg = make_value(s,reg)
+        self.reg = None
         self.offset = None
 
-        if self.reg is not None:
+        if reg is not None:
+            self.reg = make_value(s,reg)
             assert not self.in_register(s)
             s.state.regs[self.reg] = self
 
@@ -962,11 +990,16 @@ class StackValue(TrackedValue):
             s.state.stack[self.offset] = None
 
     def __call__(self,s):
+        assert self.in_register(s) or self.in_stack(s)
         return self.reg if self.in_register(s) else stack_location(s,self.offset)
 
-    def _set_offset(self,offset):
+    def _set_offset(self,s,offset):
         self.offset = offset
         return self
+
+    @classmethod
+    def new_from_offset(cls,s,offset):
+        return cls(s)._set_offset(s,offset)
 
     def reload_reg(self,s,r=None):
         r = make_value(s,r)
@@ -1198,9 +1231,15 @@ def annot_with_comment(abi,descr,stack):
     return debug.annotate(stack,descr) + abi.comment('annotation: stack={}, {}',stack,descr)
 
 class Stitch:
-    """Create machine code concisely using method chaining"""
+    """Create machine code concisely using method chaining
 
-    def __init__(self,abi,outer=None,jmp_target=None,in_elif=False):
+    :type abi: abi.Abi
+    :type outer: Stitch | None
+    :type jmp_target: JumpTarget | None
+    :type in_elif: bool
+
+    """
+    def __init__(self,abi,outer=None,jmp_target=None,in_elif=False,state=None,cleanup=None,def_stack_offset=None,special_addrs=None):
         self.abi = abi
         self.outer = outer
         self.jmp_target = jmp_target
@@ -1221,41 +1260,62 @@ class Stitch:
 
             self.usable_tmp_regs = outer.usable_tmp_regs
         else:
-            self.state = State()
+            self.state = state or State()
             self.state_if = None
-            self.cleanup = StackCleanup(JumpTarget())
-            self.def_stack_offset = DeferredOffsetBase()
-            self.special_addrs = {}
+            self.cleanup = cleanup or StackCleanup()
+            self.def_stack_offset = def_stack_offset or DeferredOffsetBase()
+            self.special_addrs = special_addrs if special_addrs else {}
 
             self.usable_tmp_regs = list(abi.r_scratch)
             self.usable_tmp_regs.append(abi.r_ret)
             self.usable_tmp_regs.extend(abi.r_pres)
 
+    def detached_branch(self):
+        return Stitch(
+            self.abi,
+            state=self.state,
+            cleanup=self.cleanup,
+            def_stack_offset=self.def_stack_offset,
+            special_addrs=self.special_addrs)
+
     def address_like(self,x):
         return isinstance(x,(self.abi.Address,DeferredOffsetAddress))
-
-    @property
-    def exc_depth(self):
-        return len(self.cleanup.dest)
 
     def new_stack_value(self,prolog=False,value_t=None,name=None):
         if prolog:
             depth = 0
-            if value_t is None: value_t = StackValue(self)._set_offset
+            if value_t is None: value_t = StackValue.new_from_offset
         else:
-            depth = self.exc_depth
-            if value_t is None: value_t = StackObj(self)._set_offset
+            depth = self.cleanup.depth
+            if value_t is None: value_t = StackObj.new_from_offset
 
         for i,s in enumerate(self.state.stack):
             if s is None:
-                r = value_t(i)
+                r = value_t(self,i)
                 self.state.stack[i] = (r,depth)
                 return r
 
-        r = value_t(len(self.state.stack))
+        r = value_t(self,len(self.state.stack))
         self.state.stack.append((r,depth))
         if name: self.special_addrs[name] = r
         return r
+
+    def new_contiguous_stack_values(self,amount,value_t=None):
+        for i in range(len(self.state.stack)):
+            if all(s is None for s in self.state.stack[i:i+amount]):
+                start = i
+                break
+        else:
+            start = len(self.state.stack)
+
+        if value_t is None:
+            value_t = StackObj.new_from_offset
+
+        new_vals = [value_t(self,i) for i in range(start,start+amount)]
+        depth = self.cleanup.depth
+        self.state.stack[start:start+amount] = ((v,depth) for v in new_vals)
+
+        return new_vals
 
     def unused_reg(self):
         for r in self.usable_tmp_regs:
@@ -1310,30 +1370,6 @@ class Stitch:
             if val is not None:
                 freed = val.free_reg(self)
                 assert freed,"register will not be preserved"
-
-    def exc_cleanup(self):
-        """Free the stack items created at the current exception handler depth.
-
-        :rtype: Stitch
-
-        """
-        self.invalidate_scratch()
-
-        items = []
-        for ld in self.state.stack:
-            if ld is not None and ld[1] == self.exc_depth:
-                cleanup = getattr(ld[0],'cleanup_free_func',None)
-                if cleanup is not None:
-                    cleanup = cleanup(self)
-                    if cleanup is not None:
-                        items.append(CleanupItem(make_value(self,ld[0]),cleanup))
-
-        self(self.cleanup.new_section(self,items))
-        self.last_op_is_uncond_jmp = True
-        return self
-
-    def check_err(self,inverted=False):
-        return self.if_(R_RET if inverted else not_(R_RET)).exc_cleanup().endif()
 
     def reserve_stack(self,move_sp=True):
         """Advance the stack pointer so that self.stack_size * abi.ptr_size
@@ -1412,10 +1448,12 @@ class Stitch:
         This should not be confused with arg_dest and arg_reg, which operate on
         the arguments of the function about to be called.
 
+        :type n: int
+
         """
         return self.abi.r_arg[n] if n < len(self.abi.r_arg) else DeferredOffsetAddress(self.def_stack_offset,-n,self.abi.r_sp)
 
-    def append(self,x,is_jmp=None):
+    def append(self,x,is_jmp=False):
         self.last_op_is_uncond_jmp = is_jmp
         self._code.extend(x)
 
@@ -1737,7 +1775,10 @@ class Stitch:
                 .append(self.abi.op.call(self.abi.r_ret))
                 .inline_comment(func))
 
-        return self.append(self.abi.op.call(func))
+        if isinstance(func,JumpTarget):
+            return self(JumpSource(self.abi.op.call,self.abi,func))
+
+        return self.append(deferred_values(self,self.abi.op.call,(func,)))
 
     def invoke(self,func,*args,tmpreg=None):
         for a in args:
@@ -1781,7 +1822,7 @@ class Stitch:
         if isinstance(target,JumpTarget):
             self(JumpSource(self.abi.op.jmp,self.abi,target))
         else:
-            self._code += self.abi.op.jmp(target)
+            self.append(deferred_values(self,self.abi.op.jmp,(target,)))
 
         self.last_op_is_uncond_jmp = True
         return self
@@ -1857,20 +1898,17 @@ class Stitch:
 
         return partial(xcc,test)
 
-    def __call__(self,op,*,is_jmp=False):
+    def __call__(self,op,*,is_jmp=None):
+        op = make_value(self,op)
         assert not isinstance(op,list)
-        self._code.append(op)
-        self.last_op_is_uncond_jmp = is_jmp
-        return self
 
-    def __getitem__(self,b):
-        """Equivalent to b(self); return self.
+        if hasattr(op,'__call__'):
+            assert is_jmp is None
+            op(self)
+        else:
+            self._code.append(op)
+            self.last_op_is_uncond_jmp = bool(is_jmp)
 
-        This is to allow calling arbitrary functions on chains of Stitch
-        operations without breaking the sequential flow.
-
-        """
-        b(self)
         return self
 
 

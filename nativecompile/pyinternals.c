@@ -1159,6 +1159,53 @@ static void missing_arguments(Function *f,PyObject **locals) {
     Py_DECREF(name_str);
 }
 
+static void prepare_exc_handler(PyObject **context) {
+    int i;
+    PyThreadState *tstate = PyThreadState_GET();
+
+    context[3] = tstate->exc_type;
+    context[4] = tstate->exc_value;
+    context[5] = tstate->exc_traceback;
+
+    for(i=3; i<6; ++i) {
+        if(!context[i]) {
+            context[i] = Py_None;
+            Py_INCREF(context[i]);
+        }
+    }
+
+    PyErr_Fetch(&context[0],&context[1],&context[2]);
+    PyErr_NormalizeException(&context[0],&context[1],&context[2]);
+    PyException_SetTraceback(context[1],context[2] ? context[2] : Py_None);
+
+    tstate = PyThreadState_GET();
+    tstate->exc_type = context[0];
+    Py_INCREF(context[0]);
+    tstate->exc_value = context[1];
+    Py_INCREF(context[1]);
+    tstate->exc_traceback = context[2];
+
+    if(!context[2]) context[2] = Py_None;
+    Py_INCREF(context[2]);
+}
+
+static void end_exc_handler(PyObject **context_half) {
+    PyObject *type, *value, *tb;
+    PyThreadState *tstate = PyThreadState_GET();
+
+    type = tstate->exc_type;
+    value = tstate->exc_value;
+    tb = tstate->exc_traceback;
+
+    tstate->exc_type = context_half[0];
+    tstate->exc_value = context_half[1];
+    tstate->exc_traceback = context_half[2];
+
+    Py_XDECREF(type);
+    Py_XDECREF(value);
+    Py_XDECREF(tb);
+}
+
 
 
 /* The following are copied from Python/ceval.c */
@@ -1523,49 +1570,6 @@ call_exc_trace(Py_tracefunc func, PyObject *self,
     }
 }
 
-static PyObject *
-unicode_concatenate(PyObject *v, PyObject *w, PyFrameObject *f,
-                    unsigned char next_instr, int instr_arg)
-{
-    PyObject *res;
-    if (Py_REFCNT(v) == 2) {
-        switch (next_instr) {
-        case STORE_FAST:
-        {
-            PyObject **fastlocals = f->f_localsplus;
-            if (GETLOCAL(instr_arg) == v)
-                SETLOCAL(instr_arg, NULL);
-            break;
-        }
-        case STORE_DEREF:
-        {
-            PyObject **freevars = (f->f_localsplus +
-                                   f->f_code->co_nlocals);
-            PyObject *c = freevars[instr_arg];
-            if (PyCell_GET(c) == v)
-                PyCell_Set(c, NULL);
-            break;
-        }
-        case STORE_NAME:
-        {
-            PyObject *names = f->f_code->co_names;
-            PyObject *name = PyTuple_GET_ITEM(names, instr_arg);
-            PyObject *locals = f->f_locals;
-            if (PyDict_CheckExact(locals) &&
-                PyDict_GetItem(locals, name) == v) {
-                if (PyDict_DelItem(locals, name) != 0) {
-                    PyErr_Clear();
-                }
-            }
-            break;
-        }
-        }
-    }
-    res = v;
-    PyUnicode_Append(&res, w);
-    return res;
-}
-
 static int _print_expr(PyObject *expr) {
     PyObject *args, *hook, *eval_ret;
     int ret = 0;
@@ -1800,6 +1804,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR(Py_AddPendingCall),
         ADD_ADDR(PyDict_GetItem),
         ADD_ADDR(PyDict_SetItem),
+        ADD_ADDR(PyDict_DelItem),
         ADD_ADDR(PyDict_GetItemString),
         ADD_ADDR(PyDict_Size),
         ADD_ADDR(PyDict_Copy),
@@ -1807,6 +1812,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR(_PyDict_NewPresized),
         ADD_ADDR(_PyDict_LoadGlobal),
         ADD_ADDR(_PyDict_GetItemId),
+        ADD_ADDR(PyObject_IsSubclass),
         ADD_ADDR(PyObject_GetItem),
         ADD_ADDR(PyObject_SetItem),
         ADD_ADDR(PyObject_DelItem),
@@ -1871,6 +1877,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR(PyTraceBack_Here),
         ADD_ADDR(PyUnicode_Format),
         ADD_ADDR(PyUnicode_Append),
+        ADD_ADDR(PyUnicode_Concat),
         ADD_ADDR(PyCell_Get),
         ADD_ADDR(PyCell_Set),
         ADD_ADDR(PyCell_New),
@@ -1885,6 +1892,8 @@ PyInit_pyinternals(void) {
         ADD_ADDR(excess_keyword),
         ADD_ADDR(append_tuple_for_call),
         ADD_ADDR(append_dict_for_call),
+        ADD_ADDR(prepare_exc_handler),
+        ADD_ADDR(end_exc_handler),
         ADD_ADDR(format_exc_check_arg),
         ADD_ADDR(format_exc_unbound),
         ADD_ADDR(_unpack_iterable),
@@ -1893,7 +1902,6 @@ PyInit_pyinternals(void) {
         ADD_ADDR(import_all_from),
         ADD_ADDR(special_lookup),
         ADD_ADDR(call_exc_trace),
-        ADD_ADDR(unicode_concatenate),
         ADD_ADDR(_print_expr),
         ADD_ADDR(_load_build_class),
 

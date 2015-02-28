@@ -162,10 +162,6 @@ class CLASS_string(FORM): pass
 def form(name,base,index,encode):
     return type('FORM_'+name,(base,),{'index':index,'encode':encode})
 
-def make_form(*args):
-    f = form(*args)
-    globals()[f.__name__] = f
-
 def enc_block_n(size):
     def encode(self,d):
         assert isinstance(self.val,(bytes,bytearray)) and len(self.val) == size
@@ -184,24 +180,24 @@ def get_ref(self,d):
     assert r is not None, 'Only back-references are supported' # for now
     return r
 
-make_form('addr',CLASS_address,0x01,(lambda self,d: RelocAbsAddress(self.val)))
-make_form('block2',CLASS_block,0x03,enc_block_n(2))
-make_form('block4',CLASS_block,0x04,enc_block_n(4))
-make_form('data2',CLASS_constant,0x05,(lambda self,d: d.mode.enc_int(self.val,2)))
-make_form('data4',CLASS_constant,0x06,(lambda self,d: d.mode.enc_int(self.val,4)))
-make_form('data8',CLASS_constant,0x07,(lambda self,d: d.mode.enc_int(self.val,8)))
-make_form('block',CLASS_block,0x09,enc_block)
-make_form('block1',CLASS_block,0x0a,enc_block_n(1))
-make_form('data1',CLASS_constant,0x0b,(lambda self,d: d.mode.enc_int(self.val,1)))
-make_form('flag',CLASS_flag,0x0c,(lambda self,d: b'\1' if self.val else b'\0'))
-make_form('strp',CLASS_string,0x0e,enc_ref)
-make_form('sdata',CLASS_constant,0x0d,(lambda self,d: enc_sleb128(self.val)))
-make_form('udata',CLASS_constant,0x0f,(lambda self,d: enc_uleb128(self.val)))
-make_form('ref1',CLASS_reference,0x11,(lambda self,d: d.mode.enc_int(get_ref(self,d),1)))
-make_form('ref2',CLASS_reference,0x12,(lambda self,d: d.mode.enc_int(get_ref(self,d),2)))
-make_form('ref4',CLASS_reference,0x13,(lambda self,d: d.mode.enc_int(get_ref(self,d),4)))
-make_form('ref8',CLASS_reference,0x14,(lambda self,d: d.mode.enc_int(get_ref(self,d),8)))
-make_form('ref_udata',CLASS_reference,0x15,(lambda self,d: enc_uleb128(get_ref(self,d))))
+FORM_addr = form('addr',CLASS_address,0x01,(lambda self,d: RelocAbsAddress(self.val)))
+FORM_block2 = form('block2',CLASS_block,0x03,enc_block_n(2))
+FORM_block4 = form('block4',CLASS_block,0x04,enc_block_n(4))
+FORM_data2 = form('data2',CLASS_constant,0x05,(lambda self,d: d.mode.enc_int(self.val,2)))
+FORM_data4 = form('data4',CLASS_constant,0x06,(lambda self,d: d.mode.enc_int(self.val,4)))
+FORM_data8 = form('data8',CLASS_constant,0x07,(lambda self,d: d.mode.enc_int(self.val,8)))
+FORM_block = form('block',CLASS_block,0x09,enc_block)
+FORM_block1 = form('block1',CLASS_block,0x0a,enc_block_n(1))
+FORM_data1 = form('data1',CLASS_constant,0x0b,(lambda self,d: d.mode.enc_int(self.val,1)))
+FORM_flag = form('flag',CLASS_flag,0x0c,(lambda self,d: b'\1' if self.val else b'\0'))
+FORM_strp = form('strp',CLASS_string,0x0e,enc_ref)
+FORM_sdata = form('sdata',CLASS_constant,0x0d,(lambda self,d: enc_sleb128(self.val)))
+FORM_udata = form('udata',CLASS_constant,0x0f,(lambda self,d: enc_uleb128(self.val)))
+FORM_ref1 = form('ref1',CLASS_reference,0x11,(lambda self,d: d.mode.enc_int(get_ref(self,d),1)))
+FORM_ref2 = form('ref2',CLASS_reference,0x12,(lambda self,d: d.mode.enc_int(get_ref(self,d),2)))
+FORM_ref4 = form('ref4',CLASS_reference,0x13,(lambda self,d: d.mode.enc_int(get_ref(self,d),4)))
+FORM_ref8 = form('ref8',CLASS_reference,0x14,(lambda self,d: d.mode.enc_int(get_ref(self,d),8)))
+FORM_ref_udata = form('ref_udata',CLASS_reference,0x15,(lambda self,d: enc_uleb128(get_ref(self,d))))
 
 
 SEC_OFFSET_CLASSES = CLASS_lineptr,CLASS_loclistptr,CLASS_macptr,CLASS_rangelistptr
@@ -236,7 +232,7 @@ for i,sof in enumerate(SEC_OFFSET_FORMS):
     sof.sec_offset_index = i
 
 
-make_form('exprloc',CLASS_exprloc,0x18,enc_block)
+FORM_exprloc = form('exprloc',CLASS_exprloc,0x18,enc_block)
 
 # special case: no value
 class FORM_flag_present(CLASS_flag):
@@ -252,7 +248,6 @@ def smallest_block_form(val):
     if len(val) == 1: return FORM_block1(val)
     if len(val) == 2: return FORM_block2(val)
     if len(val) == 4: return FORM_block4(val)
-    if len(val) == 8: return FORM_block8(val)
     return FORM_block(val)
 
 
@@ -629,6 +624,16 @@ Reg64._FLAGS = Reg64.rFLAGS
 
 def reg(mode):
     return Reg64 if mode.ptr_size == 8 else Reg32
+
+
+class CC(Enum,FORM_data1):
+    __init__ = Enum.__init__
+
+CC('normal',1)
+CC('program',2)
+CC('nocall',3)
+# lo_user = 0x40
+# hi_user = 0xff
 
 
 class StringTable:
