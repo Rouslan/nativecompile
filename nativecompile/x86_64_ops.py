@@ -44,6 +44,8 @@ class Register(x86_ops.Register):
              'r8','r9','r10','r11','r12','r13','r14','r15']
         ][self.size][self.code]
 
+    __hash__ = x86_ops.Register.__hash__
+
 
 spl = x86_ops.ah
 bpl = x86_ops.ch
@@ -97,10 +99,12 @@ class Address(x86_ops.Address):
             assert index is None
             self.rip = True
             base = None
-            
+
         assert (base is None or base.size == SIZE_Q) and (index is None or index.size == SIZE_Q)
 
         super().__init__(offset,base,index,scale)
+
+    __hash__ = x86_ops.Address.__hash__
 
     def _mod_rm_sib_disp(self):
         if self.rip or self.base or self.index:

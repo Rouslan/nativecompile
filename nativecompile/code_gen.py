@@ -422,6 +422,15 @@ class CleanupItem:
     def __call__(self,s):
         self.free(s,self.loc)
 
+    def __hash__(self):
+        return hash(self.loc) ^ hash(self.free)
+
+    def __eq__(self,b):
+        if isinstance(b,CleanupItem):
+            return self.loc == b.loc and self.free == b.free
+
+        return NotImplemented
+
 def pyobj_free(s,loc):
     if not isinstance(loc,s.abi.Register):
         s.mov(loc,R_RET)
@@ -459,6 +468,14 @@ class StackCleanupSection(DelayedCompileEarly):
     def __hash__(self):
         return hash(self.action) ^ hash(self.locations) ^ hash(self.dest)
 
+    # If a subsequent cleanup section's actions are a subset of this section's
+    # actions and has the same destination, this section will only perform the
+    # actions that are different and jump to the next section to finish the
+    # cleanup. For a bigger reduction, the search for subsets could be expanded
+    # to prior sections. For an even bigger reduction, jumps could be made into
+    # the middle of sections, so that sections need only to intersect; in such
+    # a case, different orderings of actions would need to be considered for
+    # finding the optimal arrangement.
     def compile(self,displacement):
         s = Stitch(self.abi).comment('cleanup start')(self.start)
         best = None
@@ -469,7 +486,7 @@ class StackCleanupSection(DelayedCompileEarly):
                 # len(best.locations) intentionally uses >= because when there
                 # are multiple identical sections, all but the last one will
                 # just be jumps to the last one
-                if (best is None or len(next_.locations) >= len(best.locations)) and self.locations >= next_.locations:
+                if len(next_.locations) and (best is None or len(next_.locations) >= len(best.locations)) and self.locations >= next_.locations:
                     best = next_
                 next_ = next_.next
 
@@ -519,6 +536,19 @@ class DeferredOffsetAddress(DeferredValue):
     def __call__(self,abi):
         assert self.offset_arg is not None
         return abi.Address(self.offset.realize(self.offset_arg) * abi.ptr_size,self.base,self.index,self.scale)
+
+    def __hash__(self):
+        r = hash(self.offset) ^ hash(self.offset_arg) ^ hash(self.base) ^ hash(self.index)
+        if self.index is not None: r ^= hash(self.scale)
+        return r
+
+    def __eq__(self,b):
+        return (isinstance(b,DeferredOffsetAddress)
+            and self.offset == b.offset
+            and self.offset_arg == b.offset_arg
+            and self.base == b.base
+            and self.index == b.index
+            and (self.index is None or self.index == b.index))
 
 class DeferredOffset(DeferredValue):
     def __init__(self,base,arg,factor=1):

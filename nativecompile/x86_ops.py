@@ -66,19 +66,19 @@ class Register:
     @property
     def w(self):
         return bool(self.size)
-    
+
     def __eq__(self,b):
         if isinstance(b,Register):
             return self.size == b.size and self.code == b.code
-        
+
         return NotImplemented
-    
+
     def __ne__(self,b):
         if isinstance(b,Register):
             return self.size != b.size or self.code != b.code
-        
+
         return NotImplemented
-    
+
     def __hash__(self):
         return self.code | (self.size << 4)
 
@@ -89,7 +89,7 @@ class Register:
             ['al','cl','dl','bl','ah','ch','dh','bh'],
             ['eax','ecx','edx','ebx','esp','ebp','esi','edi']
         ][self.size][self.reg]
-    
+
     def __repr__(self):
         return 'Register({},{})'.format(self.size,self.code)
 
@@ -104,86 +104,88 @@ class Address:
         assert scale in (1,2,4,8)
         assert (base is None or base.w) and (index is None or index.w)
         assert base is None or index is None or base.size == index.size
-        
+
         # %esp cannot be used as the index
         assert index is None or index.reg != 0b100
-        
+
         self.offset = offset
         self.base = base
         self.index = index
         self.scale = scale
-    
+
     def __eq__(self,b):
         if isinstance(b,Address):
             return (self.offset == b.offset
                 and self.base == b.base
                 and self.index == b.index
-                and self.scale == b.scale)
-        
+                and (self.index is None or self.scale == b.scale))
+
         return NotImplemented
-    
+
     def __ne__(self,b):
         if isinstance(b,Address):
             return (self.offset != b.offset
                 or self.base != b.base
                 or self.index != b.index
-                or self.scale != b.scale)
-        
+                or (self.index is not None and self.scale != b.scale))
+
         return NotImplemented
-    
+
     def __hash__(self):
-        return self.offset ^ hash(self.base) ^ hash(self.index) ^ self.scale
+        r = self.offset ^ hash(self.base) ^ hash(self.index)
+        if self.index is not None: r ^= self.scale
+        return r
 
     @property
     def size(self):
         if self.base: return self.base.size
         if self.index: return self.index.size
         return None
-    
+
     def _sib(self):
-        r = (((self.index.reg if self.index else 0b100) << 3) | 
+        r = (((self.index.reg if self.index else 0b100) << 3) |
             (self.base.reg if self.base else 0b101))
         if self.index:
             r |= {1:0,2:1<<6,4:2<<6,8:3<<6}[self.scale]
         return bytes([r])
-    
+
     def _mod_rm_sib_disp(self):
         if self.index or (self.base and self.base.reg == 0b100):
-            # The opcode format is a little different when the base is 0b101 and 
+            # The opcode format is a little different when the base is 0b101 and
             # mod is 0b00 so to use %ebp, we'll have to go with the next mod value.
             if self.offset == 0 and not (self.base and self.base.reg == 0b101):
                 return 0b00, 0b100, self._sib()
-                
+
             if fits_in_sbyte(self.offset):
                 return 0b01, 0b100, self._sib() + int_to_8(self.offset)
-                
+
             return 0b10, 0b100, self._sib() + int_to_32(self.offset)
 
 
         if self.base is None:
             return 0b00, 0b101, int_to_32(self.offset)
-        
-        # The opcode format is a little different when the base is 0b101 and 
+
+        # The opcode format is a little different when the base is 0b101 and
         # mod is 0b00 so to use %ebp, we'll have to go with the next mod value.
         if self.offset == 0 and not (self.base and self.base.reg == 0b101):
             return 0b00, self.base.reg, b''
-        
+
         if fits_in_sbyte(self.offset):
             return 0b01, self.base.reg, int_to_8(self.offset)
-        
+
         return 0b10, self.base.reg, int_to_32(self.offset)
-    
+
     def mod_rm_sib_disp(self,mid):
         """Get the mod field, the r/m field and the SIB and displacement bytes"""
-    
+
         mod,rm,extra = self._mod_rm_sib_disp()
         return bytes([(mod << 6) | (mid << 3) | rm]) + extra
-    
+
     def __str__(self):
         if self.index is not None:
             if self.scale != 1:
                 return '{}({},{},{})'.format(hex(self.offset) if self.offset else '',self.base or '',self.index,self.scale)
- 
+
             return '{}({},{})'.format(hex(self.offset) if self.offset else '',self.base or '',self.index)
         if self.base is not None:
             return '{}({})'.format(hex(self.offset) if self.offset else '',self.base)
@@ -207,7 +209,7 @@ class Address:
         if isinstance(b,int):
             self.offset += b
             return self
-        
+
         return NotImplemented
 
     def __isub__(self,b): return self.__iadd__(-b)
@@ -217,23 +219,23 @@ Address.__mmtype__ = Address
 
 class Displacement:
     """A displacement relative to the next instruction.
-    
+
     This class exists to make it clear that a given op code treats a value as
     a displacement and not an absolute address.
-    
+
     """
     def __init__(self,value,force_full_size=False):
         self.val = value
         self.force_full_size = force_full_size
-    
+
     def __eq__(self,b):
         if isinstance(b,Displacement):
             return self.val == b.val and self.force_full_size == b.force_full_size
-    
+
     def __ne__(self,b):
         if isinstance(b,Displacement):
             return self.val != b.val or self.force_full_size != b.force_full_size
-    
+
     def __hash__(self):
         return self.val ^ self.force_full_size
 
@@ -284,32 +286,32 @@ def rex(reg,rm,need_w=True):
 class Test:
     def __init__(self,val):
         self.val = val
-    
+
     def __invert__(self):
         return Test(self.val ^ 1)
-    
+
     def __int__(self):
         return self.val
 
     def __eq__(self,b):
         if isinstance(b,Test):
             return self.val == b.val
-        
+
         return NotImplemented
-    
+
     def __ne__(self,b):
         if isinstance(b,Test):
             return self.val != b.val
-        
+
         return NotImplemented
-    
+
     def __hash__(self):
         return self.val
-    
+
     @property
     def mnemonic(self):
         return TEST_MNEMONICS[self.val][0]
-    
+
     def __repr__(self):
         return 'Test({})'.format(self.val)
 
@@ -327,7 +329,7 @@ def asm_str(indirect,nextaddr,x):
 
 class AsmOp:
     __slots__ = ('binary','name','args','annot')
-    
+
     def __init__(self,binary,name,args,annot=''):
         self.binary = binary
         self.name = name
@@ -336,28 +338,28 @@ class AsmOp:
 
 class AsmComment:
     __slots__ = ('message',)
-    
+
     def __init__(self,message):
         self.message = message
 
 class AsmSequence:
     def __init__(self,ops=None):
         self.ops = ops or []
-    
+
     def __len__(self):
         return sum(len(op.binary) for op in self.ops if type(op) is AsmOp)
-    
+
     def __add__(self,b):
         if isinstance(b,AsmSequence):
             return AsmSequence(self.ops+b.ops)
-            
+
         return NotImplemented
-    
+
     def __iadd__(self,b):
         if isinstance(b,AsmSequence):
             self.ops += b.ops
             return self
-        
+
         return NotImplemented
 
     def __mul__(self,b):
@@ -372,7 +374,7 @@ class AsmSequence:
             return self
 
         return NotImplemented
-    
+
     def dump(self,base=0):
         lines = []
         addr = base
@@ -382,16 +384,16 @@ class AsmSequence:
             else:
                 indirect = op.name == 'call' or op.name == 'jmp'
                 nextaddr = addr + len(op.binary)
-            
+
                 lines.append('{:8x}: {:20}{:8} {}{}\n'.format(
                     addr,
                     binascii.hexlify(op.binary).decode(),
                     op.name,
                     ', '.join(asm_str(indirect,nextaddr,arg) for arg in op.args),
                     op.annot and '  ; '+op.annot))
-                
+
                 addr = nextaddr
-        
+
         return ''.join(lines)
 
 
@@ -399,7 +401,7 @@ class Assembly:
     @staticmethod
     def namespace():
         return globals()
-    
+
     def op(self,name,*args):
         return AsmSequence([AsmOp(self.namespace()[name](*args),name,args)])
 
@@ -407,7 +409,7 @@ class Assembly:
         b = self.namespace()[name]
         if not callable(b): return b
         return partial(self.op,name)
-    
+
     def jcc(self,test,x):
         return AsmSequence([AsmOp(self.namespace()['jcc'](test,x),'j'+test.mnemonic,(x,))])
 
@@ -416,11 +418,11 @@ class Assembly:
 
     def with_new_imm_dword(self,op,imm):
         assert len(op.ops) == 1
-        
+
         old = op.ops[0]
-        
+
         assert isinstance(old,AsmOp) and len(old.args) == 2
-        
+
         return AsmSequence([AsmOp(with_new_imm_dword(old.binary,imm),old.name,(imm,old.args[1]),old.annot)])
 
 
@@ -639,7 +641,7 @@ def imul(a : Register,b : Register):
     assert a.size == b.size
     if b.code == 0:
         return rex(None,a) + bytes([0b11110110 | bool(a.size),0b11101000 | a.reg])
-    
+
     assert a.size > SIZE_B
     return rex(b,a) + bytes([0b00001111,0b10101111,0b11000000 | (b.reg << 3) | a.reg])
 
@@ -647,21 +649,21 @@ def imul(a : Register,b : Register):
 def imul(a : Address,b : Register):
     if b.code == 0:
         return rex(b.size,a) + bytes([0b11110110 | bool(a.size)]) + a.mod_rm_sib_disp(0b101)
-    
+
     assert a.size > SIZE_B
     return rex(b,a) + b'\x0F\xAF' + a.mod_rm_sib_disp(b.reg)
 
 @multimethod
 def imul(a : Register,b : int,dest : Register):
     assert a.size == dest.size and a.size > SIZE_B
-    
+
     fits = fits_in_sbyte(b)
     return rex(dest,a) + bytes([0b01101001 | (fits << 1),0b11000000 | (dest.reg << 3) | a.reg]) + immediate_data(not fits,b)
 
 @multimethod
 def imul(a : Address,b : int,dest : Register):
     assert a.size == dest.size and a.size > SIZE_B
-    
+
     fits = fits_in_sbyte(b)
     return rex(dest,a) + bytes([0b01101001 | (fits << 1)]) + a.mod_rm_sib_disp(dest.reg) + immediate_data(not fits,b)
 
@@ -693,7 +695,7 @@ def incl(x : Address):
 def jcc(test : Test,x : Displacement):
     if fits_in_sbyte(x):
         return bytes([0b01110000 | test.val]) + int_to_8(x.val)
-    
+
     return bytes([
         0b00001111,
         0b10000000 | test.val]) + int_to_32(x.val)
@@ -748,7 +750,7 @@ def loopz(x : Displacement):
     return b'\xE1' + int_to_8(x.val)
 
 loope = loopz
-    
+
 @multimethod
 def loopnz(x : Displacement):
     return b'\xE0' + int_to_8(x.val)
@@ -905,14 +907,14 @@ def shx_imm_reg(amount,x,shiftright):
         return r + bytes([
             0b11010000 | x.w,
             0b11100000 | (shiftright << 3) | x.reg])
-    
+
     return r + bytes([
         0b11000000 | x.w,
         0b11100000 | (shiftright << 3) | x.reg]) + immediate_data(False,amount)
 
 def shx_reg_reg(amount,x,shiftright):
     assert amount == cl
-    
+
     return rex(None,x) + bytes([
         0b11010010 | x.w,
         0b11100000 | (shiftright << 3) | x.reg])
@@ -922,12 +924,12 @@ def shx_imm_addr(amount,x,size,shiftright):
     rmsd = x.mod_rm_sib_disp(0b100 | shiftright)
     if amount == 1:
         return r + bytes([0b11010000 | bool(size)]) + rmsd
-    
+
     return r + bytes([0b11000000 | bool(size)]) + rmsd + immediate_data(False,amount)
 
 def shx_reg_addr(amount,x,size,shiftright):
     assert amount == cl
-    
+
     return rex(size,x) + bytes([0b11010010 | bool(size)]) + x.mod_rm_sib_disp(0b100 | shiftright)
 
 

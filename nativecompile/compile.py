@@ -130,6 +130,22 @@ class _ParsedValue:
     def __init__(self,value):
         self.value = value
 
+def clear_r_ret(s):
+    s.mov(0,R_RET)
+
+class CallTargetAction:
+    def __init__(self,target):
+        self.target = target
+
+    def __call__(self,s):
+        s.call(self.target)
+
+    def __hash__(self):
+        return hash(self.target)
+
+    def __eq__(self,b):
+        return isinstance(b,CallTargetAction) and self.target == b.target
+
 class ExprCompiler(ast.NodeVisitor):
     def __init__(self,abi,s_table=None,s_map=None,util_funcs=None,global_scope=False,entry_points=None):
         self.code = Stitch(abi)
@@ -146,6 +162,7 @@ class ExprCompiler(ast.NodeVisitor):
         self.visit_depth = 0
         self.target_contexts = []
         self.func_end = JumpTarget()
+        self._del_name_cleanups = {}
 
         self.free_var_indexes = {}
         if isinstance(s_table,symtable.Function):
@@ -818,15 +835,6 @@ class ExprCompiler(ast.NodeVisitor):
         last = self.target_contexts.pop()
         assert c is last
 
-    def finally_itr(self,until=None):
-        for c in reversed(self.target_contexts):
-            if c is until: break
-            if isinstance(c,FinallyContext): yield c
-
-    def add_jump_target(self,target,until=None):
-        for c in self.finally_itr(until):
-            c.next_targets.add(target)
-
     def unwind_to(self,target,until=None,s=None,last_action=None):
         assert not isinstance(until,FinallyContext)
 
@@ -860,7 +868,7 @@ class ExprCompiler(ast.NodeVisitor):
             if isinstance(c,FinallyContext):
                 item_groups.append((
                     clean_context(c.depth),
-                    (lambda s,target=c.target: s.call(target))))
+                    CallTargetAction(c.target)))
                 callbacks.clear()
             if c is until:
                 item_groups.append((clean_context(c.depth),None))
@@ -882,12 +890,25 @@ class ExprCompiler(ast.NodeVisitor):
             dest = self.func_end
             top = self.top_context(ExceptContext)
             if top: dest = top.target
-            self.unwind_to(dest,top,s,(lambda s: s.mov(0,R_RET)))
+            self.unwind_to(dest,top,s,clear_r_ret)
         return inner
 
     def check_err(self,inverted=False):
         return (lambda s:
             s.if_(R_RET if inverted else not_(R_RET))(self.exc_cleanup()).endif())
+
+    # these are cached so that:
+    # self.delete_name_cleanup(x) == self.delete_name_cleanup(x)
+    # and thus can be deduplicated by StackCleanup
+    def delete_name_cleanup(self,name):
+        c = self._del_name_cleanups.get(name)
+        if c is None:
+            code = self.code.detached_branch()
+            self.delete_name(name,False,code)
+            c = lambda s: s.append(code.code)
+            self._del_name_cleanups[name] = c
+
+        return c
 
 
     #### VISITOR METHODS ####
@@ -1261,9 +1282,7 @@ class ExprCompiler(ast.NodeVisitor):
                     self.code = self.code.if_(steal(issub))
                     if exc.name:
                         self.assign_name_expr(exc.name,exc_val)
-                        code = self.code.detached_branch()
-                        self.delete_name(exc.name,False,code)
-                        cleanup = lambda s: s.append(code.code)
+                        cleanup = self.delete_name_cleanup(exc.name)
                         top_context.extra_callbacks.append(cleanup)
 
                 for val in exc_vals[3:]: val.discard(self.code)
