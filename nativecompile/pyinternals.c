@@ -1,4 +1,4 @@
-/* Copyright 2015 Rouslan Korneychuk
+/* Copyright 2016 Rouslan Korneychuk
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -173,7 +173,22 @@ void unregister_gdb(const void *addr) {
 #endif
 
 
+PyObject *str_close;
+
+
+struct _CompiledCode;
+typedef struct _CompiledCode CompiledCode;
+
 typedef struct {
+    CompiledCode *resume_gen_code;
+    Py_ssize_t resume_gen_offset;
+} module_data_t;
+
+static module_data_t *get_module_data_from(PyObject *m);
+static module_data_t *get_module_data(void);
+
+
+struct _CompiledCode {
     PyObject_HEAD
 
     void *data;
@@ -182,7 +197,7 @@ typedef struct {
 #ifdef GDB_JIT_SUPPORT
     unsigned char gdb_reg;
 #endif
-} CompiledCode;
+};
 
 static void CompiledCode_dealloc(CompiledCode *self) {
     if(self->data) {
@@ -340,6 +355,12 @@ static PyObject *CompiledCode_new(PyTypeObject *type,PyObject *args,PyObject *kw
     return (PyObject*)self;
 }
 
+static PyMemberDef CompiledCode_members[] = {
+    {"start_addr",T_ULONG,offsetof(CompiledCode,data),READONLY,NULL},
+    {"size",T_PYSSIZET,offsetof(CompiledCode,size),READONLY,NULL},
+    {NULL}
+};
+
 static PyTypeObject CompiledCodeType = {
     PyVarObject_HEAD_INIT(NULL, 0)
     "nativecompile.pyinternals.CompiledCode", /* tp_name */
@@ -369,7 +390,7 @@ static PyTypeObject CompiledCodeType = {
     0,	                       /* tp_iter */
     0,	                       /* tp_iternext */
     0,                         /* tp_methods */
-    0,                         /* tp_members */
+    CompiledCode_members,      /* tp_members */
     0,                         /* tp_getset */
     0,                         /* tp_base */
     0,                         /* tp_dict */
@@ -852,6 +873,263 @@ static PyObject *new_function(FunctionBody *body,PyObject *name,PyObject *global
 }
 
 
+enum generator_state {
+    GEN_INITIAL,
+    GEN_RUNNING,
+    GEN_PAUSED,
+    GEN_FINISHED
+} state;
+
+typedef struct {
+    PyObject_HEAD
+
+    size_t stack_size;
+    void **stack;
+    enum generator_state state;
+    size_t offset;
+    PyObject *name;
+    PyObject **closure;
+    FunctionBody *body;
+    PyObject *sub_generator;
+    PyObject *weakrefs;
+} Generator;
+
+static PyFrameObject* Generator_frame(Generator *g) {
+    return (PyFrameObject*)g->stack[g->stack_size-1];
+}
+
+static PyObject *Generator_call(Generator *self,PyObject *val,long exc) {
+    module_data_t *data = get_module_data();
+    return (*(PyObject *(*)(Generator*,PyObject*,long))(data->resume_gen_code->data + data->resume_gen_offset))(self,val,exc);
+}
+
+static PyObject *Generator_close(Generator *self,PyObject *arg);
+
+static void Generator_finalize(Generator *self) {
+    PyObject *r, *e_type, *e_value, *e_tb;
+
+    if(self->stack) {
+        PyErr_Fetch(&e_type,&e_value,&e_tb);
+
+        r = Generator_close(self,NULL);
+        if(r) Py_DECREF(r);
+        else {
+            PyErr_WriteUnraisable((PyObject*)self);
+
+            /* force it to clean up */
+            Generator_call(self,NULL,0);
+        }
+
+        PyErr_Restore(e_type,e_value,e_tb);
+    }
+}
+
+static void Generator_dealloc(Generator *self) {
+    if(self->weakrefs) PyObject_ClearWeakRefs((PyObject*)self);
+
+    if(PyObject_CallFinalizerFromDealloc((PyObject*)self)) return;
+
+    Py_DECREF(self->name);
+    Py_DECREF(self->body);
+    Py_XDECREF(self->sub_generator);
+}
+
+static PyObject *gen_send_ex(Generator *self,PyObject *arg,int exc) {
+    PyFrameObject *f;
+    PyObject *result;
+    PyThreadState *tstate = PyThreadState_GET();
+
+    if(self->state == GEN_RUNNING) {
+        PyErr_SetString(PyExc_ValueError,"generator already executing");
+        return NULL;
+    }
+    if(!self->stack) {
+        if(arg && !exc) PyErr_SetNone(PyExc_StopIteration);
+        return NULL;
+    }
+
+    f = Generator_frame(self);
+
+    if(self->state == GEN_INITIAL && arg && arg != Py_None) {
+        PyErr_SetString(PyExc_TypeError,
+            "can't send non-None value to a just-started generator");
+        return NULL;
+    }
+
+    Py_XINCREF(tstate->frame);
+    assert(f->f_back == NULL);
+    f->f_back = tstate->frame;
+
+    self->state = GEN_RUNNING;
+    result = Generator_call(self,arg,exc);
+    self->state = GEN_PAUSED;
+
+    assert(f->f_back == tstate->frame);
+    Py_CLEAR(f->f_back);
+
+    /* If the generator just returned (as opposed to yielding), signal
+     * that the generator is exhausted. */
+    if(result && f->f_stacktop == NULL) {
+        if(result == Py_None) {
+            /* Delay exception instantiation if we can */
+            PyErr_SetNone(PyExc_StopIteration);
+        } else {
+            PyObject *e = PyObject_CallFunctionObjArgs(
+                               PyExc_StopIteration, result, NULL);
+            if(e) {
+                PyErr_SetObject(PyExc_StopIteration, e);
+                Py_DECREF(e);
+            }
+        }
+        Py_CLEAR(result);
+    }
+
+    if (!result || f->f_stacktop == NULL) {
+        /* generator can't be rerun, so release the frame */
+        /* first clean reference cycle through stored exception traceback */
+        PyObject *t, *v, *tb;
+        t = f->f_exc_type;
+        v = f->f_exc_value;
+        tb = f->f_exc_traceback;
+        f->f_exc_type = NULL;
+        f->f_exc_value = NULL;
+        f->f_exc_traceback = NULL;
+        Py_XDECREF(t);
+        Py_XDECREF(v);
+        Py_XDECREF(tb);
+        f->f_gen = NULL;
+        Py_DECREF(f);
+    }
+
+    return result;
+}
+
+static PyMethodDef Generator_methods[] = {
+    {"close",(PyCFunction)Generator_close,METH_O,NULL},
+    {NULL}
+};
+
+static PyTypeObject GeneratorType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "nativecompile.pyinternals.Generator", /* tp_name */
+    sizeof(Generator),         /* tp_basicsize */
+    0,                         /* tp_itemsize */
+    (destructor)Generator_dealloc, /* tp_dealloc */
+    0,                         /* tp_print */
+    0,                         /* tp_getattr */
+    0,                         /* tp_setattr */
+    0,                         /* tp_reserved */
+    0,                         /* tp_repr */
+    0,                         /* tp_as_number */
+    0,                         /* tp_as_sequence */
+    0,                         /* tp_as_mapping */
+    0,                         /* tp_hash */
+    0,                         /* tp_call */
+    0,                         /* tp_str */
+    0,                         /* tp_getattro */
+    0,                         /* tp_setattro */
+    0,                         /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_FINALIZE, /* tp_flags */
+    0,                         /* tp_doc */
+    0,                         /* tp_traverse */
+    0,                         /* tp_clear */
+    0,                         /* tp_richcompare */
+    offsetof(Generator,weakrefs), /* tp_weaklistoffset */
+    0,                         /* tp_iter */
+    0,                         /* tp_iternext */
+    Generator_methods,         /* tp_methods */
+    0,                         /* tp_members */
+    0,                         /* tp_getset */
+    0,                         /* tp_base */
+    0,                         /* tp_dict */
+    0,                         /* tp_descr_get */
+    0,                         /* tp_descr_set */
+    0,                         /* tp_dictoffset */
+    0,                         /* tp_init */
+    0,                         /* tp_alloc */
+    0,                         /* tp_new */
+    0,                         /* tp_free */
+    0,                         /* tp_is_gc */
+    0,                         /* tp_bases */
+    0,                         /* tp_mro */
+    0,                         /* tp_cache */
+    0,                         /* tp_subclasses */
+    0,                         /* tp_weaklist */
+    0,                         /* tp_del */
+    0,                         /* tp_version_tag */
+    (destructor)Generator_finalize /* tp_finalize */
+};
+
+static PyObject *Generator_close(Generator *self,PyObject *arg) {
+    PyObject *r;
+
+    if(self->sub_generator) {
+        if(Py_TYPE(self->sub_generator) == &GeneratorType) {
+            r = Generator_close((Generator*)self->sub_generator,NULL);
+        } else {
+            PyObject *m = PyObject_GetAttr(self->sub_generator,str_close);
+            if(!m) {
+                if(!PyErr_ExceptionMatches(PyExc_AttributeError)) PyErr_WriteUnraisable(self->sub_generator);
+                PyErr_Clear();
+                goto no_err;
+            } else {
+                r = PyObject_CallObject(m,NULL);
+                Py_DECREF(m);
+            }
+        }
+        if(r) Py_DECREF(r);
+        else goto err;
+    }
+
+no_err:
+    PyErr_SetNone(PyExc_GeneratorExit);
+err:
+    r = Generator_call(self,Py_None,1);
+    if(r) {
+        Py_DECREF(r);
+        PyErr_SetString(PyExc_RuntimeError,"generator ignored GeneratorExit");
+        return NULL;
+    }
+
+    if(PyErr_ExceptionMatches(PyExc_StopIteration) || PyErr_ExceptionMatches(PyExc_GeneratorExit)) {
+        PyErr_Clear();
+        Py_RETURN_NONE;
+    }
+
+    return NULL;
+}
+
+/* This is called by the generator function after locals have been set up and
+   arguments have been handled */
+static PyObject *new_generator(PyFrameObject *frame,Function *f,size_t stack_size) {
+    Generator *r = PyObject_New(Generator,&GeneratorType);
+    if(!r) return NULL;
+
+    r->stack_size = stack_size;
+    r->state = GEN_INITIAL;
+    r->name = f->name;
+    Py_INCREF(f->name);
+    r->closure = NULL;
+    if(f->closure) {
+        Py_ssize_t c_size = PyTuple_GET_SIZE(f->body->free_names);
+        r->closure = PyMem_Malloc(sizeof(PyObject*) * c_size);
+        while(--c_size >= 0) {
+            r->closure[c_size] = f->closure[c_size];
+            Py_INCREF(f->closure[c_size]);
+        }
+    }
+    r->body = f->body;
+    Py_INCREF(f->body);
+
+    Py_INCREF(Generator_frame(r));
+
+    r->sub_generator = NULL;
+    r->weakrefs = NULL;
+
+    return (PyObject*)r;
+}
+
+
 
 PyDoc_STRVAR(read_address_doc,
 "read_address(address : int,length : int) -> bytes\n\
@@ -883,6 +1161,57 @@ static PyObject *create_cell(PyObject *self,PyObject *args) {
     if(!PyArg_ParseTuple(args,"|O:create_cell",&value)) return NULL;
 
     return PyCell_New(value);
+}
+
+
+PyDoc_STRVAR(set_utility_funcs_doc,
+"set_utility_funcs(value)\n\
+\n\
+Set the dictionary containing utility functions used by compiled Python\n\
+functions.\n\
+");
+
+static PyObject *set_utility_funcs(PyObject *self,PyObject *arg) {
+    PyObject *resume_gen, *resume_gen_str, *code, *offset_obj, *r;
+    Py_ssize_t offset;
+    module_data_t *data = get_module_data_from(self);
+    CompiledCode *old_code = data->resume_gen_code;
+
+    r = code = offset_obj = NULL;
+
+    resume_gen_str = PyUnicode_FromString("resume_generator");
+    if(!resume_gen_str) return NULL;
+    resume_gen = PyObject_GetItem(arg,resume_gen_str);
+    Py_DECREF(resume_gen_str);
+    if(!resume_gen) return NULL;
+
+    code = PyObject_GetAttrString(resume_gen,"code");
+    if(!code) goto end;
+    if(!PyObject_TypeCheck(code,&CompiledCodeType)) {
+        PyErr_SetString(PyExc_TypeError,"value['resume_generator'].code must be an instance of CompiledCode");
+        goto end;
+    }
+
+    offset_obj = PyObject_GetAttrString(resume_gen,"offset");
+    if(!offset_obj) goto end;
+    offset = PyLong_AsSsize_t(offset_obj);
+    if(PyErr_Occurred()) {
+        PyErr_Clear();
+        PyErr_SetString(PyExc_TypeError,"value['resume_generator'].offset must be an integer");
+        goto end;
+    }
+
+    data->resume_gen_code = (CompiledCode*)code;
+    data->resume_gen_offset = offset;
+    code = (PyObject*)old_code;
+
+    r = Py_None;
+    Py_INCREF(r);
+end:
+    Py_XDECREF(code);
+    Py_XDECREF(offset_obj);
+    Py_DECREF(resume_gen);
+    return r;
 }
 
 
@@ -1653,20 +1982,37 @@ _Py_IDENTIFIER(send);
 static PyMethodDef functions[] = {
     {"read_address",read_address,METH_VARARGS,read_address_doc},
     {"create_cell",create_cell,METH_VARARGS,create_cell_doc},
+    {"set_utility_funcs",set_utility_funcs,METH_O,set_utility_funcs_doc},
     {NULL}
 };
+
+void free_module(void *data) {
+    Py_XDECREF(((module_data_t*)data)->resume_gen_code);
+    Py_DECREF(str_close);
+}
 
 static struct PyModuleDef this_module = {
     PyModuleDef_HEAD_INIT,
     "pyinternals",
     NULL,
-    0,
+    sizeof(module_data_t),
     functions,
     NULL,
     NULL,
     NULL,
-    NULL
+    free_module
 };
+
+
+static module_data_t *get_module_data_from(PyObject *m) {
+    assert(m);
+    void *r = PyModule_GetState(m);
+    assert(r);
+    return (module_data_t*)r;
+}
+static module_data_t *get_module_data(void) {
+    return get_module_data_from(PyState_FindModule(&this_module));
+}
 
 
 #define ADD_ADDR(item) {#item,(unsigned long)item}
@@ -1696,57 +2042,68 @@ typedef struct {
 
 static OffsetStruct member_offsets[] = {
     {"PyObject",(OffsetMember[]){
-            M_OFFSET(PyObject,ob_refcnt),
-            M_OFFSET(PyObject,ob_type),
-            {NULL}}},
+        M_OFFSET(PyObject,ob_refcnt),
+        M_OFFSET(PyObject,ob_type),
+        {NULL}}},
     {"PyVarObject",(OffsetMember[]){M_OFFSET(PyVarObject,ob_size),{NULL}}},
     {"PyTypeObject",(OffsetMember[]){
-            M_OFFSET(PyTypeObject,tp_dealloc),
-            M_OFFSET(PyTypeObject,tp_iternext),
-            M_OFFSET(PyTypeObject,tp_flags),
-            {NULL}}},
+        M_OFFSET(PyTypeObject,tp_dealloc),
+        M_OFFSET(PyTypeObject,tp_iternext),
+        M_OFFSET(PyTypeObject,tp_flags),
+        {NULL}}},
     {"PyListObject",(OffsetMember[]){M_OFFSET(PyListObject,ob_item),{NULL}}},
     {"PyTupleObject",(OffsetMember[]){M_OFFSET(PyTupleObject,ob_item),{NULL}}},
     {"PyFrameObject",(OffsetMember[]){
-            M_OFFSET(PyFrameObject,f_back),
-            M_OFFSET(PyFrameObject,f_code),
-            M_OFFSET(PyFrameObject,f_builtins),
-            M_OFFSET(PyFrameObject,f_globals),
-            M_OFFSET(PyFrameObject,f_locals),
-            M_OFFSET(PyFrameObject,f_localsplus),
-            M_OFFSET(PyFrameObject,f_valuestack),
-            M_OFFSET(PyFrameObject,f_stacktop),
-            M_OFFSET(PyFrameObject,f_trace),
-            M_OFFSET(PyFrameObject,f_exc_type),
-            M_OFFSET(PyFrameObject,f_exc_value),
-            M_OFFSET(PyFrameObject,f_exc_traceback),
-            M_OFFSET(PyFrameObject,f_lasti),
-            {NULL}}},
+        M_OFFSET(PyFrameObject,f_back),
+        M_OFFSET(PyFrameObject,f_code),
+        M_OFFSET(PyFrameObject,f_builtins),
+        M_OFFSET(PyFrameObject,f_globals),
+        M_OFFSET(PyFrameObject,f_locals),
+        M_OFFSET(PyFrameObject,f_localsplus),
+        M_OFFSET(PyFrameObject,f_valuestack),
+        M_OFFSET(PyFrameObject,f_stacktop),
+        M_OFFSET(PyFrameObject,f_trace),
+        M_OFFSET(PyFrameObject,f_exc_type),
+        M_OFFSET(PyFrameObject,f_exc_value),
+        M_OFFSET(PyFrameObject,f_exc_traceback),
+        M_OFFSET(PyFrameObject,f_lasti),
+        {NULL}}},
     {"PyThreadState",(OffsetMember[]){
-            M_OFFSET(PyThreadState,frame),
-            M_OFFSET(PyThreadState,curexc_traceback),
-            M_OFFSET(PyThreadState,curexc_value),
-            M_OFFSET(PyThreadState,curexc_type),
-            M_OFFSET(PyThreadState,exc_traceback),
-            M_OFFSET(PyThreadState,exc_value),
-            M_OFFSET(PyThreadState,exc_type),
-            M_OFFSET(PyThreadState,c_tracefunc),
-            M_OFFSET(PyThreadState,c_traceobj),
-            M_OFFSET(PyThreadState,dict),
-            M_OFFSET(PyThreadState,async_exc),
-            M_OFFSET(PyThreadState,thread_id),
-            {NULL}}},
+        M_OFFSET(PyThreadState,frame),
+        M_OFFSET(PyThreadState,curexc_traceback),
+        M_OFFSET(PyThreadState,curexc_value),
+        M_OFFSET(PyThreadState,curexc_type),
+        M_OFFSET(PyThreadState,exc_traceback),
+        M_OFFSET(PyThreadState,exc_value),
+        M_OFFSET(PyThreadState,exc_type),
+        M_OFFSET(PyThreadState,c_tracefunc),
+        M_OFFSET(PyThreadState,c_traceobj),
+        M_OFFSET(PyThreadState,dict),
+        M_OFFSET(PyThreadState,async_exc),
+        M_OFFSET(PyThreadState,thread_id),
+        {NULL}}},
     {"PyCellObject",(OffsetMember[]){M_OFFSET(PyCellObject,ob_ref),{NULL}}},
     {"PyMethodObject",(OffsetMember[]){
-            M_OFFSET(PyMethodObject,im_self),
-            M_OFFSET(PyMethodObject,im_func),
-            {NULL}}},
+        M_OFFSET(PyMethodObject,im_self),
+        M_OFFSET(PyMethodObject,im_func),
+        {NULL}}},
+    {"CompiledCode",(OffsetMember[]){M_OFFSET(CompiledCode,data),{NULL}}},
+    {"FunctionBody",(OffsetMember[]){
+        M_OFFSET(FunctionBody,code),
+        M_OFFSET(FunctionBody,offset),
+        {NULL}}},
     {"Function",(OffsetMember[]){
-            M_OFFSET(Function,name),
-            M_OFFSET(Function,defaults),
-            M_OFFSET(Function,kwdefaults),
-            M_OFFSET(Function,closure),
-            {NULL}}},
+        M_OFFSET(Function,name),
+        M_OFFSET(Function,defaults),
+        M_OFFSET(Function,kwdefaults),
+        M_OFFSET(Function,closure),
+        {NULL}}},
+    {"Generator",(OffsetMember[]){
+        M_OFFSET(Generator,stack_size),
+        M_OFFSET(Generator,stack),
+        M_OFFSET(Generator,offset),
+        M_OFFSET(Generator,body),
+        {NULL}}},
     {NULL}
 };
 
@@ -1763,6 +2120,8 @@ PyInit_pyinternals(void) {
     if(PyType_Ready(&FunctionBodyType) < 0) return NULL;
 
     if(PyType_Ready(&FunctionType) < 0) return NULL;
+
+    if(PyType_Ready(&GeneratorType) < 0) return NULL;
 
     m = PyModule_Create(&this_module);
     if(!m) return NULL;
@@ -1886,6 +2245,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR(_LeaveRecursiveCall),
 
         ADD_ADDR(new_function),
+        ADD_ADDR(new_generator),
         ADD_ADDR(free_pyobj_array),
         ADD_ADDR(missing_arguments),
         ADD_ADDR(too_many_positional),
@@ -1958,6 +2318,11 @@ PyInit_pyinternals(void) {
 
     Py_INCREF(&FunctionType);
     if(PyModule_AddObject(m,"Function",(PyObject*)&FunctionType) == -1) return NULL;
+
+    Py_INCREF(&GeneratorType);
+    if(PyModule_AddObject(m,"Generator",(PyObject*)&GeneratorType) == -1) return NULL;
+
+    if(!(str_close = PyUnicode_FromString("close"))) return NULL;
 
     return m;
 }

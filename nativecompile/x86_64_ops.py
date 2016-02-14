@@ -1,4 +1,4 @@
-#  Copyright 2015 Rouslan Korneychuk
+#  Copyright 2016 Rouslan Korneychuk
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -93,6 +93,8 @@ rip = _Rip()
 
 
 class Address(x86_ops.Address):
+    default_size = SIZE_Q
+
     def __init__(self,offset=0,base=None,index=None,scale=1):
         self.rip = False
         if base is rip:

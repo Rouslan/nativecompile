@@ -1,4 +1,4 @@
-#  Copyright 2015 Rouslan Korneychuk
+#  Copyright 2016 Rouslan Korneychuk
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -100,6 +100,8 @@ Register.__mmtype__ = Register
 
 
 class Address:
+    default_size = SIZE_D
+
     def __init__(self,offset=0,base=None,index=None,scale=1):
         assert scale in (1,2,4,8)
         assert (base is None or base.w) and (index is None or index.w)
@@ -846,7 +848,7 @@ def or_(a : Address,b : Register):
 
 @multimethod
 def or_(a : Register,b : Address):
-    return _op_addr_reg(0b00001000,a,b,False)
+    return _op_addr_reg(0b00001000,b,a,False)
 
 @multimethod
 def or_(a : int,b : Register):
@@ -871,7 +873,7 @@ def pop(x : Register):
 
 @multimethod
 def pop(x : Address):
-    return rex(None,x,False) + b'\x8F' + x.mod_rm_sib_disp(0)
+    return rex(x.default_size,x,False) + b'\x8F' + x.mod_rm_sib_disp(0)
 
 
 
@@ -881,7 +883,7 @@ def push(x : Register):
 
 @multimethod
 def push(x : Address):
-    return rex(None,x,False) + b'\xFF' + x.mod_rm_sib_disp(0b110)
+    return rex(x.default_size,x,False) + b'\xFF' + x.mod_rm_sib_disp(0b110)
 
 @multimethod
 def push(x : int):

@@ -1,4 +1,4 @@
-#  Copyright 2015 Rouslan Korneychuk
+#  Copyright 2016 Rouslan Korneychuk
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -404,7 +404,7 @@ def generate(abi,cu,entry_points):
 
     # adjust the entry points by the code segment's offset
     for e in entry_points:
-        e.func.offset += c_offset
+        e.offset += c_offset
 
     # all addresses refer to the code segment
     for o,a in out.addrs:

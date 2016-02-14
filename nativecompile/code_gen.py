@@ -1,4 +1,4 @@
-#  Copyright 2015 Rouslan Korneychuk
+#  Copyright 2016 Rouslan Korneychuk
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -16,9 +16,7 @@
 import sys
 import operator
 import warnings
-from collections import namedtuple
 from functools import partial,reduce
-from itertools import chain
 
 if __debug__:
     import weakref
@@ -1276,13 +1274,19 @@ class Stitch:
         self.in_elif = in_elif
         self._code = []
 
+        # This attribute holds the largest value of len(self.state.stack) of
+        # all prior values of self.state. Every time self.state is assigned to,
+        # and the current value of self.state is not None, this attribute is
+        # updated to max(self._max_stack,len(self.state.stack)).
+        self._max_stack = 0
+
         # this is True when the last instruction was an unconditional jump
         # (even if that instruction comes from a DelayedCompiled* object and
         # hasn't been generated yet)
         self.last_op_is_uncond_jmp = False
 
         if outer:
-            self.state = outer.state.copy()
+            self._state = outer.state.copy()
             self.state_if = outer.state
             self.cleanup = outer.cleanup
             self.def_stack_offset = outer.def_stack_offset
@@ -1290,15 +1294,29 @@ class Stitch:
 
             self.usable_tmp_regs = outer.usable_tmp_regs
         else:
-            self.state = state or State()
+            self._state = state or State()
             self.state_if = None
             self.cleanup = cleanup or StackCleanup()
             self.def_stack_offset = def_stack_offset or DeferredOffsetBase()
-            self.special_addrs = special_addrs if special_addrs else {}
+            self.special_addrs = special_addrs if special_addrs is not None else {}
 
             self.usable_tmp_regs = list(abi.r_scratch)
             self.usable_tmp_regs.append(abi.r_ret)
             self.usable_tmp_regs.extend(abi.r_pres)
+
+    def get_state(self):
+        return self._state
+
+    def set_state(self,val):
+        if self._state is not None: self._max_stack = max(self._max_stack,len(self._state.stack))
+        self._state = val
+
+    state = property(get_state,set_state)
+
+    @property
+    def max_stack(self):
+        if self._state is not None: return max(self._max_stack,len(self._state.stack))
+        return self._max_stack
 
     def detached_branch(self):
         return Stitch(
@@ -1492,23 +1510,23 @@ class Stitch:
     def branch(self,jmp_target=None,in_elif=False):
         return Stitch(self.abi,self,jmp_target,in_elif)
 
-    def _accommodate_branch(self,stack):
-        if len(stack) > len(self.state.stack):
+    def _accommodate_branch(self,max_stack):
+        if max_stack > len(self.state.stack):
             # the length of the stack array determines how much actual stack
             # space to allocate
-            self.state.stack += [None] * (len(stack) - len(self.state.stack))
+            self.state.stack += [None] * (max_stack - len(self.state.stack))
 
     def end_branch(self):
         last_op_is_uncond_jmp = self.last_op_is_uncond_jmp
         if self.jmp_target: self(self.jmp_target)
 
         self.outer.append(self._code)
-        self.outer._accommodate_branch(self.state.stack)
+        self.outer._accommodate_branch(self.max_stack)
 
         if last_op_is_uncond_jmp:
             self.outer.state = self.state_if
             if self.state_if is None:
-                self.outer.last_of_is_uncond_jmp = True
+                self.outer.last_op_is_uncond_jmp = True
         else:
             assert self.state_if is None or self.state == self.state_if
             self.outer.state = self.state
@@ -1545,8 +1563,6 @@ class Stitch:
         assert self.jmp_target
         e_target = self.jmp_target
         self.jmp_target = JumpTarget()
-
-        self.outer._accommodate_branch(self.state.stack)
 
         if self.last_op_is_uncond_jmp:
             self.state_if = None
@@ -1862,7 +1878,7 @@ class Stitch:
         target = make_value(self,target)
 
         op = self.abi.op.jcc
-        return self(JumpSource(partial(op,test),self.abi,target) if isinstance(target,JumpTarget) else op(test,target))
+        return self(JumpSource(partial(op,test),self.abi,target)) if isinstance(target,JumpTarget) else self.append(op(test,target))
 
     def cmovcc(self,test,a,b):
         test = make_value(self,test)

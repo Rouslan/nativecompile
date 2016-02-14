@@ -1,4 +1,4 @@
-#  Copyright 2015 Rouslan Korneychuk
+#  Copyright 2016 Rouslan Korneychuk
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@
 import ast
 import symtable
 import os
-from collections import OrderedDict
-from functools import partial
+from collections import OrderedDict, namedtuple
+from itertools import chain
 
 from . import astloader
 from . import abi
@@ -54,19 +54,11 @@ BINOP_IFUNCS = {
     ast.BitAnd : 'PyNumber_InPlaceAnd',
     ast.FloorDiv : 'PyNumber_InPlaceFloorDivide'}
 
+utility_funcs = None
+
 
 class SyntaxTreeError(Exception):
     """The abstract syntax tree is malformed or has an incorrect value"""
-
-class UtilityFunctions:
-    def __init__(self):
-        self.local_name = JumpTarget()
-        self.global_name = JumpTarget()
-        self.prepare_exc_handler = JumpTarget()
-        self.reraise_exc_handler = JumpTarget()
-        self.unwind_exc = JumpTarget()
-        self.unwind_finally = JumpTarget()
-        self.swap_exc_state = JumpTarget()
 
 
 def ast_and_symtable_map(code,filename,compile_type):
@@ -147,11 +139,11 @@ class CallTargetAction:
         return isinstance(b,CallTargetAction) and self.target == b.target
 
 class ExprCompiler(ast.NodeVisitor):
-    def __init__(self,abi,s_table=None,s_map=None,util_funcs=None,global_scope=False,entry_points=None):
+    def __init__(self,abi,s_table=None,s_map=None,u_funcs=None,global_scope=False,entry_points=None):
         self.code = Stitch(abi)
         self.stable = s_table
         self.sym_map = s_map
-        self.util_funcs = util_funcs
+        self.u_funcs = u_funcs
         self.global_scope = global_scope
         self.entry_points = entry_points
         self.consts = {}
@@ -469,18 +461,18 @@ class ExprCompiler(ast.NodeVisitor):
                                     'DUPLICATE_VAL_MSG',
                                     c_func_self.name,
                                     name)
-                        (self.exc_cleanup())
+                                (self.exc_cleanup())
                             .endif()
                             .mov(R_RET,self.local_addrs[a.arg])
                             .incref(R_RET)
-                            [mark_hit(name)]
+                            (mark_hit(name))
                         .elif_(not_(self.local_addrs[a.arg]))
                             .if_(signed(len(args.args)-1-i) < def_len)
                                 .mov(default_item,R_RET)
                                 .mov(R_RET,self.local_addrs[a.arg])
                                 .incref(R_RET)
                             .else_()
-                                [mark_miss]
+                                (mark_miss)
                             .endif()
                         .endif())
 
@@ -492,7 +484,7 @@ class ExprCompiler(ast.NodeVisitor):
                 (s
                     .mov(CType('PyVarObject',defaults).ob_size,R_SCRATCH1)
                     .if_(signed(missing_args) > R_SCRATCH1)
-                        [mark_miss]
+                        (mark_miss)
                         .mov(R_SCRATCH1,missing_args)
                     .endif()
                     .mov(len(args.args),R_RET)
@@ -910,6 +902,18 @@ class ExprCompiler(ast.NodeVisitor):
 
         return c
 
+    def test_condition(self,node):
+        test = self.visit(node)
+        self.code.invoke('PyObject_IsTrue',test)
+        test.discard(self.code,preserve_reg=R_RET)
+
+        self.code = (self.code
+            .test(R_RET,R_RET)
+            .if_cond(TEST_L)
+                (self.exc_cleanup())
+            .endif()
+            .if_cond(TEST_NZ))
+
 
     #### VISITOR METHODS ####
 
@@ -993,7 +997,7 @@ class ExprCompiler(ast.NodeVisitor):
     def visit_FunctionDef(self,node):
         body = create_uninitialized(pyinternals.FunctionBody)
 
-        func = compile_eval(node,self.sym_map,self.abi,self.util_funcs,self.entry_points,False,node.name,body,node.args)
+        func = compile_eval(node,self.sym_map,self.abi,self.u_funcs,self.entry_points,False,node.name,body,node.args)
 
         doc = 0
 
@@ -1110,7 +1114,7 @@ class ExprCompiler(ast.NodeVisitor):
             val = self.get_const(None)
 
         for ld in self.code.state.stack:
-            if ld is not None and ld[1]:
+            if ld is not None and ld[0] is not val and ld[1]:
                 ld[0].discard(self.code)
 
         self.code.mov(steal(val),R_RET)
@@ -1210,16 +1214,7 @@ class ExprCompiler(ast.NodeVisitor):
         self.assign_expr(node.target,expr,check_dest=check_dest)
 
     def visit_If(self,node):
-        test = self.visit(node.test)
-        self.code.invoke('PyObject_IsTrue',test)
-        test.discard(self.code,preserve_reg=R_RET)
-
-        self.code = (self.code
-            .test(R_RET,R_RET)
-            .if_cond(TEST_L)
-                (self.exc_cleanup())
-            .endif()
-            .if_cond(TEST_NZ))
+        self.test_condition(node.test)
 
         if_quit = else_quit = False
 
@@ -1473,7 +1468,30 @@ class ExprCompiler(ast.NodeVisitor):
     def visit_Lambda(self,node):
         raise NotImplementedError()
     def visit_IfExp(self,node):
-        raise NotImplementedError()
+        tmp = self.code
+        else_code = self.code = self.code.detached_branch()
+        else_val = self.visit(node.orelse)
+        self.code = tmp
+
+        self.test_condition(node.test)
+
+        if_val = self.visit(node.body)
+
+        owned = False
+        if if_val.owned or else_val.owned:
+            owned = True
+            if_val = steal(if_val)
+            else_val = steal(else_val)
+
+        self.code = (self.code
+                .mov(if_val,R_RET)
+            .else_()
+                .append(else_code.code)
+                .mov(else_val,R_RET)
+            .endif())
+
+        return StackObj(self.code,R_RET,owned=owned)
+
     def visit_Dict(self,node):
         (self.code
             .invoke('_PyDict_NewPresized',len(node.keys))
@@ -1513,7 +1531,7 @@ class ExprCompiler(ast.NodeVisitor):
     def visit_Call(self,node):
         fobj = self.visit(node.func)
 
-        args_obj = None
+        args_obj = 0
         if node.args:
             (self.code
                 .invoke('PyTuple_New',len(node.args))
@@ -1663,11 +1681,12 @@ class ExprCompiler(ast.NodeVisitor):
 
             return StackObj(self.code,r,owned=False)
 
-        self.code.free_regs(R_PRES1,R_PRES3)
+        self.code.free_regs(R_PRES1,R_PRES3,R_RET)
         (self.code
             .mov(self.get_name(node.id),R_PRES1)
             .mov(self.code.special_addrs['frame'],R_PRES3)
-            .inner_call(self.util_funcs.local_name if self.is_local(s) else self.util_funcs.global_name)
+            .mov(self.u_funcs['local_name' if self.is_local(s) else 'global_name'].addr,R_RET)
+            .call(R_RET)
             (self.check_err()))
         return StackObj(self.code,R_RET)
 
@@ -1729,7 +1748,7 @@ def reserve_debug_temps(s):
 
 def simple_frame(func_name):
     def decorator(func_name,f):
-        def inner(abi,end_targets,*extra):
+        def inner(abi):
             s = Stitch(abi)
 
             # the return address added by CALL
@@ -1739,9 +1758,9 @@ def simple_frame(func_name):
             s.reserve_stack()
             reserve_debug_temps(s)
 
-            s = f(s,*extra).release_stack().ret()
+            s = f(s).release_stack().ret()
 
-            r = resolve_jumps(abi.op,destitch(s),end_targets)
+            r = resolve_jumps(abi.op,destitch(s))
             r.name = func_name
             return r
 
@@ -1751,8 +1770,6 @@ def simple_frame(func_name):
 
 @simple_frame('local_name')
 def local_name_func(s):
-    # TODO: have just one copy shared by all compiled modules
-
     # R_PRES1 is expected to have the address of the name to load
     # R_PRES3 is expected to have the address of the frame object
 
@@ -1815,8 +1832,6 @@ def local_name_func(s):
 
 @simple_frame('global_name')
 def global_name_func(s):
-    # TODO: have just one copy shared by all compiled modules
-
     # R_PRES1 is expected to have the address of the name to load
     # R_PRES3 is expected to have the address of the frame object
 
@@ -1857,6 +1872,42 @@ def global_name_func(s):
                 .endif()
             .endif()
             (ret))
+
+def resume_generator_func(abi):
+    # the parameter is expected to be an address to a Generator instance
+
+    s = Stitch(abi)
+
+    # the return address added by CALL
+    s.new_stack_value(True)
+    s.annotation(debug.RETURN_ADDRESS)
+
+    g_reg = s.arg_reg(R_RET,0)
+    generator = CType('Generator',g_reg)
+    body = CType('FunctionBody',R_PRES2)
+    (s
+        .mov(s.func_arg(0),g_reg)
+        .save_reg(R_PRES1)
+        .mov(generator.stack_size,R_SCRATCH1)
+        .save_reg(R_PRES2)
+        .mov(generator.body,R_PRES2)
+        .mov(generator.stack,R_SCRATCH2)
+        .imul(R_SCRATCH1,8,R_PRES1)
+        .save_reg(R_PRES3)
+        .mov(body.code,R_PRES3)
+        .sub(R_PRES1,R_SP)
+        .mov(CType('CompiledCode',R_PRES3).data,R_PRES3)
+        .add(body.offset,R_PRES3)
+        .add(generator.offset,R_PRES3)
+        .do()
+            .sub(1,R_SCRATCH1)
+            .push(addr(0,R_SCRATCH2,R_SCRATCH1,PTR_SIZE))
+        .while_cond(TEST_NZ)
+        .jmp(R_PRES3))
+
+    r = resolve_jumps(abi.op,destitch(s))
+    r.name = 'resume_generator'
+    return r
 
 
 ProtoFunction = namedtuple('ProtoFunction',['name','code'])
@@ -1900,6 +1951,16 @@ class PyFunction:
             self.cells,
             self.consts)
 
+class UtilityFunction:
+    def __init__(self,name,code,offset):
+        self.name = name
+        self.code = code
+        self.offset = offset
+
+    @property
+    def addr(self):
+        return self.code.start_addr + self.offset
+
 
 def func_arg_addr(ec,i):
     r = ec.code.func_arg(i)
@@ -1920,13 +1981,13 @@ def func_arg_bind(ec,arg):
     return BorrowedValue(arg)
 
 
-def compile_eval(scope_ast,sym_map,abi,util_funcs,entry_points,global_scope,name='<module>',fb_obj=None,args=None):
+def compile_eval(scope_ast,sym_map,abi,u_funcs,entry_points,global_scope,name='<module>',fb_obj=None,args=None):
     """Compile scope_ast into an intermediate representation
 
     :type scope_ast: ast.Module | ast.FunctionDef | ast.ClassDef
     :type sym_map: dict[int,symtable.SymbolTable]
     :type abi: abi.Abi
-    :type util_funcs: UtilityFunctions
+    :type u_funcs: dict[str,UtilityFunction]
     :type entry_points: list
     :type global_scope: bool
     :type name: str
@@ -1938,7 +1999,7 @@ def compile_eval(scope_ast,sym_map,abi,util_funcs,entry_points,global_scope,name
     #move_throw_flag = (code.co_flags & CO_GENERATOR and len(abi.r_arg) >= 2)
     mov_throw_flag = False
 
-    ec = ExprCompiler(abi,sym_map[scope_ast._raw_id],sym_map,util_funcs,global_scope,entry_points)
+    ec = ExprCompiler(abi,sym_map[scope_ast._raw_id],sym_map,u_funcs,global_scope,entry_points)
 
     # the stack will have following items:
     #     - return address
@@ -2132,59 +2193,32 @@ def compile_eval(scope_ast,sym_map,abi,util_funcs,entry_points,global_scope,name
     return r
 
 
-def compile_raw(code,abi):
-    assert len(abi.r_scratch) >= 2 and len(abi.r_pres) >= 2
+def compile_utility_funcs_raw(abi):
+    functions = [
+        global_name_func(abi),
+        local_name_func(abi),
+        resume_generator_func(abi)]
 
-    ufuncs = UtilityFunctions()
-    prepare_exc_handler_tail = JumpTarget()
-    unwind_exc_tail = JumpTarget()
+    offset = 0
+    for func in functions:
+        func.offset = offset
+        offset += len(func)
+
+    return CompilationUnit(functions)
+
+
+def compile_raw(code,abi,u_funcs):
+    assert len(abi.r_scratch) >= 2 and len(abi.r_pres) >= 2
 
     entry_points = []
     mod_ast,sym_map = ast_and_symtable_map(code,'<string>','exec')
-    compile_eval(mod_ast,sym_map,abi,ufuncs,entry_points,True)
+    compile_eval(mod_ast,sym_map,abi,u_funcs,entry_points,True)
 
     functions = []
-    end_targets = []
-
-    def add_util_func(target,body,*extra_args):
-        target.displacement = 0
-        functions.insert(0,body(abi,end_targets,*extra_args))
-        end_targets.append(target)
-
-    if ufuncs.swap_exc_state.used:
-        add_util_func(ufuncs.swap_exc_state,swap_exc_state_func)
-
-    if ufuncs.unwind_exc.used or ufuncs.unwind_finally.used:
-        add_util_func(unwind_exc_tail,unwind_exc_func_tail)
-
-    if ufuncs.unwind_exc.used:
-        add_util_func(ufuncs.unwind_exc,unwind_exc_func_head)
-
-    if ufuncs.unwind_finally.used:
-        add_util_func(ufuncs.unwind_finally,unwind_finally_func,unwind_exc_tail)
-
-    if ufuncs.prepare_exc_handler.used or ufuncs.reraise_exc_handler.used:
-        add_util_func(prepare_exc_handler_tail,prepare_exc_handler_func_tail)
-
-    if ufuncs.prepare_exc_handler.used:
-        add_util_func(ufuncs.prepare_exc_handler,prepare_exc_handler_func_head)
-
-    if ufuncs.reraise_exc_handler.used:
-        add_util_func(
-            ufuncs.reraise_exc_handler,
-            reraise_exc_handler_func,
-            prepare_exc_handler_tail)
-
-    if ufuncs.global_name.used:
-        add_util_func(ufuncs.global_name,global_name_func)
-
-    if ufuncs.local_name.used:
-        add_util_func(ufuncs.local_name,local_name_func)
-
 
     for pyfunc in entry_points:
         name,fcode = pyfunc.func
-        pyfunc.func = resolve_jumps(abi.op,fcode,end_targets)
+        pyfunc.func = resolve_jumps(abi.op,fcode)
         pyfunc.func.name = name
         pyfunc.func.pyfunc = True
         pyfunc.func.returns = debug.TPtr(debug.t_void)
@@ -2211,20 +2245,41 @@ def native_abi(*,assembly=False):
     raise Exception("native compilation is not supported on this CPU")
 
 
+def compile_utility_funcs(abi):
+    global utility_funcs
+    if not utility_funcs:
+        utility_cu = compile_utility_funcs_raw(abi)
+
+        if debug.GDB_JIT_SUPPORT:
+            out = debug.generate(abi,utility_cu,utility_cu.functions)
+            if DUMP_OBJ_FILE:
+                with open('OBJ_UTILITY_DUMP_{}'.format(os.getpid()),'wb') as f:
+                    f.write(out.buff.getbuffer())
+        else:
+            out = [f.code for f in utility_cu.functions]
+
+        compiled = pyinternals.CompiledCode(out)
+        utility_funcs = {f.name:UtilityFunction(f.name,compiled,f.offset) for f in utility_cu.functions}
+        pyinternals.set_utility_funcs(utility_funcs)
+    return utility_funcs
+
+
 def compile(code,globals=None):
     """Compile "code" and return a function taking no arguments.
 
-    :type code: str
+    :param str code: A string containing Python code to compile
+    :param globals: A mapping to use as the "globals" object
     :rtype: pyinternals.Function
 
     """
     global DUMP_OBJ_FILE
 
     abi = native_abi()
-    cu,entry_points = compile_raw(code,abi)
+    u_funcs = compile_utility_funcs(abi)
+    cu,entry_points = compile_raw(code,abi,u_funcs)
 
     if debug.GDB_JIT_SUPPORT:
-        out = debug.generate(abi,cu,entry_points)
+        out = debug.generate(abi,cu,(e.func for e in entry_points))
         if DUMP_OBJ_FILE:
             with open('OBJ_DUMP_{}_{}'.format(os.getpid(),int(DUMP_OBJ_FILE)),'wb') as f:
                 f.write(out.buff.getbuffer())
@@ -2262,10 +2317,14 @@ def compile_asm(code):
     :rtype: str
 
     """
+    class DummyUFunc:
+        addr = 0
+
     abi = native_abi(assembly=True)
 
     parts = []
-    for f in compile_raw(code,abi)[0].functions:
+    u_funcs = compile_utility_funcs_raw(abi).functions
+    for f in chain(compile_raw(code,abi,{f.name:DummyUFunc for f in u_funcs})[0].functions,u_funcs):
         if f.name: parts.append(f.name+':')
         parts.append(f.code.dump())
 
