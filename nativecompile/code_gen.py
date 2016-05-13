@@ -1181,6 +1181,9 @@ if __debug__:
         def __hash__(self):
             return hash(self._id)
 
+def reg_dict_eq(a,b):
+    return all(a.get(k) == b.get(k) for k in (a.keys() | b.keys()))
+
 class State:
     def __init__(self,stack=None,regs=None,owned=None,args=0,unreserved_offset=None):
         self.stack = stack if stack is not None else []
@@ -1192,7 +1195,7 @@ class State:
     def __eq__(self,b):
         if isinstance(b,State):
             return (self.stack == b.stack
-                and self.regs == b.regs
+                and reg_dict_eq(self.regs,b.regs)
                 and self.owned_objs == b.owned_objs
                 and self.args == b.args
                 and self.unreserved_offset == b.unreserved_offset)
@@ -1827,8 +1830,11 @@ class Stitch:
         return self.append(deferred_values(self,self.abi.op.call,(func,)))
 
     def invoke(self,func,*args,tmpreg=None):
-        for a in args:
-            self.push_arg(a,tmpreg)
+        # This needs to be done before any arguments are pushed. In debug mode
+        # increasing a reference count involves calling another function.
+        args = [make_value(self,a) for a in args]
+        for i,a in enumerate(args):
+            self.push_arg(a,tmpreg,i)
 
         return self.call(func)
 

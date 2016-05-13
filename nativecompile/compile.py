@@ -21,6 +21,7 @@ from itertools import chain
 
 from . import astloader
 from . import abi
+from . import pyinternals
 from .code_gen import *
 
 
@@ -1360,8 +1361,36 @@ class ExprCompiler(ast.NodeVisitor):
     def visit_Expr(self,node):
         self.visit(node.value).discard(self.code)
 
+    def  _boolop_iteration(self,op,values):
+        if len(values) > 1:
+            val = self.visit(values[0])
+            self.code.invoke('PyObject_IsTrue',val)
+
+            def inner(c):
+                tmp = self.code
+                self.code = c
+                self._boolop_iteration(op,values[1:])
+                self.code = tmp
+
+            (self.code
+                .test(R_RET,R_RET)
+                .if_cond(TEST_L)
+                    (self.exc_cleanup())
+                .endif()
+                .if_cond(TEST_NZ if isinstance(op,ast.Or) else TEST_Z)
+                    .mov(steal(val),R_RET)
+                .else_()
+                    (val.discard)
+                    (inner)
+                .endif())
+        else:
+            val = self.visit(values[0])
+            self.code.mov(steal(val),R_RET)
+
     def visit_BoolOp(self,node):
-        raise NotImplementedError()
+        self._boolop_iteration(node.op,node.values)
+        return StackObj(self.code,R_RET)
+
     def visit_BinOp(self,node):
         # TODO: find out if constant folding is done automatically by Python.
         # If it is, replace this with an assertion. If it isn't, implement a
@@ -1616,7 +1645,8 @@ class ExprCompiler(ast.NodeVisitor):
         return self.get_const(node.s)
 
     def visit_NameConstant(self,node):
-        raise NotImplementedError()
+        return ConstObj(address_of(node.value))
+
     def visit_Ellipsis(self,node):
         return self.get_const(...)
 
