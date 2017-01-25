@@ -1,4 +1,4 @@
-#  Copyright 2015 Rouslan Korneychuk
+#  Copyright 2017 Rouslan Korneychuk
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@
 
 
 import struct
+import collections
+from typing import Union
 
 from . import elf
 from .reloc_buffer import RelocAbsAddress
@@ -35,12 +37,50 @@ COMP_UNIT_HEADER_64_FMT = struct.Struct('<HQB')
 ARANGES_HEADER_64_FMT = struct.Struct('<HQBB')
 
 
-class Enum:
+# we have very specific requirements for our enum class, so we create our own
+# class instead of using the standard enum.Enum
+class _EnumMeta(type):
+    @classmethod
+    def __prepare__(mcs,cls,bases):
+        return collections.OrderedDict()
+
+    def __new__(mcs,cls,bases,namespace):
+        elements_l = []
+        for name,val in namespace.items():
+            if not (hasattr(val,'__get__') or hasattr(val,'__set__') or
+                    hasattr(val,'__delete__') or
+                    (name.startswith('_') and name.endswith('_'))):
+                elements_l.append((name,val))
+
+        for name,x in elements_l:
+            del namespace[name]
+
+        r = super().__new__(mcs,cls,bases,dict(namespace))
+
+        by_val = {}
+        elements = {}
+
+        for name,val in elements_l:
+            if not isinstance(val,tuple):
+                val = (val,)
+
+            e = r(name,*val)
+            elements[name] = by_val.setdefault(e.val,e)
+
+        r._elements_ = elements
+        r._by_val_ = by_val
+        return r
+
+    def __getattr__(cls,item):
+        try:
+            return cls._elements_[item]
+        except KeyError:
+            raise AttributeError(item) from None
+
+class Enum(metaclass=_EnumMeta):
     def __init__(self,name,val):
-        assert isinstance(val,int)
         self.name = name
         self.val = val
-        setattr(self.__class__,name,self)
 
     def __str__(self): return self.name
     def __int__(self): return self.val
@@ -54,7 +94,7 @@ def enc_uleb128(x):
         x >>= 7
         if x: b |= 0x80
         r.append(b)
-        if not x: return r
+        if not x: return bytes(r)
 
 def enc_sleb128(x):
     r = bytearray()
@@ -67,71 +107,70 @@ def enc_sleb128(x):
         else:
             b |= 0x80
         r.append(b)
-    return r
+    return bytes(r)
 
 
-class TAG(Enum): pass
-
-TAG('array_type',0x01)
-TAG('class_type',0x02)
-TAG('entry_point',0x03)
-TAG('enumeration_type',0x04)
-TAG('formal_parameter',0x05)
-TAG('imported_declaration',0x08)
-TAG('label',0x0a)
-TAG('lexical_block',0x0b)
-TAG('member',0x0d)
-TAG('pointer_type',0x0f)
-TAG('reference_type',0x10)
-TAG('compile_unit',0x11)
-TAG('string_type',0x12)
-TAG('structure_type',0x13)
-TAG('subroutine_type',0x15)
-TAG('typedef',0x16)
-TAG('union_type',0x17)
-TAG('unspecified_parameters',0x18)
-TAG('variant',0x19)
-TAG('common_block',0x1a)
-TAG('common_inclusion',0x1b)
-TAG('inheritance',0x1c)
-TAG('inlined_subroutine',0x1d)
-TAG('module',0x1e)
-TAG('ptr_to_member_type',0x1f)
-TAG('set_type',0x20)
-TAG('subrange_type',0x21)
-TAG('with_stmt',0x22)
-TAG('access_declaration',0x23)
-TAG('base_type',0x24)
-TAG('catch_block',0x25)
-TAG('const_type',0x26)
-TAG('constant',0x27)
-TAG('enumerator',0x28)
-TAG('file_type',0x29)
-TAG('friend',0x2a)
-TAG('namelist',0x2b)
-TAG('namelist_item',0x2c)
-TAG('packed_type',0x2d)
-TAG('subprogram',0x2e)
-TAG('template_type_parameter',0x2f)
-TAG('template_value_parameter',0x30)
-TAG('thrown_type',0x31)
-TAG('try_block',0x32)
-TAG('variant_part',0x33)
-TAG('variable',0x34)
-TAG('volatile_type',0x35)
-TAG('dwarf_procedure',0x36)
-TAG('restrict_type',0x37)
-TAG('interface_type',0x38)
-TAG('namespace',0x39)
-TAG('imported_module',0x3a)
-TAG('unspecified_type',0x3b)
-TAG('partial_unit',0x3c)
-TAG('imported_unit',0x3d)
-TAG('condition',0x3f)
-TAG('shared_type',0x40)
-TAG('type_unit',0x41)
-TAG('rvalue_reference_type',0x42)
-TAG('template_alias',0x43)
+class TAG(Enum):
+    array_type = 0x01
+    class_type = 0x02
+    entry_point = 0x03
+    enumeration_type = 0x04
+    formal_parameter = 0x05
+    imported_declaration = 0x08
+    label = 0x0a
+    lexical_block = 0x0b
+    member = 0x0d
+    pointer_type = 0x0f
+    reference_type = 0x10
+    compile_unit = 0x11
+    string_type = 0x12
+    structure_type = 0x13
+    subroutine_type = 0x15
+    typedef = 0x16
+    union_type = 0x17
+    unspecified_parameters = 0x18
+    variant = 0x19
+    common_block = 0x1a
+    common_inclusion = 0x1b
+    inheritance = 0x1c
+    inlined_subroutine = 0x1d
+    module = 0x1e
+    ptr_to_member_type = 0x1f
+    set_type = 0x20
+    subrange_type = 0x21
+    with_stmt = 0x22
+    access_declaration = 0x23
+    base_type = 0x24
+    catch_block = 0x25
+    const_type = 0x26
+    constant = 0x27
+    enumerator = 0x28
+    file_type = 0x29
+    friend = 0x2a
+    namelist = 0x2b
+    namelist_item = 0x2c
+    packed_type = 0x2d
+    subprogram = 0x2e
+    template_type_parameter = 0x2f
+    template_value_parameter = 0x30
+    thrown_type = 0x31
+    try_block = 0x32
+    variant_part = 0x33
+    variable = 0x34
+    volatile_type = 0x35
+    dwarf_procedure = 0x36
+    restrict_type = 0x37
+    interface_type = 0x38
+    namespace = 0x39
+    imported_module = 0x3a
+    unspecified_type = 0x3b
+    partial_unit = 0x3c
+    imported_unit = 0x3d
+    condition = 0x3f
+    shared_type = 0x40
+    type_unit = 0x41
+    rvalue_reference_type = 0x42
+    template_alias = 0x43
 
 
 CHILDREN_yes = b'\1'
@@ -144,6 +183,9 @@ class FORM:
 
     def __str__(self):
         return '{} (DW_{})'.format(self.val,self.__class__.__name__)
+
+    def encode(self,d):
+        raise NotImplementedError()
 
 
 class CLASS_address(FORM): pass
@@ -180,68 +222,125 @@ def get_ref(self,d):
     assert r is not None, 'Only back-references are supported' # for now
     return r
 
-FORM_addr = form('addr',CLASS_address,0x01,(lambda self,d: RelocAbsAddress(self.val)))
-FORM_block2 = form('block2',CLASS_block,0x03,enc_block_n(2))
-FORM_block4 = form('block4',CLASS_block,0x04,enc_block_n(4))
-FORM_data2 = form('data2',CLASS_constant,0x05,(lambda self,d: d.mode.enc_int(self.val,2)))
-FORM_data4 = form('data4',CLASS_constant,0x06,(lambda self,d: d.mode.enc_int(self.val,4)))
-FORM_data8 = form('data8',CLASS_constant,0x07,(lambda self,d: d.mode.enc_int(self.val,8)))
-FORM_block = form('block',CLASS_block,0x09,enc_block)
-FORM_block1 = form('block1',CLASS_block,0x0a,enc_block_n(1))
-FORM_data1 = form('data1',CLASS_constant,0x0b,(lambda self,d: d.mode.enc_int(self.val,1)))
-FORM_flag = form('flag',CLASS_flag,0x0c,(lambda self,d: b'\1' if self.val else b'\0'))
-FORM_strp = form('strp',CLASS_string,0x0e,enc_ref)
-FORM_sdata = form('sdata',CLASS_constant,0x0d,(lambda self,d: enc_sleb128(self.val)))
-FORM_udata = form('udata',CLASS_constant,0x0f,(lambda self,d: enc_uleb128(self.val)))
-FORM_ref1 = form('ref1',CLASS_reference,0x11,(lambda self,d: d.mode.enc_int(get_ref(self,d),1)))
-FORM_ref2 = form('ref2',CLASS_reference,0x12,(lambda self,d: d.mode.enc_int(get_ref(self,d),2)))
-FORM_ref4 = form('ref4',CLASS_reference,0x13,(lambda self,d: d.mode.enc_int(get_ref(self,d),4)))
-FORM_ref8 = form('ref8',CLASS_reference,0x14,(lambda self,d: d.mode.enc_int(get_ref(self,d),8)))
-FORM_ref_udata = form('ref_udata',CLASS_reference,0x15,(lambda self,d: enc_uleb128(get_ref(self,d))))
+class FORM_addr(CLASS_address):
+    index = 0x01
+    def encode(self,d): return RelocAbsAddress(self.val)
+
+class FORM_block2(CLASS_block):
+    index = 0x03
+    encode = enc_block_n(2)
+
+class FORM_block4(CLASS_block):
+    index = 0x04
+    encode = enc_block_n(4)
+
+class FORM_data2(CLASS_constant):
+    index = 0x05
+    def encode(self,d): return d.mode.enc_int(self.val,2)
+
+class FORM_data4(CLASS_constant):
+    index = 0x06
+    def encode(self,d): return d.mode.enc_int(self.val,4)
+
+class FORM_data8(CLASS_constant):
+    index = 0x07
+    def encode(self,d): return d.mode.enc_int(self.val,8)
+
+class FORM_block(CLASS_block):
+    index = 0x09
+    encode = enc_block
+
+class FORM_block1(CLASS_block):
+    index = 0x0a
+    encode = enc_block_n(1)
+
+class FORM_data1(CLASS_constant):
+    index = 0x0b
+    def encode(self,d): return d.mode.enc_int(self.val,1)
+
+class FORM_flag(CLASS_flag):
+    index = 0x0c
+    def encode(self,d): return b'\1' if self.val else b'\0'
+
+class FORM_strp(CLASS_string):
+    index =  0x0e
+    encode = enc_ref
+
+class FORM_sdata(CLASS_constant):
+    index = 0x0d
+    def encode(self,d): return enc_sleb128(self.val)
+
+class FORM_udata(CLASS_constant):
+    index = 0x0f
+    def encode(self,d): return enc_uleb128(self.val)
+
+class FORM_ref1(CLASS_reference):
+    index = 0x11
+    def encode(self,d): return d.mode.enc_int(get_ref(self,d),1)
+
+class FORM_ref2(CLASS_reference):
+    index = 0x12
+    def encode(self,d): return d.mode.enc_int(get_ref(self,d),2)
+
+class FORM_ref4(CLASS_reference):
+    index = 0x13
+    def encode(self,d): return d.mode.enc_int(get_ref(self,d),4)
+
+class FORM_ref8(CLASS_reference):
+    index = 0x14
+    def encode(self,d): return d.mode.enc_int(get_ref(self,d),8)
+
+class FORM_ref_udata(CLASS_reference):
+    index = 0x15
+    def encode(self,d): return enc_uleb128(get_ref(self,d))
 
 
 SEC_OFFSET_CLASSES = CLASS_lineptr,CLASS_loclistptr,CLASS_macptr,CLASS_rangelistptr
 
-class FORM_sec_offset():
+class FORM_sec_offset:
     index = 0x17
-
-    def __init__(self,val):
-        self.val = val
 
     def encode(self,d):
         return d.mode.enc_int(d.sec_offset_maps[self.sec_offset_index][self],d.mode.ref_size)
 
 class FORM_line_offset(FORM_sec_offset,CLASS_lineptr):
+    sec_offset_index = 0
+
     def __init__(self,val):
         assert False,'Not implemented'
 
 class FORM_loclist_offset(FORM_sec_offset,CLASS_loclistptr):
+    sec_offset_index = 1
+
     def values(self,op):
         return self.val(op)
 
 class FORM_mac_offset(FORM_sec_offset,CLASS_macptr):
+    sec_offset_index = 2
+
     def __init__(self,val):
         assert False,'Not implemented'
 
 class FORM_rangelist_offset(FORM_sec_offset,CLASS_rangelistptr):
+    sec_offset_index = 3
+
     def values(self):
         return self.val()
 
 SEC_OFFSET_FORMS = FORM_line_offset,FORM_loclist_offset,FORM_mac_offset,FORM_rangelist_offset
-for i,sof in enumerate(SEC_OFFSET_FORMS):
-    sof.sec_offset_index = i
 
 
-FORM_exprloc = form('exprloc',CLASS_exprloc,0x18,enc_block)
+class FORM_exprloc(CLASS_exprloc):
+    index = 0x18
+    encode = enc_block
 
 # special case: no value
 class FORM_flag_present(CLASS_flag):
     index = 0x19
     def __init__(self):
-        self.val = None
+        super().__init__(None)
 
-    def encode(self,e):
-        return b''
+    def encode(self,d): return b''
 
 
 def smallest_block_form(val):
@@ -254,122 +353,122 @@ def smallest_block_form(val):
 class ATE(Enum,FORM_data1):
     __init__ = Enum.__init__
 
-ATE('address',0x01)
-ATE('boolean',0x02)
-ATE('complex_float',0x03)
-ATE('float',0x04)
-ATE('signed',0x05)
-ATE('signed_char',0x06)
-ATE('unsigned',0x07)
-ATE('unsigned_char',0x08)
-ATE('imaginary_float',0x09)
-ATE('packed_decimal',0x0a)
-ATE('numeric_string',0x0b)
-ATE('edited',0x0c)
-ATE('signed_fixed',0x0d)
-ATE('unsigned_fixed',0x0e)
-ATE('decimal_float',0x0f)
-ATE('UTF',0x10)
+    address = 0x01
+    boolean = 0x02
+    complex_float = 0x03
+    float = 0x04
+    signed = 0x05
+    signed_char = 0x06
+    unsigned = 0x07
+    unsigned_char = 0x08
+    imaginary_float = 0x09
+    packed_decimal = 0x0a
+    numeric_string = 0x0b
+    edited = 0x0c
+    signed_fixed = 0x0d
+    unsigned_fixed = 0x0e
+    decimal_float = 0x0f
+    UTF = 0x10
 
 
 class AT(Enum):
     def __init__(self,name,val,types):
-        super().__init__(name,val)
+        Enum.__init__(self,name,val)
         self.types = types
 
 # hooray for sed
-AT('sibling',0x01,CLASS_reference)
-AT('location',0x02,(CLASS_exprloc,CLASS_loclistptr))
-AT('name',0x03,CLASS_string)
-AT('ordering',0x09,CLASS_constant)
-AT('byte_size',0x0b,(CLASS_constant,CLASS_exprloc,CLASS_reference))
-AT('bit_offset',0x0c,(CLASS_constant,CLASS_exprloc,CLASS_reference))
-AT('bit_size',0x0d,(CLASS_constant,CLASS_exprloc,CLASS_reference))
-AT('stmt_list',0x10,CLASS_lineptr)
-AT('low_pc',0x11,CLASS_address)
-AT('high_pc',0x12,(CLASS_address,CLASS_constant))
-AT('language',0x13,CLASS_constant)
-AT('discr',0x15,CLASS_reference)
-AT('discr_value',0x16,CLASS_constant)
-AT('visibility',0x17,CLASS_constant)
-AT('import',0x18,CLASS_reference)
-AT('string_length',0x19,(CLASS_exprloc,CLASS_loclistptr))
-AT('common_reference',0x1a,CLASS_reference)
-AT('comp_dir',0x1b,CLASS_string)
-AT('const_value',0x1c,(CLASS_block,CLASS_constant,CLASS_string))
-AT('containing_type',0x1d,CLASS_reference)
-AT('default_value',0x1e,CLASS_reference)
-AT('inline',0x20,CLASS_constant)
-AT('is_optional',0x21,CLASS_flag)
-AT('lower_bound',0x22,(CLASS_constant,CLASS_exprloc,CLASS_reference))
-AT('producer',0x25,CLASS_string)
-AT('prototyped',0x27,CLASS_flag)
-AT('return_addr',0x2a,(CLASS_exprloc,CLASS_loclistptr))
-AT('start_scope',0x2c,(CLASS_constant,CLASS_rangelistptr))
-AT('bit_stride',0x2e,(CLASS_constant,CLASS_exprloc,CLASS_reference))
-AT('upper_bound',0x2f,(CLASS_constant,CLASS_exprloc,CLASS_reference))
-AT('abstract_origin',0x31,CLASS_reference)
-AT('accessibility',0x32,CLASS_constant)
-AT('address_class',0x33,CLASS_constant)
-AT('artificial',0x34,CLASS_flag)
-AT('base_types',0x35,CLASS_reference)
-AT('calling_convention',0x36,CLASS_constant)
-AT('count',0x37,(CLASS_constant,CLASS_exprloc,CLASS_reference))
-AT('data_member_location',0x38,(CLASS_constant,CLASS_exprloc,CLASS_loclistptr))
-AT('decl_column',0x39,CLASS_constant)
-AT('decl_file',0x3a,CLASS_constant)
-AT('decl_line',0x3b,CLASS_constant)
-AT('declaration',0x3c,CLASS_flag)
-AT('discr_list',0x3d,CLASS_block)
-AT('encoding',0x3e,CLASS_constant)
-AT('external',0x3f,CLASS_flag)
-AT('frame_base',0x40,(CLASS_exprloc,CLASS_loclistptr))
-AT('friend',0x41,CLASS_reference)
-AT('identifier_case',0x42,CLASS_constant)
-AT('macro_info',0x43,CLASS_macptr)
-AT('namelist_item',0x44,CLASS_reference)
-AT('priority',0x45,CLASS_reference)
-AT('segment',0x46,(CLASS_exprloc,CLASS_loclistptr))
-AT('specification',0x47,CLASS_reference)
-AT('static_link',0x48,(CLASS_exprloc,CLASS_loclistptr))
-AT('type',0x49,CLASS_reference)
-AT('use_location',0x4a,(CLASS_exprloc,CLASS_loclistptr))
-AT('variable_parameter',0x4b,CLASS_flag)
-AT('virtuality',0x4c,CLASS_constant)
-AT('vtable_elem_location',0x4d,(CLASS_exprloc,CLASS_loclistptr))
-AT('allocated',0x4e,(CLASS_constant,CLASS_exprloc,CLASS_reference))
-AT('associated',0x4f,(CLASS_constant,CLASS_exprloc,CLASS_reference))
-AT('data_location',0x50,CLASS_exprloc)
-AT('byte_stride',0x51,(CLASS_constant,CLASS_exprloc,CLASS_reference))
-AT('entry_pc',0x52,CLASS_address)
-AT('use_UTF8',0x53,CLASS_flag)
-AT('extension',0x54,CLASS_reference)
-AT('ranges',0x55,CLASS_rangelistptr)
-AT('trampoline',0x56,(CLASS_address,CLASS_flag,CLASS_reference,CLASS_string))
-AT('call_column',0x57,CLASS_constant)
-AT('call_file',0x58,CLASS_constant)
-AT('call_line',0x59,CLASS_constant)
-AT('description',0x5a,CLASS_string)
-AT('binary_scale',0x5b,CLASS_constant)
-AT('decimal_scale',0x5c,CLASS_constant)
-AT('small',0x5d,CLASS_reference)
-AT('decimal_sign',0x5e,CLASS_constant)
-AT('digit_count',0x5f,CLASS_constant)
-AT('picture_string',0x60,CLASS_string)
-AT('mutable',0x61,CLASS_flag)
-AT('threads_scaled',0x62,CLASS_flag)
-AT('explicit',0x63,CLASS_flag)
-AT('object_pointer',0x64,CLASS_reference)
-AT('endianity',0x65,CLASS_constant)
-AT('elemental',0x66,CLASS_flag)
-AT('pure',0x67,CLASS_flag)
-AT('recursive',0x68,CLASS_flag)
-AT('signature',0x69,CLASS_reference)
-AT('main_subprogram',0x6a,CLASS_flag)
-AT('data_bit_offset',0x6b,CLASS_constant)
-AT('const_expr',0x6c,CLASS_flag)
-AT('enum_class',0x6d,CLASS_flag)
-AT('linkage_name',0x6e,CLASS_string)
+    sibling = 0x01,CLASS_reference
+    location = 0x02,(CLASS_exprloc,CLASS_loclistptr)
+    name = 0x03,CLASS_string
+    ordering = 0x09,CLASS_constant
+    byte_size = 0x0b,(CLASS_constant,CLASS_exprloc,CLASS_reference)
+    bit_offset = 0x0c,(CLASS_constant,CLASS_exprloc,CLASS_reference)
+    bit_size = 0x0d,(CLASS_constant,CLASS_exprloc,CLASS_reference)
+    stmt_list = 0x10,CLASS_lineptr
+    low_pc = 0x11,CLASS_address
+    high_pc = 0x12,(CLASS_address,CLASS_constant)
+    language = 0x13,CLASS_constant
+    discr = 0x15,CLASS_reference
+    discr_value = 0x16,CLASS_constant
+    visibility = 0x17,CLASS_constant
+    import_ = 0x18,CLASS_reference
+    string_length = 0x19,(CLASS_exprloc,CLASS_loclistptr)
+    common_reference = 0x1a,CLASS_reference
+    comp_dir = 0x1b,CLASS_string
+    const_value = 0x1c,(CLASS_block,CLASS_constant,CLASS_string)
+    containing_type = 0x1d,CLASS_reference
+    default_value = 0x1e,CLASS_reference
+    inline = 0x20,CLASS_constant
+    is_optional = 0x21,CLASS_flag
+    lower_bound = 0x22,(CLASS_constant,CLASS_exprloc,CLASS_reference)
+    producer = 0x25,CLASS_string
+    prototyped = 0x27,CLASS_flag
+    return_addr = 0x2a,(CLASS_exprloc,CLASS_loclistptr)
+    start_scope = 0x2c,(CLASS_constant,CLASS_rangelistptr)
+    bit_stride = 0x2e,(CLASS_constant,CLASS_exprloc,CLASS_reference)
+    upper_bound = 0x2f,(CLASS_constant,CLASS_exprloc,CLASS_reference)
+    abstract_origin = 0x31,CLASS_reference
+    accessibility = 0x32,CLASS_constant
+    address_class = 0x33,CLASS_constant
+    artificial = 0x34,CLASS_flag
+    base_types = 0x35,CLASS_reference
+    calling_convention = 0x36,CLASS_constant
+    count = 0x37,(CLASS_constant,CLASS_exprloc,CLASS_reference)
+    data_member_location = 0x38,(CLASS_constant,CLASS_exprloc,CLASS_loclistptr)
+    decl_column = 0x39,CLASS_constant
+    decl_file = 0x3a,CLASS_constant
+    decl_line = 0x3b,CLASS_constant
+    declaration = 0x3c,CLASS_flag
+    discr_list = 0x3d,CLASS_block
+    encoding = 0x3e,CLASS_constant
+    external = 0x3f,CLASS_flag
+    frame_base = 0x40,(CLASS_exprloc,CLASS_loclistptr)
+    friend = 0x41,CLASS_reference
+    identifier_case = 0x42,CLASS_constant
+    macro_info = 0x43,CLASS_macptr
+    namelist_item = 0x44,CLASS_reference
+    priority = 0x45,CLASS_reference
+    segment = 0x46,(CLASS_exprloc,CLASS_loclistptr)
+    specification = 0x47,CLASS_reference
+    static_link = 0x48,(CLASS_exprloc,CLASS_loclistptr)
+    type = 0x49,CLASS_reference
+    use_location = 0x4a,(CLASS_exprloc,CLASS_loclistptr)
+    variable_parameter = 0x4b,CLASS_flag
+    virtuality = 0x4c,CLASS_constant
+    vtable_elem_location = 0x4d,(CLASS_exprloc,CLASS_loclistptr)
+    allocated = 0x4e,(CLASS_constant,CLASS_exprloc,CLASS_reference)
+    associated = 0x4f,(CLASS_constant,CLASS_exprloc,CLASS_reference)
+    data_location = 0x50,CLASS_exprloc
+    byte_stride = 0x51,(CLASS_constant,CLASS_exprloc,CLASS_reference)
+    entry_pc = 0x52,CLASS_address
+    use_UTF8 = 0x53,CLASS_flag
+    extension = 0x54,CLASS_reference
+    ranges = 0x55,CLASS_rangelistptr
+    trampoline = 0x56,(CLASS_address,CLASS_flag,CLASS_reference,CLASS_string)
+    call_column = 0x57,CLASS_constant
+    call_file = 0x58,CLASS_constant
+    call_line = 0x59,CLASS_constant
+    description = 0x5a,CLASS_string
+    binary_scale = 0x5b,CLASS_constant
+    decimal_scale = 0x5c,CLASS_constant
+    small = 0x5d,CLASS_reference
+    decimal_sign = 0x5e,CLASS_constant
+    digit_count = 0x5f,CLASS_constant
+    picture_string = 0x60,CLASS_string
+    mutable = 0x61,CLASS_flag
+    threads_scaled = 0x62,CLASS_flag
+    explicit = 0x63,CLASS_flag
+    object_pointer = 0x64,CLASS_reference
+    endianity = 0x65,CLASS_constant
+    elemental = 0x66,CLASS_flag
+    pure = 0x67,CLASS_flag
+    recursive = 0x68,CLASS_flag
+    signature = 0x69,CLASS_reference
+    main_subprogram = 0x6a,CLASS_flag
+    data_bit_offset = 0x6b,CLASS_constant
+    const_expr = 0x6c,CLASS_flag
+    enum_class = 0x6d,CLASS_flag
+    linkage_name = 0x6e,CLASS_string
 
 
 def op_method(code,enc1=None,enc2=None):
@@ -402,7 +501,7 @@ def op_indexed(code):
     return staticmethod(inner)
 
 class OP:
-    def __init__(self,mode):
+    def __init__(self,mode : 'Mode') -> None:
         self.mode = mode
 
     addr = op_native_val(0x03)
@@ -449,25 +548,27 @@ class OP:
     ne = op_method(0x2e)
 
     @staticmethod
-    def lit(index):
+    def lit(index : int) -> bytes:
         assert 0 <= index <= 31
         return bytes((0x30 + index,))
 
     @staticmethod
-    def reg(index):
+    def reg(index : Union[int,'Register']) -> bytes:
         if isinstance(index,Register): index = int(index)
         assert 0 <= index <= 31
         return bytes((0x50 + index,))
 
-    @staticmethod
-    def breg(index,offset):
+    @classmethod
+    def breg(cls,index : Union[int,'Register'],offset : int) -> bytes:
         if isinstance(index,Register): index = int(index)
-        assert 0 <= index <= 31
-        return bytes((0x70 + index,)) + enc_sleb128(offset)
+        if 0 <= index <= 31:
+            return bytes((0x70 + index,)) + enc_sleb128(offset)
+
+        return cls._bregx(index,offset)
 
     regx = op_method(0x90,enc_reg)
     fbreg = op_method(0x91,enc_sleb128)
-    bregx = op_method(0x92,enc_reg,enc_sleb128)
+    _bregx = op_method(0x92,enc_reg,enc_sleb128)
     piece = op_method(0x93,enc_uleb128)
     deref_size = op_constant(0x94,1,False)
     xderef_size = op_constant(0x95,1,False)
@@ -485,7 +586,7 @@ class OP:
 
     # helper methods:
 
-    def const_int(self,val):
+    def const_int(self,val : int) -> bytes:
         """Return the most compact representation of the constant 'val'."""
         # actually, some values can probably be represented more compactly
         # using leb128 instead of the smallest fitting const- method, but that
@@ -512,22 +613,22 @@ class OP:
 
 
 class CFA:
-    def __init__(self,mode):
+    def __init__(self,mode : 'Mode') -> None:
         self.mode = mode
 
     @staticmethod
-    def advance_loc(val):
+    def advance_loc(val : int) -> bytes:
         assert 0 <= val < (1<<6)
         return bytes(((1<<6) | val,))
 
     @staticmethod
-    def offset(reg,offset):
+    def offset(reg : 'Register',offset) -> bytes:
         reg = int(reg)
         assert 0 <= reg < (1<<6)
         return bytes(((2<<6) | reg,)) + enc_uleb128(offset)
 
     @staticmethod
-    def restore(reg):
+    def restore(reg : 'Register') -> bytes:
         reg = int(reg)
         assert 0 <= reg < (1<<6)
         return bytes(((3<<6) | reg,))
@@ -558,7 +659,7 @@ class CFA:
 
     # helper methods:
 
-    def advance_loc_smallest(self,amount):
+    def advance_loc_smallest(self,amount : int) -> bytes:
         if amount < (1 << 6):
             return self.advance_loc(amount)
         if amount <= 0xff:
@@ -578,48 +679,83 @@ class CFA:
 
 class Register(Enum): pass
 
-class Reg32(Register): pass
+class Reg32(Register):
+    eax = 0
+    ecx = 1
+    edx = 2
+    ebx = 3
+    esp = 4
+    _sp = esp
+    ebp = 5
+    _bp = ebp
+    esi = 6
+    edi = 7
+    RA = 8
+    eFLAGS = 9
+    _FLAGS = eFLAGS
+    st0 = 16
+    st1 = 17
+    st2 = 18
+    st3 = 19
+    st4 = 20
+    st5 = 21
+    st6 = 22
+    st7 = 23
+    xmm0 = 32
+    xmm1 = 33
+    xmm2 = 34
+    xmm3 = 35
+    xmm4 = 36
+    xmm5 = 37
+    xmm6 = 38
+    xmm7 = 39
 
-Reg32('eax',0)
-Reg32('ecx',1)
-Reg32('edx',2)
-Reg32('ebx',3)
-Reg32('esp',4)
-Reg32._sp = Reg32.esp
-Reg32('ebp',5)
-Reg32._bp = Reg32.ebp
-Reg32('esi',6)
-Reg32('edi',7)
-Reg32('RA',8)
-Reg32('eFLAGS',9)
-Reg32._FLAGS = Reg32.eFLAGS
-for i in range(8):
-    Reg32('st' + str(i),i + 16)
-for i in range(8):
-    Reg32('xmm' + str(i),i + 32)
-
-
-class Reg64(Register): pass
-
-Reg64('rax',0)
-Reg64('rdx',1)
-Reg64('rcx',2)
-Reg64('rbx',3)
-Reg64('rsi',4)
-Reg64('rdi',5)
-Reg64('rbp',6)
-Reg64._bp = Reg64.rbp
-Reg64('rsp',7)
-Reg64._sp = Reg64.rsp
-for i in range(8,16):
-    Reg64('r' + str(i),i)
-Reg64('RA',16)
-for i in range(16):
-    Reg64('xmm' + str(i),i + 17)
-for i in range(8):
-    Reg64('st' + str(i),i + 33)
-Reg64('rFLAGS',49)
-Reg64._FLAGS = Reg64.rFLAGS
+class Reg64(Register):
+    rax = 0
+    rdx = 1
+    rcx = 2
+    rbx = 3
+    rsi = 4
+    rdi = 5
+    rbp = 6
+    _bp = rbp
+    rsp = 7
+    _sp = rsp
+    r8 = 8
+    r9 = 9
+    r10 = 10
+    r11 = 11
+    r12 = 12
+    r13 = 13
+    r14 = 14
+    r15 = 15
+    RA = 16
+    xmm0 = 17
+    xmm1 = 18
+    xmm2 = 19
+    xmm3 = 20
+    xmm4 = 21
+    xmm5 = 22
+    xmm6 = 23
+    xmm7 = 24
+    xmm8 = 25
+    xmm9 = 26
+    xmm10 = 27
+    xmm11 = 28
+    xmm12 = 29
+    xmm13 = 30
+    xmm14 = 31
+    xmm15 = 32
+    st0 = 33
+    st1 = 34
+    st2 = 35
+    st3 = 36
+    st4 = 37
+    st5 = 38
+    st6 = 39
+    st7 = 40
+    rFLAGS = 49
+    _FLAGS = rFLAGS
 
 
 def reg(mode):
@@ -629,11 +765,11 @@ def reg(mode):
 class CC(Enum,FORM_data1):
     __init__ = Enum.__init__
 
-CC('normal',1)
-CC('program',2)
-CC('nocall',3)
-# lo_user = 0x40
-# hi_user = 0xff
+    normal = 1
+    program = 2
+    nocall = 3
+    lo_user = 0x40
+    hi_user = 0xff
 
 
 class StringTable:
@@ -666,12 +802,12 @@ class StringTable:
 class DIE:
     """A DWARF debugging information entry."""
 
-    def __init__(self,tag,**attrvals):
+    def __init__(self,tag : Union[str,TAG],**attrvals) -> None:
         if isinstance(tag,str):
             try:
-                tag = getattr(TAG,tag)
-            except AttributeError:
-                raise ValueError('"{}" is not a DWARF tag'.format(tag))
+                tag = TAG._elements_[tag]
+            except KeyError as e:
+                raise ValueError('"{}" is not a DWARF tag'.format(tag)) from e
 
         self.__dict__['tag'] = tag
         self.__dict__['children'] = []
@@ -681,15 +817,35 @@ class DIE:
             self.__setattr__(n,v)
 
     def __getattr__(self,name):
-        return self.attr[getattr(AT,name)]
+        try:
+            return self.attr[AT._elements_[name]]
+        except KeyError as e:
+            raise AttributeError(name) from e
 
     def __setattr__(self,name,value):
-        at = getattr(AT,name)
-        assert isinstance(value,at.types)
+        try:
+            at = AT._elements_[name]
+        except KeyError as e:
+            raise AttributeError(name) from e
+
+        if not isinstance(value,at.types):
+            if isinstance(at.types,tuple):
+                assert len(at.types)
+                if len(at.types) > 1:
+                    what = '{} or {}'.format(', '.join(t.__name__ for t in at.types[0:-1]),at.types[-1].__name__)
+                else:
+                    what = at.types[0].__name__
+            else:
+                what = at.types.__name__
+            raise TypeError('{} must be an instance of {}'.format(name,what))
+
         self.attr[at] = value
 
     def __delattr__(self,name):
-        del self.attr[getattr(AT,name)]
+        try:
+            del self.attr[getattr(AT,name)]
+        except KeyError as e:
+            raise AttributeError(name) from e
 
     def signature(self):
         return self.tag,tuple((n,v.index) for n,v in self.attr.items())
@@ -739,7 +895,7 @@ def sized_section(f):
         else:
             # values 0xfffffff0 to 0xffffffff have special meaning
             if size >= 0xfffffff0:
-                raise Exception('The debug information is too large to be encoded in one section')
+                raise ValueError('The debug information is too large to be encoded in one section')
 
             out.write(COMP_UNIT_SIZE_32_FMT.pack(size))
 

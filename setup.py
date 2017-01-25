@@ -1,4 +1,4 @@
-#  Copyright 2015 Rouslan Korneychuk
+#  Copyright 2017 Rouslan Korneychuk
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -67,7 +67,7 @@ with open('README') as rfile:
 
 setup(
     name='NativeCompile',
-    version='0.2.0',
+    version='0.3.0',
     description='Compile Python code into native machine code',
     long_description=readme,
     author='Rouslan Korneychuk',
@@ -87,6 +87,7 @@ setup(
     ext_modules=[
         Extension('nativecompile.pyinternals',['nativecompile/pyinternals.c']),
         Extension('nativecompile.astloader',[DUMMY_PATH])],
+    install_requires=['typing>=3.5.3'],
     zip_safe=True,
     cmdclass={'build_ext':CustomBuildExt})
 

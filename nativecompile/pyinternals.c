@@ -173,7 +173,7 @@ void unregister_gdb(const void *addr) {
 #endif
 
 
-PyObject *str_close;
+PyObject *str_close=NULL;
 
 
 struct _CompiledCode;
@@ -716,7 +716,7 @@ static PyObject *Function_new(PyTypeObject *type,PyObject *args,PyObject *kwds) 
 
     static char *kwlist[] = {"body","name","globals","doc","defaults","kwdefaults","closure","annotations",NULL};
 
-    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O!UO!|OO!O!O!",kwlist,
+    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O!UO!|OO!O!O!O!",kwlist,
             &FunctionBodyType,&body,
             &name,
             &PyDict_Type,&globals,
@@ -2322,7 +2322,11 @@ PyInit_pyinternals(void) {
     Py_INCREF(&GeneratorType);
     if(PyModule_AddObject(m,"Generator",(PyObject*)&GeneratorType) == -1) return NULL;
 
-    if(!(str_close = PyUnicode_FromString("close"))) return NULL;
+    if(!str_close) {
+        if(!(str_close = PyUnicode_FromString("close"))) return NULL;
+    } else {
+        Py_INCREF(str_close);
+    }
 
     return m;
 }

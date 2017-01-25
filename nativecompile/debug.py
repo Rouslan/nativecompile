@@ -1,4 +1,4 @@
-#  Copyright 2016 Rouslan Korneychuk
+#  Copyright 2017 Rouslan Korneychuk
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 #  limitations under the License.
 
 
-import collections
 from itertools import groupby
 
 from . import pyinternals
@@ -24,35 +23,29 @@ from .reloc_buffer import RelocBuffer
 
 GDB_JIT_SUPPORT = getattr(pyinternals,'GDB_JIT_SUPPORT',False)
 
-InnerAnnotation = collections.namedtuple('InnerAnnotation','stack descr')
+FUNC_PARAMS = ('__f',)
 
 # we want a mutable "size"
 class Annotation:
-    __slots__ = 'stack','descr','size'
+    __slots__ = 'descr','size'
 
-    def __init__(self,i_annot,size):
-        self.stack,self.descr = i_annot
+    def __init__(self,descr,size):
+        self.descr = descr
         self.size = size
 
-    @staticmethod
-    def mergable(a,b):
-        return a.descr is None and b.descr is None and a.stack == b.stack
-
-
-def annotate(stack,descr=None):
-    return [InnerAnnotation(stack,descr)] if GDB_JIT_SUPPORT else []
-
-
-def append_annot(seq,item):
-    if item.size:
-        if seq and Annotation.mergable(seq[-1],item):
-            seq[-1].size += item.size
-        else:
-            seq.append(item)
+    def __repr__(self):
+        return 'Annotation({!r},{})'.format(self.descr,self.size)
 
 
 RETURN_ADDRESS = 'RETURN_ADDRESS'
-PROLOG_END = 'PROLOG_END'
+
+class PrologEnd:
+    def __init__(self,stack):
+        self.stack = stack
+
+    def __repr__(self):
+        return 'PrologEnd({})'.format(self.stack)
+
 EPILOG_START = 'EPILOG_START'
 PYTHON_STACK_START = 'PYTHON_STACK_START'
 
@@ -61,31 +54,31 @@ class SaveReg:
         self.reg = reg
 
     def __repr__(self):
-        return 'SaveReg({})'.format(self.reg)
+        return 'SaveReg({!r})'.format(self.reg)
 
 class RestoreReg:
     def __init__(self,reg):
         self.reg = reg
 
     def __repr__(self):
-        return 'RestoreReg({})'.format(self.reg)
+        return 'RestoreReg({!r})'.format(self.reg)
 
-class PushVariable:
-    def __init__(self,name):
+class VariableLoc:
+    def __init__(self,name,loc):
         self.name = name
+        self.loc = loc
 
     def __repr__(self):
-        return 'PushVariable({})'.format(self.name)
+        return 'VariableLoc({!r},{!r})'.format(self.name,self.loc)
 
 
 class SymbolSection(elf.Section):
     name = b'.symtab'
     type = elf.SHT_SYMTAB
-    link = 3 # index of the string table (TODO: don't hard-code)
 
     def __init__(self,mode,strtab,funcs):
         self.mode = mode
-        self.strtab = strtab
+        self.link = self.strtab = strtab
         self.funcs = funcs
         self.ent_size = (elf.ELF64_SYMBOL_TABLE_FMT
                 if mode == 64 else
@@ -113,19 +106,42 @@ class SymbolSection(elf.Section):
                     1)
 
 
-def dwarf_reg(mode,reg):
-    """Convert a Register object to the corresponding dwarf value"""
-    return getattr(dwarf.reg(mode),reg.name)
+class DwarfLocation:
+    def dwarf_loc_expr(self,op):
+        raise NotImplementedError()
 
-def dwarf_arg_loc(abi,mode,index):
-    op = dwarf.OP(mode)
-    if index >= len(abi.r_arg):
-        r = op.fbreg(index * abi.ptr_size)
-    else:
-        r = op.reg(dwarf_reg(mode,abi.r_arg[index]))
 
-    return dwarf.FORM_exprloc(r)
+class VarLocListEntry(dwarf.FORM_loclist_offset):
+    def __init__(self,var,func,start_index=0,start_offset=0):
+        self.var = var
+        self.func = func
+        self.start_index = start_index
+        self.start_offset = start_offset
 
+    def values(self,op):
+        end = self.start_offset + self.func.offset
+        last_loc = None
+        last_offset = 0
+
+        for i in range(self.start_index,len(self.func.annotation)):
+            annot = self.func.annotation[i]
+            if isinstance(annot.descr,VariableLoc) and annot.descr.name == self.var:
+                if annot.descr.loc != last_loc:
+                    if last_loc is not None and end > last_offset:
+                        yield last_offset,end,last_loc.dwarf_loc_expr(op)
+                    last_loc = annot.descr.loc
+                    last_offset = end
+
+            end += annot.size
+
+def find_vars(func):
+    pos = func.offset
+    found = set()
+    for i,annot in enumerate(func.annotation):
+        if isinstance(annot.descr,VariableLoc) and annot.descr.name not in found:
+            found.add(annot.descr.name)
+            yield annot.descr.name,VarLocListEntry(annot.descr.name,func,i,pos)
+        pos += annot.size
 
 class StackBodyLocListEntry(dwarf.FORM_loclist_offset):
     def __init__(self,addr,annot):
@@ -144,25 +160,6 @@ class StackBodyLocListEntry(dwarf.FORM_loclist_offset):
             assert end > start
             yield start,end,op.const_int(stack - bottom) + expr_end
             start = end
-
-class PyFrameLocListEntry(dwarf.FORM_loclist_offset):
-    def __init__(self,func,abi,mode):
-        self.start = func.offset
-        self.end = func.offset + len(func) - func.padding
-        self.annot = func.annotation
-        self.abi = abi
-        self.mode = mode
-
-    def values(self,op):
-        regend = self.start
-        for a in self.annot:
-            if isinstance(a.descr,PushVariable) and a.descr.name == '__f':
-                yield self.start,regend,op.reg(dwarf_reg(self.mode,self.abi.r_arg[0]))
-                yield regend,self.end - regend + self.start,op.fbreg(a.stack * -self.abi.ptr_size)
-                break
-            regend += a.size
-        else:
-            assert False
 
 class StackTopRangeEntry(dwarf.FORM_rangelist_offset):
     def __init__(self,addr,annot):
@@ -186,47 +183,54 @@ class CallFrameEntry:
     def __call__(self,op,reg):
         assert self.annot
 
-        itr = iter(self.annot)
-        a = next(itr)
-        old_stack = a.stack
-        in_body = False
+        stack = 0
+        prolog_stack = None
         instr = b''
-        span = a.size
+        span = 0
         tot_size = 0
 
         def add_code(c):
-            nonlocal instr,span,tot_size
+            nonlocal instr,span
 
             if span:
                 instr += op.advance_loc_smallest(span)
-                tot_size += span
                 span = 0
             instr += c
 
-        for a in itr:
-            assert in_body or a.stack is not None
+        def add_stack_code():
+            add_code(op.def_cfa_offset(stack*self.ptr_size))
 
-            if a.descr is EPILOG_START:
-                    in_body = False
-                    add_code(op.def_cfa_offset(a.stack * self.ptr_size))
-                    old_stack = a.stack
-            elif a.descr is PROLOG_END:
-                in_body = True
-                add_code(op.def_cfa_offset(a.stack * self.ptr_size))
-                old_stack = a.stack
-            else:
-                if (not in_body) and a.stack != old_stack:
-                    add_code(op.def_cfa_offset(a.stack * self.ptr_size))
-                    old_stack = a.stack
-
-                if isinstance(a.descr,SaveReg):
-                    add_code(op.offset(getattr(reg,a.descr.reg.name),a.stack))
-                elif isinstance(a.descr,RestoreReg):
-                    add_code(op.restore(getattr(reg,a.descr.reg.name)))
+        for a in self.annot:
+            if a.descr is RETURN_ADDRESS:
+                assert prolog_stack is None
+                stack += 1
+                add_stack_code()
+            elif a.descr is EPILOG_START:
+                assert prolog_stack is not None
+                if prolog_stack != stack:
+                    stack = prolog_stack
+                    add_stack_code()
+            elif isinstance(a.descr,PrologEnd):
+                assert prolog_stack is None
+                prolog_stack = stack
+                if stack != a.descr.stack:
+                    stack = a.descr.stack
+                    add_stack_code()
+            elif isinstance(a.descr,SaveReg):
+                assert prolog_stack is None
+                stack += 1
+                add_stack_code()
+                add_code(op.offset(getattr(reg,a.descr.reg.name),stack))
+            elif isinstance(a.descr,RestoreReg):
+                assert prolog_stack is not None
+                stack -= 1
+                add_stack_code()
+                add_code(op.restore(getattr(reg,a.descr.reg.name)))
 
             span += a.size
+            tot_size += a.size
 
-        tot_size += span
+        assert stack == 1
 
         return self.addr,tot_size,instr
 
@@ -375,11 +379,11 @@ def generate(abi,cu,entry_points):
             cfs.append(CallFrameEntry(func.offset,func.annotation,abi.ptr_size))
 
         if func.pyfunc:
-            df.children.append(dwarf.DIE('formal_parameter',
-                name=st['f'],
-                type=ref(t_vptr),
-                location=PyFrameLocListEntry(func,abi,dmode)
-                    if abi.r_arg else dwarf_arg_loc(abi,dmode,0)))
+            for var,form in find_vars(func):
+                df.children.append(dwarf.DIE('formal_parameter' if var in FUNC_PARAMS else 'variable',
+                    name=st[var],
+                    type=ref(t_vptr),
+                    location=form))
         else:
             df.calling_convention = dwarf.CC.nocall
 

@@ -363,7 +363,10 @@ class FindOps:
         self.visited |= Interval(self.start_pos,self.position)
 
         self.start_pos = self.data.position = pos
-        self.end_pos = self.visited.closest_ge(pos)
+        try:
+            self.end_pos = self.visited.closest_ge(pos)
+        except ValueError:
+            self.end_pos = float('inf')
 
     def __iter__(self):
         return self
@@ -406,7 +409,7 @@ class FindOps:
                 break
 
             self.data.advance()
-        
+
         op_s = self.data.position
 
         map = one_byte_map_64 if self.mode == MODE_64 else one_byte_map

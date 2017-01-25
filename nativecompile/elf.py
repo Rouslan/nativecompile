@@ -1,4 +1,4 @@
-#  Copyright 2015 Rouslan Korneychuk
+#  Copyright 2017 Rouslan Korneychuk
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -120,7 +120,7 @@ class Section:
     align = 0
     flags = 0
     ent_size = 0
-    link = SHN_UNDEF
+    link = None
     info = 0
 
 class CodeSection(Section):
@@ -180,7 +180,8 @@ def write_shared_object(mode,out,sections):
     # the unit header will be written last
     out.seek((ELF64_HEADER_FMT if mode == MODE_64 else ELF_HEADER_FMT).size)
 
-    for s in list(sections) + [snames]:
+    sections = list(sections) + [snames]
+    for s in sections:
         align_fo(out,s.align)
         offset = out.tell()
         name_index = snames.add(s.name)
@@ -205,7 +206,7 @@ def write_shared_object(mode,out,sections):
             s.offset,
             s.size,
             0,
-            s.section.link,
+            SHN_UNDEF if s.section.link is None else (sections.index(s.section.link) + 1),
             s.section.info,
             s.section.align,
             s.section.ent_size))

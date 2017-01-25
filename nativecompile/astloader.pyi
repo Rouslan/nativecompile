@@ -13,5 +13,7 @@
 #  limitations under the License.
 
 
-from .compile_mod import compile
+import ast
+from typing import Dict,Tuple
 
+def symtable(code : str,filename : str,compile_type : str) -> Tuple[ast.AST,Dict]: ...
