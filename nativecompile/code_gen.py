@@ -15,6 +15,7 @@
 
 import operator
 import sys
+import weakref
 from functools import reduce
 from typing import Callable,Dict,FrozenSet,Generic,Iterable,List,Optional,Sized,Tuple,TYPE_CHECKING,TypeVar,Union
 
@@ -230,13 +231,12 @@ class DelayedCompile:
         return r
 
 class CleanupItem:
-    def __init__(self,s,item,free):
-        self.item = item
-        self.loc = make_value(s,item)
+    def __init__(self,loc,free):
+        self.loc = loc
         self.free = free
 
     def __call__(self,s):
-        self.free(s,self.item)
+        self.free(s,self.loc)
 
     def __hash__(self):
         return hash(self.loc) ^ hash(self.free)
@@ -552,12 +552,13 @@ class TrackedValue(MaybeTrackedValue):
         self.initial_own = own
 
     def __call__(self,s):
-        s.state.track(self,s.cleanup.depth if self.initial_own else None)
+        if self.initial_own: s.state.own(self,s.cleanup.depth)
         return self.value
 
     def discard(self,s):
         if s.state.owned(self):
             self.cleanup_func(s,self.value)
+            s.state.disown(self)
 
 class PyObject(TrackedValue):
     def __init__(self,value : Optional[Value]=None,own : bool=False) -> None:
@@ -565,6 +566,14 @@ class PyObject(TrackedValue):
             Var() if value is None else value,
             (lambda s,val: s.decref(val)),
             own)
+
+        if __debug__ and value is None:
+            self.value.origin = _get_origin()
+
+    if __debug__:
+        @property
+        def origin(self):
+            return getattr(self.value,'origin',None)
 
 class BorrowedValue(MaybeTrackedValue):
     def __init__(self,value : TrackedValue) -> None:
@@ -732,32 +741,75 @@ class DoWhileScope(Scope,Branch):
     def cur_single_scope(self) -> 'Branch':
         return self
 
-class CompareByID(Generic[T]):
-    def __init__(self,val):
-        self.val = val
+class CompareByID(weakref.ref):
+    def __init__(self,val,callback=None):
+        super().__init__(val,callback)
 
-    def __hash__(self):
-        return id(self.val)
+        self._hash = id(val)
+
+        if __debug__:
+            self.origin = getattr(val,'origin',None)
 
     def __eq__(self,b):
-        return (self.val is b.val) if isinstance(b,CompareByID) else (self.val is b)
+        val = self()
+        if val is None: return False
+
+        if isinstance(b,CompareByID):
+            b = b()
+            if b is None: return False
+
+        return val is b
+
+    def __hash__(self):
+        return self._hash
+
+    def __repr__(self):
+        val = self()
+        if val is not None:
+            return 'CompareByID({!r})'.format(val)
+
+        return '<expired CompareByID object>'
 
 class State:
     """Keeps track of implied state in machine code as it's generated."""
-    def __init__(self,vals : Optional[Dict[CompareByID[TrackedValue],Optional[int]]]=None) -> None:
-        self._tracked_vals = vals if vals is not None else {} # type: Dict[CompareByID[TrackedValue],Optional[int]]
+    def __init__(self) -> None:
+        self._tracked_vals = {} # type: Dict[CompareByID,int]
 
-    def __eq__(self,b) -> bool:
-        return isinstance(b,State) and self._tracked_vals == b._tracked_vals
+    def __eq__(self,b):
+        if isinstance(b,State):
+            for tv in self._tracked_vals.keys() | b._tracked_vals.keys():
+                if self._tracked_vals.get(tv) != b._tracked_vals.get(tv):
+                    return False
+            return True
 
-    def __ne__(self,b) -> bool:
-        return not self.__eq__(b)
+        return NotImplemented
+
+    def __ne__(self,b):
+        r = self.__eq__(b)
+        return r if r is NotImplemented else not r
+
+    def _make_wrapper(self,val : TrackedValue) -> CompareByID:
+        if __debug__:
+            def check_ownership(val,self_ref=weakref.ref(self)):
+                self_ = self_ref()
+                if self_ is not None:
+                    for v in self_._tracked_vals:
+                        if v() is None:
+                            if v.origin:
+                                print('{}:{}: '.format(*v.origin),end='',file=sys.stderr)
+                            print('Ref-counted value not freed (in the ' +
+                                'generated machine code, not the running ' +
+                                'interpreter)',file=sys.stderr)
+
+            return CompareByID(val,check_ownership)
+
+        return CompareByID(val)
 
     def owned_items(self) -> Iterable[Tuple[TrackedValue,int]]:
-        return [(wrap.val,cd) for wrap,cd in self._tracked_vals.items() if cd is not None]
-
-    def track(self,x : TrackedValue,cleanup_depth : Optional[int]) -> None:
-        self._tracked_vals.setdefault(CompareByID(x),cleanup_depth)
+        for wrap,cd in self._tracked_vals.items():
+            if cd is None: continue
+            val = wrap()
+            if val is not None: yield val,cd
 
     def own(self,x : TrackedValue,cleanup_depth : int) -> None:
         """Mark x as being owned.
@@ -766,7 +818,7 @@ class State:
 
         """
         assert not self.owned(x)
-        self._tracked_vals[CompareByID(x)] = cleanup_depth
+        self._tracked_vals[self._make_wrapper(x)] = cleanup_depth
 
     def disown(self,x : TrackedValue) -> None:
         """Un-mark x as being owned.
@@ -774,14 +826,18 @@ class State:
         x must be owned, prior to calling this.
 
         """
-        self._tracked_vals[CompareByID(x)] = None
+        del self._tracked_vals[CompareByID(x)]
 
     def owned(self,x : TrackedValue) -> bool:
         """Return true iff x is owned"""
         return self._tracked_vals.get(CompareByID(x)) is not None
 
     def copy(self) -> 'State':
-        return State(self._tracked_vals.copy())
+        r = State()
+        for wrap,depth in self._tracked_vals.items():
+            val = wrap()
+            if val is not None: r.own(val,depth)
+        return r
 
 if __debug__:
     def _get_origin():
@@ -855,7 +911,9 @@ class Stitch:
         while True:
             top = self._scopes.pop()
             assert isinstance(top,IfElseScope)
+            assert top.branch_f is None or top.branch_t.state == top.branch_f.state
             self.extend(self.cgen.if_(top.test,top.branch_t.code,top.branch_f and top.branch_f.code))
+            self._cur_scope.state = top.branch_t.state
             if not top.in_elif: break
         return self
 
@@ -1016,7 +1074,7 @@ class Stitch:
         stored in only one, depending on which copy was updated.
 
         """
-        self.append(IndirectMod(val,loc_type))
+        self.append(IndirectMod(make_arg(self,val),loc_type))
         return self
 
     def create_var(self,var,val):

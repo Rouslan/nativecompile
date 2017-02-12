@@ -30,7 +30,7 @@ from . import pyinternals
 from . import debug
 
 
-DUMP_OBJ_FILE = bool(os.environ.get('DUMP_OBJ_FILE',False))
+DUMP_OBJ_FILE = bool(int(os.environ.get('DUMP_OBJ_FILE','0')))
 NODE_COMMENTS = True
 DISABLE_DEBUG = False
 
@@ -230,26 +230,27 @@ class ExprCompiler:
             the_rest.difference_update(locals_)
             locals_.extend(the_rest)
 
-            for n in locals_:
-                self.names[n] = address_of(n)
+            if locals_:
+                for n in locals_:
+                    self.names[n] = address_of(n)
 
-            zero = 0
-            if len(locals_) > 1:
-                zero = Var()
-                self.code.mov(0,zero)
+                zero = 0
+                if len(locals_) > 1:
+                    zero = Var()
+                    self.code.mov(0,zero)
 
-            self.local_addr_block = Block(len(locals_))
+                self.local_addr_block = Block(len(locals_))
 
-            for i,loc in enumerate(locals_):
-                addr = self.local_addr_block[i]
-                if self.is_cell(loc):
-                    tmp = Var()
-                    self.code.call('PyCell_New',zero,store_ret=tmp)
-                    self.code.mov(tmp,addr)
-                else:
-                    self.code.mov(zero,addr)
+                for i,loc in enumerate(locals_):
+                    addr = self.local_addr_block[i]
+                    if self.is_cell(loc):
+                        tmp = Var()
+                        self.code.call('PyCell_New',zero,store_ret=tmp)
+                        self.code.mov(tmp,addr)
+                    else:
+                        self.code.mov(zero,addr)
 
-                self.local_addrs[loc] = addr
+                    self.local_addrs[loc] = addr
 
     def deallocate_locals(self,s=None):
         assert self.local_addrs is not None
@@ -848,7 +849,7 @@ class ExprCompiler:
             items = []
             for item,item_depth in s.state.owned_items():
                 if item_depth >= depth and (max_depth is None or item_depth < max_depth):
-                    items.append(CleanupItem(s,item,item.cleanup_func))
+                    items.append(CleanupItem(item.value,item.cleanup_func))
 
             items.extend(callbacks)
             max_depth = depth
@@ -1099,6 +1100,9 @@ class ExprCompiler:
 
         fobj.discard(self.code)
 
+    def visit_ClassDef(self,node):
+        raise NotImplementedError()
+
     def visit_Return(self,node):
         if node.value:
             val = self.visit(node.value,self.var_return)
@@ -1208,6 +1212,58 @@ class ExprCompiler:
 
         self.assign_expr(node.target,expr,check_dest=check_dest)
 
+    def visit_For(self,node):
+        context = self.new_context(LoopContext)
+        exhaust = Target()
+        i_type = CType('PyTypeObject',Var('i_type'))
+        itr = PyObject(Var('itr'))
+
+        itr_val = self.visit(node.iter)
+
+        (self.code
+            .call('PyObject_GetIter',itr_val,store_ret=itr)
+            (itr_val.discard)
+            (self.check_err(itr))
+            .own(itr))
+
+        next_val = PyObject(Var('next_val'))
+        occurred = Var('occurred')
+        matches = Var('matches')
+
+        (self.code
+            (context.begin)
+            .mov(type_of(itr),i_type)
+            .call(i_type.tp_iternext,itr,store_ret=next_val)
+            .if_(not_(next_val))
+                .call('PyErr_Occurred',store_ret=occurred)
+                .if_(occurred)
+                    .call('PyErr_ExceptionMatches','PyExc_StopIteration',store_ret=matches)
+                    (self.check_err(matches))
+                    .call('PyErr_Clear')
+                .endif()
+                .jmp(exhaust)
+            .endif())
+
+        self.assign_expr(node.target,next_val)
+        next_val.discard(self.code)
+        for stmt in node.body:
+            self.visit(stmt)
+
+        (self.code
+            .jmp(context.begin)
+            (exhaust))
+
+        self.end_context(context)
+        for stmt in node.orelse:
+            self.visit(stmt)
+
+        (self.code
+            (context.break_)
+            (itr.discard))
+
+    def visit_While(self,node):
+        raise NotImplementedError()
+
     def visit_If(self,node):
         self.test_condition(node.test)
 
@@ -1228,6 +1284,12 @@ class ExprCompiler:
         self.code = self.code.endif()
 
         return if_quit and else_quit
+
+    def visit_With(self,node):
+        raise NotImplementedError()
+
+    def visit_Raise(self,node):
+        raise NotImplementedError()
 
     def visit_Try(self,node):
         top_context = t_context = self.new_context(TryContext)
@@ -1343,6 +1405,15 @@ class ExprCompiler:
         self.end_context(t_context)
         self.code(t_context.target)
 
+    def visit_Assert(self,node):
+        raise NotImplementedError()
+
+    def visit_Import(self,node):
+        raise NotImplementedError()
+
+    def visit_ImportFrom(self,node):
+        raise NotImplementedError()
+
     def visit_Pass(self,node):
         pass
 
@@ -1353,6 +1424,14 @@ class ExprCompiler:
 
     def visit_Expr(self,node):
         self.visit(node.value).discard(self.code)
+
+    def visit_Break(self,node):
+        context = self.top_context(LoopContext)
+        self.code.jmp(context.break_)
+
+    def visit_Continue(self,node):
+        context = self.top_context(LoopContext)
+        self.code.jmp(context.begin)
 
     def  _boolop_iteration(self,op,values,r):
         if len(values) > 1:
@@ -1541,7 +1620,7 @@ class ExprCompiler:
 
         args_obj = 0
         if node.args:
-            args_obj = PyObject()
+            args_obj = PyObject(Var('args_obj'))
 
             (self.code
                 .call('PyTuple_New',len(node.args),store_ret=args_obj)
@@ -1571,7 +1650,7 @@ class ExprCompiler:
 
         args_kwds = 0
         if node.keywords:
-            args_kwds = PyObject()
+            args_kwds = PyObject(Var('args_kwds'))
             (self.code
                 .call('_PyDict_NewPresized',len(node.keywords),store_ret=args_kwds)
                 (self.check_err(args_kwds))
@@ -1674,8 +1753,10 @@ class ExprCompiler:
         ovr = self.name_overrides.get(node.id)
         s = self.stable.lookup(node.id)
 
+        dbg_name = 'py:'+node.id
+
         if ovr is not None or s.is_free() or (self.is_local(s) and self.stable.is_optimized()) or self.is_cell(s):
-            r = PyObject() if node_var is None else node_var
+            r = PyObject(Var(dbg_name)) if node_var is None else node_var
 
             if ovr is not None:
                 self.code.mov(ovr,r)
@@ -1696,13 +1777,13 @@ class ExprCompiler:
                         'PyExc_UnboundLocalError',
                         'UNBOUNDLOCAL_ERROR_MSG',
                         self.get_name(node.id))
-                (self.exc_cleanup())
+                    (self.exc_cleanup())
                 .endif()
                 .own(r))
 
             return r
 
-        r = PyObject() if node_var is None else node_var
+        r = PyObject(Var(dbg_name)) if node_var is None else node_var
 
         (self.code
             .append(LockRegs([0,1]))
@@ -1740,9 +1821,7 @@ class ExprCompiler:
             .own(r))
 
         for i,item in enumerate(node.elts):
-            obj = self.visit(item).to_addr_movable_val(self.code)
-
-            self.code.mov(obj.steal(self.code),tuple_item(r,i))
+            self.code.mov(steal(self.visit(item)),tuple_item(r,i))
 
         return r
 
@@ -2006,7 +2085,10 @@ def compile_eval(
     tmp = Var('tmp')
     (ec.code
         .call('_EnterRecursiveCall',store_ret=tmp)
-        (ec.check_err(tmp,True))
+        .if_(tmp)
+            .mov(0,ec.var_return)
+            .jmp(fast_end)
+        .endif()
 
         .get_threadstate(tstate)
 

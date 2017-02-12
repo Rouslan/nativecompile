@@ -35,7 +35,7 @@ def exec_isolated(code):
 
     if rcode:
         raise Exception(
-            'An error occured in the child process. Its output was:\n\n'+err.decode())
+            'An error occurred in the child process. Its output was:\n\n'+err.decode())
 
     return out.decode()
 

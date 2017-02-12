@@ -1331,8 +1331,11 @@ class X86OpGen(JumpCondOpGen):
         return ArgStackItem(i,prev_frame)
 
     def _call_impl(self,func : Value,args : Sequence[Value]=(),store_ret : Optional[Var]=None) -> IRCode:
-        arg_regs = min(len(args),len(self.abi.r_arg))
-        r = [LockRegs(range(arg_regs))] # type: IRCode
+        arg_r_indices = [self.abi.reg_indices[r] for r in self.abi.r_arg[0:min(len(self.abi.r_arg),len(args))]]
+
+        r = [] # type: IRCode
+        if arg_r_indices: r.append(LockRegs(arg_r_indices))
+
         for i,arg in enumerate(args):
             r += self.move(arg,self._func_arg(i))
 
@@ -1345,7 +1348,7 @@ class X86OpGen(JumpCondOpGen):
             [self.abi.reg_indices[r] for r in self.abi.r_pres]))
         r.append(Instr(self.ops.call,func))
 
-        r.append(UnlockRegs(range(arg_regs)))
+        if arg_r_indices: r.append(UnlockRegs(arg_r_indices))
 
         if store_ret is not None:
             r.append(CreateVar(store_ret,self._reg_to_ir(self.abi.r_ret)))

@@ -51,6 +51,9 @@ from typing import (Any,Callable,cast,Container,DefaultDict,Dict,Generic,
     Iterable,List,Optional,NamedTuple,NewType,Sequence,Sized,Set,Tuple,
     TypeVar,Union)
 
+if __debug__:
+    import sys
+
 from . import abi
 from . import debug
 from .sorted_list import SortedList
@@ -84,6 +87,7 @@ class Lifetime:
 
         if __debug__:
             self.name = None
+            self.origin = None
 
     @property
     def global_start(self):
@@ -120,7 +124,7 @@ class VarLifetime(Lifetime):
         self.preferred_stack_i = None # type: Optional[int]
         self.aliases = weakref.WeakSet()
 
-        # if not None and not emtpy and debug.GDB_JIT_SUPPORT is true,
+        # if not None and not empty and debug.GDB_JIT_SUPPORT is true,
         # instances of IRAnnotation will be added to the produced intermediate
         # representation, that specifies the location of the associated value
         self.dbg_symbol = dbg_symbol
@@ -196,6 +200,9 @@ class Target:
     def __init__(self):
         self.displacement = None # type: Optional[int]
 
+    def __repr__(self):
+        return '<Target {:#x}>'.format(id(self))
+
 class Value:
     __slots__ = 'size',
     def __init__(self,size : int=SIZE_DEFAULT) -> None:
@@ -204,8 +211,23 @@ class Value:
 class MutableValue(Value):
     __slots__ = ()
 
+
+if __debug__:
+    def _get_origin():
+        f = sys._getframe(2)
+        r = None
+        while f:
+            r = f.f_code.co_filename,f.f_lineno
+            if f.f_code.co_filename != __file__:
+                break
+
+            f = f.f_back
+
+        return r
+
 # Var must compare by identity
-# The "name" attribute only acts as a helper for debugging our python code
+# The "name" and "origin" attributes only act as helpers for debugging our
+# python code
 class Var(MutableValue):
     if not __debug__:
         __slots__ = 'lifetime','dbg_symbol'
@@ -214,6 +236,8 @@ class Var(MutableValue):
         super().__init__(size)
         if __debug__:
             self.name = name
+            self.origin = _get_origin()
+
         self.lifetime = lifetime
         self.dbg_symbol = dbg_symbol
 
@@ -626,7 +650,7 @@ class IRJump:
         self.jump_ops = jump_ops
 
     def __repr__(self):
-        return 'IRJump({!r},{!r})'.format(self.dest,self.conditional)
+        return 'IRJump({!r},{!r},{})'.format(self.dest,self.conditional,self.jump_ops)
 
 class IndirectMod:
     """Indicates that a variable was updated externally, somehow.
@@ -654,14 +678,20 @@ class LockRegs:
     """
     __slots__ = 'regs',
 
-    def __init__(self,regs : Iterable[int]):
+    def __init__(self,regs : Iterable[int]) -> None:
         self.regs = tuple(regs)
+
+    def __repr__(self):
+        return 'LockRegs({!r})'.format(self.regs)
 
 class UnlockRegs:
     __slots__ = 'regs',
 
-    def __init__(self,regs : Iterable[int]):
+    def __init__(self,regs : Iterable[int]) -> None:
         self.regs = tuple(regs)
+
+    def __repr__(self):
+        return 'UnlockRegs({})'.format(self.regs)
 
 IRAnnotation = collections.namedtuple('IRAnnotation','descr')
 
@@ -1009,7 +1039,7 @@ class FollowNonlinear(Generic[T,U]):
     """
     def __init__(self,state : T) -> None:
         self.state = state # type: Optional[T]
-        self.prior_targets = set()  # type: Set[Target]
+        self.prior_states = {} # type: Dict[Target,T]
         self.pending_states = collections.defaultdict(list) # type: DefaultDict[Target,List[U]]
 
         if __debug__:
@@ -1033,11 +1063,12 @@ class FollowNonlinear(Generic[T,U]):
     def handle_irjump(self,op_i : int,op : IRJump) -> None:
         assert self.state is not None
 
-        assert op.dest not in self.elided_targets,'back-tracking support has not been added to this function'
+        assert op.dest not in self.elided_targets,'back-tracking support has not been added to this procedure'
 
-        if not op.dest in self.prior_targets:
-            self.pending_states[op.dest].append(
-                self.make_pending_state(op_i,op,self.state))
+        if op.dest in self.prior_states:
+            self.conform_prior_state(op_i,op,self.prior_states[op.dest])
+        else:
+            self.pending_states[op.dest].append(self.make_pending_state(op_i,op))
 
         if not op.conditional:
             old = self.state
@@ -1050,13 +1081,19 @@ class FollowNonlinear(Generic[T,U]):
     def handle_unlock_regs(self,op_i : int,op :UnlockRegs):
         pass
 
-    def conform_state_to(self,state : U,model : T) -> None:
+    def conform_state_to(self,op_i : int,state : U) -> None:
+        pass
+
+    def conform_prior_state(self,op_i : int,op : IRJump,state : T) -> None:
         pass
 
     def after_state_change(self,old_state : Optional[T]) -> None:
         pass
 
-    def make_pending_state(self,op_i : int,op : IRJump,state : T) -> U:
+    def make_pending_state(self,op_i : int,op : IRJump) -> U:
+        raise NotImplementedError()
+
+    def make_prior_state(self,op_i : int) -> T:
         raise NotImplementedError()
 
     def recall_pending_state(self,op_i : int,state : U) -> T:
@@ -1076,7 +1113,7 @@ class FollowNonlinear(Generic[T,U]):
             if self.state is not None:
                 self.handle_indirect_mod(op_i,op)
         elif isinstance(op,Target):
-            assert op not in self.prior_targets
+            assert op not in self.prior_states
 
             states = self.pending_states.get(op)
 
@@ -1089,12 +1126,12 @@ class FollowNonlinear(Generic[T,U]):
                     states = states[1:]
 
                 for s in states:
-                    self.conform_state_to(s,self.state)
+                    self.conform_state_to(op_i,s)
 
                 self.after_state_change(old)
 
             if self.state is not None:
-                self.prior_targets.add(op)
+                self.prior_states[op] = self.make_prior_state(op_i)
                 self.handle_target(op_i,op)
             elif __debug__:
                 self.elided_targets.add(op)
@@ -1113,107 +1150,40 @@ class FollowNonlinear(Generic[T,U]):
         for op_i,op in enumerate(code):
             self.handle_op(op_i,op)
 
-class VarStateInterval:
-    def __init__(self,itv : DInterval[int],last_def_write : int,valid : bool=True) -> None:
-        self.itv = itv
-
-        # The last time this variable was written-to under all conditions. If
-        # the code branches and every branch writes to the variable, then after
-        # merging, this value will have the minimum value of each branch's last
-        # write.
-        self.last_def_write = last_def_write
-
-        self.valid = valid
-
-    def copy(self):
-        return VarStateInterval(DInterval(self.itv),self.last_def_write,self.valid)
 
 class VarState:
-    def __init__(self,branch_start : int,
-            itvs : Optional[Dict[Lifetime,DInterval[int]]]=None,
-            potential_itvs : Optional[DefaultDict[Lifetime,DInterval[int]]]=None) -> None:
-        self.itvs = {} if itvs is None else itvs # type: Dict[Lifetime,VarStateInterval]
-        self.potential_intervals = collections.defaultdict(DInterval) if potential_itvs is None else potential_itvs  # type: DefaultDict[Lifetime,DInterval[int]]
-        self.branch_start = branch_start
+    def __init__(self,read_starts : Optional[Dict[Lifetime,int]]=None) -> None:
+        self.read_starts = {} if read_starts is None else read_starts # type: Dict[Lifetime,int]
 
-    def copy(self,branch_start):
-        # noinspection PyArgumentList
-        return VarState(
-            branch_start,
-            {life:itv.copy() for life,itv in self.itvs.items()},
-            collections.defaultdict(DInterval,((life,DInterval(itv)) for life,itv in self.potential_intervals.items())))
-
-    def extend(self,life,i,read):
-        itv = self.itvs[life]
-        if read:
-            if not itv.valid:
-                raise ValueError('cannot read from a conditionally defined value')
-            #print('{} extended by {}'.format(life,Interval(max(self.branch_start,itv.itv.global_end),i + 1)))
-            itv.itv |= Interval(max(self.branch_start,itv.itv.global_end),i + 1)
+    def apply(self,life : Lifetime,i : int,only_tracked=False) -> None:
+        rs = self.read_starts.get(life)
+        if rs is not None:
+            itv = Interval(i,rs)
+            del self.read_starts[life]
         else:
-            #print('{} extended by {}'.format(life,Interval(i,i+1)))
-            itv.itv |= Interval(i,i + 1)
+            if only_tracked: return
+            itv = Interval(i,i + 1)
+
+        life.intervals |= itv
+        #print('{} |= {}'.format(life.intervals,itv))
+        #print('{}: {}\n'.format(life.name,life.intervals))
+
+    def apply_all(self,i : int) -> None:
+        while self.read_starts:
+            life,rs = self.read_starts.popitem()
+            life.intervals |= Interval(i,rs)
 
     def __repr__(self):
-        return 'VarState({!r},{})'.format(self.itvs,self.branch_start)
+        return 'VarState({!r})'.format(self.read_starts)
 
-class _CalcVarIntervals(FollowNonlinear[VarState,VarState]):
-    def __init__(self):
-        super().__init__(VarState(0))
-        self.targets = {} # type: Dict[Target,int]
-        self.lives = [] # type: List[Lifetime]
-        self.main_itvs = self.state.itvs
+class _CalcVarIntervalsCommon(FollowNonlinear[VarState,Tuple[VarState,int]]):
+    def __init__(self) -> None:
+        super().__init__(VarState())
 
     # Here, "write" means completely overwrite. In the case of partial write,
     # both "read" and "write" will be false.
     def create_var_life(self,var,_i,read,write):
-        assert self.state is not None
-
-        i = _i
-        # the variable doesn't officially exist until after the
-        # instruction
-        if not read: i += 1
-
-        s_itv = None
-        if var.lifetime is not None:
-            s_itv = self.state.itvs.get(var.lifetime)
-
-        if var.lifetime is None or s_itv is None:
-            if read:
-                raise ValueError("attempt to read from value before any write")
-
-            if var.lifetime is None:
-                if isinstance(var,VarPart):
-                    self.create_var_life(var.block,_i,read,False)
-                    var.lifetime = AliasLifetime(cast(VarLifetime,var.block.lifetime))
-                else:
-                    var.lifetime = VarLifetime(dbg_symbol=var.dbg_symbol)
-                self.lives.append(cast(Lifetime,var.lifetime))
-
-                if __debug__:
-                    var.lifetime.name = getattr(var,'name',None)
-
-            self.state.itvs[var.lifetime] = VarStateInterval(DInterval(Interval(i,i+1)),i)
-        else:
-            p_itvs = self.state.potential_intervals.get(var.lifetime)
-            if p_itvs is not None:
-                if read:
-                    del self.state.potential_intervals[var.lifetime]
-
-                    for itv in p_itvs:
-                        if itv.end > s_itv.last_def_write:
-                            #print(var.lifetime,'applied',itv)
-                            s_itv.itv |= itv
-            if write:
-                s_itv.last_def_write = i
-                if not self.pending_states:
-                    if p_itvs and not read:
-                        del self.state.potential_intervals[var.lifetime]
-                    #for itv in p_itvs: print(var.lifetime,'discarded',itv)
-            self.state.extend(var.lifetime,i,read)
-
-            if isinstance(var,VarPart):
-                self.create_var_life(var.block,_i,read,False)
+        raise NotImplementedError()
 
     def handle_instr(self,op_i : int,op : Instr):
         for var,pd in zip(op.args,op.op.param_dirs):
@@ -1228,70 +1198,135 @@ class _CalcVarIntervals(FollowNonlinear[VarState,VarState]):
     def handle_create_var(self,op_i : int,op : CreateVar):
         self.create_var_life(op.var,op_i,False,True)
 
-    def handle_target(self,op_i : int,op : Target):
-        self.targets[op] = op_i
-
-    def _make_potential(self,op_i,state):
-        for life,s_itv in state.itvs.items():
-            start = max(s_itv.last_def_write,state.branch_start)
-            if start < op_i + 1:
-                #print(life,'added',Interval(start,op_i + 1))
-                self.state.potential_intervals[life] |= Interval(start,op_i + 1)
-
-    def handle_irjump(self,op_i : int,op : IRJump):
+    def handle_irjump(self,op_i : int,op : IRJump) -> None:
         assert self.state is not None
-
-        ti = self.targets.get(op.dest)
-        if ti is not None:
-            # in the case of backwards jumps, any interval that was created
-            # before the jump target, but exists after the target, must
-            # continue to exist up to the location of the jump
-            for life in self.lives:
-                itv = self.state.itvs[life].itv
-                assert itv.global_start is not None and itv.global_end is not None
-                if itv.global_start > ti: break
-                if itv.global_end > ti and ti in itv:
-                    itv |= Interval(itv.global_end,op_i+1)
+        state = self.state
 
         super().handle_irjump(op_i,op)
 
-    def after_state_change(self,old_state):
-        if self.state is not None:
-            self.main_itvs = self.state.itvs
+        if self.state is None:
+            state.apply_all(op_i+1)
 
-    def make_pending_state(self,op_i : int,op : IRJump,state : VarState) -> VarState:
-        self._make_potential(op_i,state)
-        return state.copy(op_i)
-
-    def recall_pending_state(self,op_i : int,state : VarState) -> VarState:
-        return state.copy(op_i)
-
-    def conform_state_to(self,state : VarState,model : VarState) -> None:
-        for life,itv in state.itvs.items():
-            m_itv = model.itvs.get(life)
-            if m_itv is None:
-                model.itvs[life] = itv
-                itv.valid = False
+            prior = self.prior_states.get(op.dest)
+            if prior:
+                self.state = VarState({life: op_i + 1 for life in prior.read_starts})
             else:
-                #print('({}) |= ({}) & ({})'.format(m_itv,itv,state.applies_to))
-                m_itv.itv |= itv.itv
-                m_itv.last_def_write = min(m_itv.last_def_write,itv.last_def_write)
-                #print(id(m_itv),m_itv)
-                #print('{}: {}\n'.format(id(life),m_itv))
+                self.state = state
 
-        for life,pitv in state.potential_intervals.items():
-            model.potential_intervals[life] |= pitv
+    def make_prior_state(self,op_i : int) -> VarState:
+        assert self.state is not None
+        return VarState(self.state.read_starts.copy())
+
+    def make_pending_state(self,op_i : int,op : IRJump) -> Tuple[VarState,int]:
+        assert self.state is not None
+        return VarState(self.state.read_starts.copy()),op_i
+
+    def recall_pending_state(self,op_i : int,state : Tuple[VarState,int]) -> VarState:
+        return state[0]
+
+    def conform_prior_state(self,op_i : int,op : IRJump,state : VarState) -> None:
+        assert self.state is not None
+
+        for life in (state.read_starts.keys() | self.state.read_starts.keys()):
+            m_rs = self.state.read_starts.get(life)
+            if m_rs is None:
+                assert life in state.read_starts
+                m_rs = op_i + 1
+
+            self.state.read_starts[life] = m_rs
+
+class _CalcVarIntervals(_CalcVarIntervalsCommon):
+    def __init__(self):
+        super().__init__()
+
+        # maps a lifetime to a set of code positions that we will need to
+        # back-track to
+        self.back_starts = collections.defaultdict(set) # type: DefaultDict[int,Set[Lifetime]]
+
+        self.block_vars = [] # type: List[Block]
+
+    # Here, "write" means completely overwrite. In the case of partial write,
+    # both "read" and "write" will be false.
+    def create_var_life(self,var,i,read,write):
+        assert self.state is not None
+
+        # the variable doesn't officially exist until after the instruction
+        if not read: i += 1
+
+        if var.lifetime is None:
+            if isinstance(var,VarPart):
+                if var.block.lifetime is None:
+                    var.block.lifetime = VarLifetime()
+                    self.block_vars.append(var.block)
+
+                var.lifetime = AliasLifetime(
+                    cast(VarLifetime,var.block.lifetime))
+            else:
+                var.lifetime = VarLifetime(dbg_symbol=var.dbg_symbol)
+
+            if __debug__:
+                var.lifetime.name = getattr(var,'name',None)
+                var.lifetime.origin = getattr(var,'origin',None)
+
+            var.lifetime.intervals |= Interval(i,i + 1)
+        elif write:
+            self.state.apply(var.lifetime,i)
+
+        if read:
+            assert var.lifetime is not None
+            self.state.read_starts.setdefault(var.lifetime,i + 1)
+
+    def conform_state_to(self,op_i : int,state : Tuple[VarState,int]) -> None:
+        assert self.state is not None
+
+        for life in self.state.read_starts:
+            # This variable's lifetime needs to be propagated to a later
+            # location. Since we are scanning the code backwards, we have
+            # to do this in another pass
+            self.back_starts[state[1]].add(life)
+
+class _CalcBackVarIntervals(_CalcVarIntervalsCommon):
+    def create_var_life(self,var,i,read,write):
+        assert self.state
+
+        if isinstance(var,VarPart):
+            self.create_var_life(var.block,i,read,False)
+
+        if not read: i += 1
+
+        # the previous pass should have handled it by this point, so don't
+        # track it any further
+        assert var.lifetime is not None
+        self.state.apply(var.lifetime,i,True)
+
 
 def calc_var_intervals(code : IRCode) -> None:
-    #print()
-    calculator = _CalcVarIntervals()
-    calculator.run(code)
+    c = _CalcVarIntervals()
+    for op_i in range(len(code) - 1,-1,-1):
+        c.handle_op(op_i,code[op_i])
 
-    assert len(calculator.main_itvs) == len(calculator.lives)
-    for life,itv in calculator.main_itvs.items():
-        assert itv.itv
-        #print(id(itv),itv.itv)
-        life.intervals = itv.itv
+    # This only checks for read-violations from code that is reachable from the
+    # start, which is fine, since code that isn't reachable from the start,
+    # isn't reachable at all, and will be stripped in a later pass.
+    assert c.state
+    if c.state.read_starts:
+        raise ValueError('one or more variables may be read-from before being written-to')
+
+    for b in c.block_vars:
+        assert b.lifetime
+        for a in b.lifetime.aliases:
+            b.lifetime.intervals |= a.intervals
+
+    if c.back_starts:
+        cb = _CalcBackVarIntervals()
+        for op_i in range(len(code)-1,-1,-1):
+            cb.handle_op(op_i,code[op_i])
+
+            lives = c.back_starts.get(op_i)
+            if lives:
+                assert cb.state is not None
+                for life in lives:
+                    cb.state.read_starts.setdefault(life,op_i+1)
 
 
 class Filter(Container[T],Generic[T]):
@@ -1323,7 +1358,14 @@ class ItvLocation:
         r = self.__eq__(b)
         return r if r is NotImplemented else not r
 
-    def to_opt_ir(self,size=SIZE_DEFAULT):
+    def to_opt_ir(self,size=SIZE_DEFAULT) -> Union[FixedRegister,StackItem,ArgStackItem,None]:
+        """Return an IR value representing a value in this location.
+
+        If this location is both a register and stack item, the return value
+        will represent a register. If this location is neither, None is
+        returned.
+
+        """
         if self.reg is not None:
             return FixedRegister(self.reg,size=size)
 
@@ -1332,7 +1374,14 @@ class ItvLocation:
 
         return None
 
-    def to_ir(self,size=SIZE_DEFAULT):
+    def to_ir(self,size=SIZE_DEFAULT) -> Union[FixedRegister,StackItem,ArgStackItem]:
+        """Return an IR value representing a value in this location.
+
+        If this location is both a register and stack item, the return value
+        will represent a register. If this location is neither, a ValueError
+        will be raised.
+
+        """
         r = self.to_opt_ir(size)
         if r is None:
             raise ValueError('this location is blank')
@@ -1529,7 +1578,7 @@ class LocationScan:
         self.reg_pool[reg] = None
 
         for ar in alt_regs:
-            if self.reg_pool[ar] is None:
+            if self.reg_pool[ar] is None and ar not in self.locked_regs:
                 life_l.reg = ar
                 self.reg_pool[ar] = life
                 break
@@ -1799,6 +1848,9 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
                 itv = VarLifetime()
                 itv.intervals |= Interval(self.state.cur_pos,self.state.cur_pos+1)
 
+                if __debug__:
+                    itv.origin = 'temporary lifetime'
+
             fr_type = hassubclass(p,FixedRegister)
             if fr_type:
                 assert not isinstance(arg,(Block,VarPart)),(
@@ -1818,7 +1870,7 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
                     assert isinstance(itv,VarLifetime)
                     moved = self.state.to_stack(itv)
                     d_loc = self.state.interval_loc(itv)
-                    dest = d_loc.to_ir()
+                    dest = to_stack_item(d_loc.stack_loc)
                     if moved and reads:
                         self.new_code_head.extend(
                             ir_preallocated_to_ir2(self.cgen.move(arg,dest)))
@@ -1986,12 +2038,21 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
         assert self.state is not None
         self.state.locked_regs.difference_update(op.regs)
 
-    def conform_state_to(self,state : JumpState,model : LocationScan):
-        if state.alloc.cur_pos != model.cur_pos:
-            state.alloc.advance(model.cur_pos,self._on_loc_expire)
-        state.conform_to(self.cgen,model)
+    def conform_state_to(self,op_i : int,state : JumpState):
+        assert self.state is not None
 
-    def make_pending_state(self,op_i : int,op : IRJump,state : LocationScan):
+        if state.alloc.cur_pos != self.state.cur_pos:
+            state.alloc.advance(self.state.cur_pos,self._on_loc_expire)
+        state.conform_to(self.cgen,self.state)
+
+    def conform_prior_state(self,op_i : int,op : IRJump,state : LocationScan):
+        JumpState(self.state,self.new_code_head,op.jump_ops).conform_to(self.cgen,state)
+
+    def make_prior_state(self,op_i : int) -> LocationScan:
+        assert self.state is not None
+        return self.state.branch()
+
+    def make_pending_state(self,op_i : int,op : IRJump):
         assert self.state is not None
 
         r = JumpState(self.state.branch(),self.new_code_head,op.jump_ops)
@@ -2088,29 +2149,34 @@ def debug_gen_code(code):
     for instr in code:
         if isinstance(instr,Instr):
             for pd,a in zip(instr.op.param_dirs,instr.args):
+                if isinstance(a,Target): continue
+
                 arg = convert_val(a)
+                if arg is None: continue
 
-                if arg is not None:
+                if pd.writes:
                     if pd.reads:
-                        if pd.writes:
-                            op = 'readwrite_op'
-                        else:
-                            op = 'read_op'
+                        op = 'readwrite_op'
                     else:
-                        assert pd.writes
                         op = 'write_op'
+                else:
+                    op = 'read_op'
 
-                    code_str.append('ir.Instr({},{})'.format(op,arg))
+                line = 'ir.Instr({},{})'.format(op,arg)
+                if line != code_str[-1]:
+                    code_str.append(line)
         elif isinstance(instr,Target):
             code_str.append(targets[instr])
         elif isinstance(instr,IRJump):
-            code_str.append('ir.IRJump({},{!r})'.format(targets[instr.dest],instr.conditional))
+            code_str.append('ir.IRJump({},{!r},0)'.format(targets[instr.dest],instr.conditional))
         elif isinstance(instr,IndirectMod):
             code_str.append('ir.IndirectMod({},ir.LocationType.{})'.format(
                 convert_val(instr.var),
                 'register' if instr.loc_type == LocationType.register else 'stack'))
         elif isinstance(instr,CreateVar):
             code_str.append('ir.CreateVar({},ir.{!r})'.format(convert_val(instr.var),instr.val))
+        elif isinstance(instr,(LockRegs,UnlockRegs,InvalidateRegs)):
+            code_str.append('ir.{!r}'.format(instr))
 
     r = []
     for name in targets.values():
