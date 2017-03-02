@@ -14,7 +14,7 @@
 
 import copy
 from functools import partial
-from typing import cast,List,Optional,Sequence,Tuple,Type,Union
+from typing import cast,List,Optional,Sequence,Tuple,Union
 
 from . import abi
 from . import debug
@@ -1116,7 +1116,7 @@ class BasicOps:
                     for t in reversed(jt.targets):
                         table = jmp_d(
                             Displacement(
-                                jt.here.displacement - t.displacement + dist_extra,
+                                t.displacement - jt.here.displacement + dist_extra,
                                 force_wide)) + table
                         dist_extra += jmp_size
 
@@ -1124,7 +1124,7 @@ class BasicOps:
                     break
             else:
                 # We don't need the actual table. We can just do JMP reg * diff1
-                spacing = -diff1
+                spacing = diff1
 
             r = b''
 
@@ -1170,7 +1170,7 @@ class BasicOps:
 
 class JumpTable:
     def __init__(self,targets : Sequence[Target]) -> None:
-        assert len(targets) > 2
+        assert len(targets) >= 2
         self.targets = targets
         self.here = Target()
 
@@ -1285,8 +1285,11 @@ class X86OpGen(JumpCondOpGen):
     def move(self,src : Value,dest : MutableValue) -> IRCode:
         return [Instr(self.ops.macro_mov,src,dest)]
 
-    def jump(self,dest : Target) -> IRCode:
-        return [Instr(self.ops.jmp,dest),IRJump(dest,False,1)]
+    def jump(self,dest : Union[Value,Target]) -> IRCode:
+        r = [Instr(self.ops.jmp,dest)] # type: IRCode
+        if isinstance(dest,Target):
+            r.append(IRJump(dest,False,1))
+        return r
 
     def _basic_jump_if(self,dest,cond) -> IRCode:
         if cond.a == 0 or (isinstance(cond.b,(Immediate,int)) and cond.b != 0):
@@ -1316,13 +1319,15 @@ class X86OpGen(JumpCondOpGen):
 
             return self.jump_if(targets[0],BinCmp(val,Immediate(0),CmpType.eq))
 
+        jt = JumpTable(targets)
+
         # the two Vars are just temporaries needed by the rather involved "op"
-        return [Instr(self.ops.jump_table,JumpTable(targets),val,Var(),Var())]
+        return [Instr(self.ops.jump_table,jt,val,Var(),Var()),jt.here,IRJump(targets,True,2)]
 
     def _reg_to_ir(self,reg):
         return FixedRegister(self.abi.reg_indices[reg])
 
-    def _func_arg(self,i,prev_frame=False):
+    def get_func_arg(self,i,prev_frame=False):
         if i < len(self.abi.r_arg):
             return self._reg_to_ir(self.abi.r_arg[i])
 
@@ -1330,25 +1335,15 @@ class X86OpGen(JumpCondOpGen):
             i -= len(self.abi.r_arg)
         return ArgStackItem(i,prev_frame)
 
-    def _call_impl(self,func : Value,args : Sequence[Value]=(),store_ret : Optional[Var]=None) -> IRCode:
-        arg_r_indices = [self.abi.reg_indices[r] for r in self.abi.r_arg[0:min(len(self.abi.r_arg),len(args))]]
-
-        r = [] # type: IRCode
-        if arg_r_indices: r.append(LockRegs(arg_r_indices))
-
-        for i,arg in enumerate(args):
-            r += self.move(arg,self._func_arg(i))
-
+    def _call_preloaded_impl(self,func,args : int,store_ret : Optional[Var]):
         scratch = self.abi.r_scratch[:]
         scratch.append(self.abi.r_ret)
-        scratch.extend(self.abi.r_arg[min(len(self.abi.r_arg),len(args)):])
+        scratch.extend(self.abi.r_arg[min(len(self.abi.r_arg),args):])
 
-        r.append(InvalidateRegs(
-            [self.abi.reg_indices[r] for r in scratch],
-            [self.abi.reg_indices[r] for r in self.abi.r_pres]))
-        r.append(Instr(self.ops.call,func))
-
-        if arg_r_indices: r.append(UnlockRegs(arg_r_indices))
+        r = [InvalidateRegs(
+                [self.abi.reg_indices[reg] for reg in scratch],
+                [self.abi.reg_indices[reg] for reg in self.abi.r_pres]),
+            Instr(self.ops.call,func)] # type: IRCode
 
         if store_ret is not None:
             r.append(CreateVar(store_ret,self._reg_to_ir(self.abi.r_ret)))
@@ -1370,9 +1365,6 @@ class X86OpGen(JumpCondOpGen):
 
     def get_compiler(self,regs_used : int,stack_used : int,args_used : int):
         return X86Compiler(self.abi,self.ops,regs_used,stack_used,args_used)
-
-    def get_cur_func_arg(self,i : int):
-        return self._func_arg(i,True)
 
     def allocater_extra_state(self):
         return X86ExtraState(self.ops)
@@ -1436,7 +1428,7 @@ class X86Compiler(IRCompiler):
     def prolog(self):
         # The function return value is already on the stack. We push the
         # registers that we need to preserve, onto the stack and move the stack
-        # pointer down.
+        # pointer down, to reserve the stack space we will need.
         r = annotate(debug.RETURN_ADDRESS)
         for i in range(self.regs_saved):
             reg = self.abi.r_pres[i]
@@ -1472,14 +1464,14 @@ class X86Compiler(IRCompiler):
     def get_reg(self,index : int,size : int):
         return self.abi.Register(size or self.abi.ptr_size,cast(Register,self.abi.all_regs[index]).code)
 
-    def get_stack_addr(self,index : int,size : int,sect : StackSection):
+    def get_stack_addr(self,index : int,offset : int,size : int,sect : StackSection):
         if sect == StackSection.local:
-            offset = (self.stack_size - (index + self.unreserved_offset) - 1) * self.abi.ptr_size
+            offset += (self.stack_size - (index + self.unreserved_offset) - 1) * self.abi.ptr_size
         elif sect == StackSection.args:
-            offset = index * self.abi.ptr_size
+            offset += index * self.abi.ptr_size
         else:
             assert sect == StackSection.previous
-            offset = (self.stack_size + index) * self.abi.ptr_size
+            offset += (self.stack_size + index) * self.abi.ptr_size
         return self.abi.Address(offset,self.abi.r_sp,size=size or self.abi.ptr_size)
 
     def get_displacement(self,amount : int,force_wide : bool):

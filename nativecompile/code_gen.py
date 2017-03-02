@@ -216,15 +216,15 @@ def resolve_jumps(cgen : OpGen,regs : int,code1 : IRCode,end_targets=(),*,assemb
 
 
 class DelayedCompile:
-    def compile(self):
+    def compile(self,s):
         raise NotImplementedError()
 
     @staticmethod
-    def process(code):
+    def process(cgen,code):
         r = []
         for op in code:
             if isinstance(op,DelayedCompile):
-                r.extend(op.compile())
+                r.extend(op.compile(cgen))
             else:
                 r.append(op)
 
@@ -286,8 +286,8 @@ class StackCleanupSection(DelayedCompile):
     # the middle of sections, so that sections need only to intersect; in such
     # a case, different orderings of actions would need to be considered for
     # finding the optimal arrangement.
-    def compile(self):
-        s = Stitch(self.abi).comment('cleanup start')(self.start)
+    def compile(self,cgen):
+        s = Stitch(cgen).comment('cleanup start')(self.start)
         best = None
         if self.locations:
             next_ = self.next
@@ -311,7 +311,7 @@ class StackCleanupSection(DelayedCompile):
         else:
             if self.action: self.action(s)
             if isinstance(self.dest,StackCleanupSection):
-                s.extend(self.dest.compile())
+                s.extend(self.dest.compile(cgen))
             else:
                 s.jmp(self.dest)
 
@@ -590,7 +590,7 @@ def borrow(x):
     return BorrowedValue(x)
 
 class StolenValue(StitchValue):
-    def __init__(self,val : TrackedValue) -> None:
+    def __init__(self,val : MaybeTrackedValue) -> None:
         self.val = val
         self.loc = None
 
@@ -603,9 +603,12 @@ class StolenValue(StitchValue):
             else:
                 self.loc = self.val(s)
 
-                if s.state.owned(self.val):
-                    s.state.disown(self.val)
-                elif isinstance(self.val,PyObject):
+                if isinstance(self.val,TrackedValue):
+                    if s.state.owned(self.val):
+                        s.state.disown(self.val)
+                    elif isinstance(self.val,PyObject):
+                        s.incref(self.loc)
+                elif isinstance(self.val,BorrowedValue) and isinstance(self.val.value,PyObject):
                     s.incref(self.loc)
                 else:
                     raise ValueError('object is neither owned nor reference-counted')
@@ -617,6 +620,8 @@ class StolenValue(StitchValue):
 steal = StolenValue
 
 class ConstValue(MaybeTrackedValue):
+    """Represents an absolute address to a Python object."""
+
     def __init__(self,value : Value) -> None:
         self.value = value
 
@@ -807,9 +812,10 @@ class State:
 
     def owned_items(self) -> Iterable[Tuple[TrackedValue,int]]:
         for wrap,cd in self._tracked_vals.items():
-            if cd is None: continue
             val = wrap()
-            if val is not None: yield val,cd
+            if val is None:
+                raise ValueError('one or more instances of TrackedValue was never disowned')
+            yield val,cd
 
     def own(self,x : TrackedValue,cleanup_depth : int) -> None:
         """Mark x as being owned.
@@ -866,8 +872,8 @@ else:
 class Stitch:
     """Create machine code concisely using method chaining"""
 
-    def __init__(self,abi_ : 'abi.Abi',state : Optional[State]=None,cleanup : Optional[StackCleanup]=None) -> None:
-        self.cgen = abi_.code_gen(abi_) # type: OpGen
+    def __init__(self,cgen : OpGen,state : Optional[State]=None,cleanup : Optional[StackCleanup]=None) -> None:
+        self.cgen = cgen
         self._scopes = [MainScope(state or State())] # type: List[Scope]
 
         self.cleanup = cleanup or StackCleanup()
@@ -1002,6 +1008,17 @@ class Stitch:
 
         return self
 
+    def call_preloaded(self,func,arg_count,store_ret=None):
+        self._debug_append(self.cgen.call_preloaded(
+            make_arg(self,func),
+            arg_count,
+            make_arg(self,store_ret)))
+
+        if isinstance(func,str):
+            self.comment(func,inline=True)
+
+        return self
+
     def get_threadstate(self,dest):
         # as far as I can tell, after expanding the macros and removing the
         # "dynamic annotations" (see dynamic_annotations.h in the CPython
@@ -1085,6 +1102,8 @@ class Stitch:
         return self._debug_append(self.cgen.return_value(make_arg(self,val)))
 
     def jump_table(self,val,targets):
+        """Generate a jump table that will jump to the corresponding target
+        of the index in 'val'."""
         return self.extend(self.cgen.jump_table(make_arg(self,val),targets))
 
     def __call__(self,op,*,is_jmp=None):

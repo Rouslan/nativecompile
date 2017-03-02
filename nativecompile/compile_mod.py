@@ -123,7 +123,13 @@ def maybe_unicode(node : ast.AST) -> bool:
     return not isinstance(node,(ast.Num,ast.Bytes,ast.Ellipsis,ast.List,ast.Tuple))
 
 class _ParsedValue:
-    """A fake AST node to allow inserting arbitrary values into AST trees"""
+    """A fake AST node to allow inserting arbitrary values into AST trees.
+
+    Note that since AST nodes normally create new Python objects, this class
+    effectively steals a reference. To pass an owned object without losing
+    ownership, wrap it in borrow().
+
+    """
 
     def __init__(self,value):
         self.value = value
@@ -158,9 +164,8 @@ else:
 
 # noinspection PyPep8Naming
 class ExprCompiler:
-    def __init__(self,abi,s_table=None,s_map=None,u_funcs=None,global_scope=False,entry_points=None):
-        self.abi = abi
-        self.code = Stitch(abi)
+    def __init__(self,cgen,s_table=None,s_map=None,u_funcs=None,global_scope=False,entry_points=None):
+        self.code = Stitch(cgen)
         self.stable = s_table
         self.sym_map = s_map
         self.u_funcs = u_funcs
@@ -176,6 +181,7 @@ class ExprCompiler:
         self.func_end = Target()
         self.var_frame = Var('var_frame',dbg_symbol='__f')
         self.var_globals = Var('var_globals')
+        self.var_locals = Var('var_locals')
         self.var_free = Var('var_free')
         self.var_return = Var('var_return')
 
@@ -188,9 +194,13 @@ class ExprCompiler:
 
             # noinspection PyUnresolvedReferences
             self.cell_vars = frozenset(s_table._Function__idents_matching(
-                lambda x:((x >> symtable.SCOPE_OFF) & symtable.SCOPE_MASK) == symtable.CELL))
+                lambda x: ((x >> symtable.SCOPE_OFF) & symtable.SCOPE_MASK) == symtable.CELL))
         else:
             self.cell_vars = frozenset()
+
+    @property
+    def abi(self):
+        return self.code.cgen.abi
 
     def is_local(self,x):
         if not isinstance(x,symtable.Symbol): x = self.stable.lookup(x)
@@ -440,26 +450,25 @@ class ExprCompiler:
 
             self.code.endif()
 
-            targets = []
+            targets = [arg_target1] + [Target() for _ in range(len(args.args))]
 
             (self.code
                 .comment('set positional arguments')
                 .jump_table(missing_args,targets))
 
-            for i,a in reversed(list(enumerate(args.args))):
-                target = Target() if targets else arg_target1
-                targets.append(target)
+            t_itr = iter(targets)
+
+            for i in range(len(args.args)-1,-1,-1):
+                a = args.args[i]
                 tmp = Var()
 
                 (self.code
-                    (target)
+                    (next(t_itr))
                     .mov(tuple_item(r_args,i),tmp)
                     .mov(tmp,self.local_addrs[a.arg])
                     .incref(tmp))
 
-            target = Target()
-            targets.append(target)
-            self.code(target)
+            self.code(next(t_itr))
 
             def with_dict(s,mark_miss,mark_hit,r_kwds):
                 d_index = Var()
@@ -505,9 +514,10 @@ class ExprCompiler:
             def without_dict(s,mark_miss):
                 # just set the defaults.
 
-                targets = []
                 def_len = Var('def_len')
                 first_def = Var('first_def')
+
+                targets = [Target() for _ in range(len(args.args)+1)]
 
                 (s
                     .mov(CType('PyVarObject',defaults).ob_size,def_len)
@@ -524,19 +534,15 @@ class ExprCompiler:
                     .jump_table(first_def,targets))
 
                 for i,a in enumerate(args.args):
-                    target = Target()
-                    targets.append(target)
                     tmp = Var('tmp')
 
                     (s
-                        (target)
+                        (targets[i])
                         .mov(tuple_item(defaults,i),tmp)
                         .mov(tmp,self.local_addrs[a.arg])
                         .incref(tmp))
 
-                target = Target()
-                targets.append(target)
-                s(target)
+                s(targets[-1])
 
             self.do_kw_args(args,func_self,func_kwds,with_dict,without_dict)
         else:
@@ -614,21 +620,19 @@ class ExprCompiler:
                     assert tmp1 is not None
                     self.code.if_(tmp1).decref(tmp1).endif()
             else:
-                locals_ = Var('locals_')
                 setitem = Var('setitem')
                 ret = Var('ret')
 
                 (self.code
-                    .mov(self.code.special_addrs['locals'],locals_)
-                    .if_(not_(locals_))
+                    .if_(not_(self.var_locals))
                         .call('PyErr_Format','PyExc_SystemError','NO_LOCALS_STORE_MSG')
                         (self.exc_cleanup())
                     .endif()
                     .mov('PyObject_SetItem',setitem)
-                    .if_('PyDict_Type' == type_of(locals_))
+                    .if_('PyDict_Type' == type_of(self.var_locals))
                         .mov('PyDict_SetItem',setitem)
                     .endif()
-                    .call(setitem,locals_,self.get_name(name),steal(expr),store_ret=ret)
+                    .call(setitem,self.var_locals,self.get_name(name),steal(expr),store_ret=ret)
                     (self.check_err(ret,True)))
         else:
             assert not (s.is_free() or self.is_cell(s))
@@ -799,6 +803,116 @@ class ExprCompiler:
             (arg2.discard))
 
         return r
+
+    def make_function(self,node : Union[ast.FunctionDef,ast.ClassDef],args : Optional[ast.arguments]=None,returns : Optional[ast.expr]=None):
+        body = create_uninitialized(pyinternals.FunctionBody)
+
+        func = compile_eval(node,self.sym_map,self.abi,self.u_funcs,self.entry_points,False,node.name,body,args)
+
+        doc = 0
+
+        if sys.flags.optimize < 2:
+            d_str = ast.get_docstring(node)
+            if d_str is not None:
+                doc = self.get_const(d_str)
+
+        defaults = 0
+        if args and args.defaults:
+            defaults = self.visit_Tuple(ast.Tuple(args.defaults,ast.Load()))
+
+        kwdefaults = 0
+        if args and args.kw_defaults:
+            kwdefaults = ObjArrayValue(Var('kwdefaults'))
+
+            (self.code
+                .call('PyMem_Malloc',len(args.kwonlyargs)*self.abi.ptr_size,store_ret=kwdefaults)
+                (self.check_err(kwdefaults))
+                .own(kwdefaults))
+
+            assert args.kwonlyargs and len(args.kwonlyargs) == len(args.kw_defaults)
+
+            for i,a in enumerate(args.kw_defaults):
+                if a is not None:
+                    val = self.visit(a)
+                    self.code.mov(steal(val),SIndirect(i*SIZE_PTR,kwdefaults.value))
+                else:
+                    self.code.mov(0,SIndirect(i*SIZE_PTR,kwdefaults.value))
+
+        free_items = 0
+        if func.free_names:
+            free_items = ObjArrayValue(Var('free_items'))
+
+            (self.code
+                .call('PyMem_Malloc',len(func.free_names)*self.abi.ptr_size,store_ret=free_items)
+                (self.check_err(free_items))
+                .own(free_items))
+
+            # cells get moved directly and don't need any special handling
+            for i,n in enumerate(func.free_names):
+                s = self.stable.lookup(n)
+                if s.is_free():
+                    src = tuple_item(self.var_free,self.free_var_indexes[n])
+                else:
+                    src = self.local_addrs[n]
+
+                tmp = Var()
+                (self.code
+                    .mov(src,tmp)
+                    .mov(tmp,SIndirect(i*SIZE_PTR,free_items.value)))
+                if self.is_cell(s):
+                    self.code.incref(tmp)
+                else:
+                    self.code.if_(tmp).incref(tmp).endif()
+
+        annots = 0
+        a_keys = []
+        a_vals = []
+
+        def add_annot(k,v):
+            a_keys.append(ast.Str(k))
+            a_vals.append(v)
+
+        def add_annot_arg(a):
+            if a.annotation:
+                add_annot(a.arg,a.annotation)
+
+        if returns: add_annot('return',returns)
+        if args:
+            for a in args.args: add_annot_arg(a)
+            if args.vararg: add_annot_arg(args.vararg)
+            for a in args.kwonlyargs: add_annot_arg(a)
+            if args.kwarg: add_annot_arg(args.kwarg)
+
+        if a_keys:
+            annots = self.visit_Dict(ast.Dict(a_keys,a_vals))
+
+        fobj = PyObject()
+        (self.code
+            .call('new_function',
+                self.get_const(body),
+                self.get_name(node.name),
+                self.var_globals,
+                doc,
+                defaults,
+                kwdefaults and steal(kwdefaults),
+                free_items and steal(free_items),
+                annots,
+                store_ret=fobj)
+            (self.check_err(fobj))
+            .own(fobj))
+
+        if defaults: defaults.discard(self.code)
+        if annots: annots.discard(self.code)
+
+        return fobj
+
+    @staticmethod
+    def apply_decorators(obj,decorators):
+        alt_node = _ParsedValue(obj)
+        for d in reversed(decorators):
+            alt_node = ast.Call(d,[alt_node],[],None,None,lineno=d.lineno,col_offset=d.col_offset)
+
+        return alt_node
 
     def get_const(self,val,node_var=None):
         c = self.consts.get(val)
@@ -991,117 +1105,42 @@ class ExprCompiler:
         assert False
 
     def visit_FunctionDef(self,node):
-        body = create_uninitialized(pyinternals.FunctionBody)
+        fobj = self.make_function(node,node.args,node.returns)
 
-        func = compile_eval(node,self.sym_map,self.abi,self.u_funcs,self.entry_points,False,node.name,body,node.args)
-
-        doc = 0
-
-        if sys.flags.optimize < 2:
-            d_str = ast.get_docstring(node)
-            if d_str is not None:
-                doc = self.get_const(d_str)
-
-        defaults = 0
-        if node.args.defaults:
-            defaults = self.visit_Tuple(ast.Tuple(node.args.defaults,ast.Load()))
-
-        kwdefaults = 0
-        if node.args.kw_defaults:
-            kwdefaults = ObjArrayValue(Var('kwdefaults'))
-
-            (self.code
-                .call('PyMem_Malloc',len(node.args.kwonlyargs)*self.abi.ptr_size,store_ret=kwdefaults)
-                (self.check_err(kwdefaults))
-                .own(kwdefaults))
-
-            assert node.args.kwonlyargs and len(node.args.kwonlyargs) == len(node.args.kw_defaults)
-
-            for i,a in enumerate(node.args.kw_defaults):
-                if a is not None:
-                    val = self.visit(a)
-                    self.code.mov(steal(val),SIndirect(i*SIZE_PTR,kwdefaults.value))
-                else:
-                    self.code.mov(0,SIndirect(i*SIZE_PTR,kwdefaults.value))
-
-        free_items = 0
-        if func.free_names:
-            free_items = ObjArrayValue(Var('free_items'))
-
-            (self.code
-                .call('PyMem_Malloc',len(func.free_names)*self.abi.ptr_size,store_ret=free_items)
-                (self.check_err(free_items))
-                .own(free_items))
-
-            # cells get moved directly and don't need any special handling
-            for i,n in enumerate(func.free_names):
-                s = self.stable.lookup(n)
-                if s.is_free():
-                    src = tuple_item(self.var_free,self.free_var_indexes[n])
-                else:
-                    src = self.local_addrs[n]
-
-                tmp = Var()
-                (self.code
-                    .mov(src,tmp)
-                    .mov(tmp,SIndirect(i*SIZE_PTR,free_items.value)))
-                if self.is_cell(s):
-                    self.code.incref(tmp)
-                else:
-                    self.code.if_(tmp).incref(tmp).endif()
-
-        annots = 0
-        a_keys = []
-        a_vals = []
-
-        def add_annot(k,v):
-            a_keys.append(ast.Str(k))
-            a_vals.append(v)
-
-        def add_annot_arg(a):
-            if a.annotation:
-                add_annot(a.arg,a.annotation)
-
-        if node.returns: add_annot('return',node.returns)
-        for a in node.args.args: add_annot_arg(a)
-        if node.args.vararg: add_annot_arg(node.args.vararg)
-        for a in node.args.kwonlyargs: add_annot_arg(a)
-        if node.args.kwarg: add_annot_arg(node.args.kwarg)
-
-        if a_keys:
-            annots = self.visit_Dict(ast.Dict(a_keys,a_vals))
-
-        fobj = PyObject()
-        (self.code
-            .call('new_function',
-                self.get_const(body),
-                self.get_name(node.name),
-                self.var_globals,
-                doc,
-                defaults,
-                kwdefaults and steal(kwdefaults),
-                free_items and steal(free_items),
-                annots,
-                store_ret=fobj)
-            (self.check_err(fobj))
-            .own(fobj))
-
-        if defaults: defaults.discard(self.code)
-        if annots: annots.discard(self.code)
-
-        # the decorator application and name assignment can be broken down into
-        # other AST nodes
-
-        alt_node = _ParsedValue(fobj)
-        for d in reversed(node.decorator_list):
-            alt_node = ast.Call(d,[alt_node],[],None,None,lineno=d.lineno,col_offset=d.col_offset)
-
-        self.visit(ast.Assign([ast.Name(node.name,ast.Store())],alt_node,lineno=node.lineno,col_offset=node.col_offset))
+        self.visit(ast.Assign(
+            [ast.Name(node.name,ast.Store())],
+            self.apply_decorators(fobj,node.decorator_list),
+            lineno=node.lineno,
+            col_offset=node.col_offset))
 
         fobj.discard(self.code)
 
     def visit_ClassDef(self,node):
-        raise NotImplementedError()
+        #build_class = PyObject(Var('build_class'))
+        #frame = CType('PyFrameObject',self.var_frame)
+
+        #(self.code
+        #    .call('_load_build_class',frame.f_builtins,store_ret=build_class)
+        #    (self.check_err(build_class))
+        #    .own(build_class))
+
+        body_func = self.make_function(node)
+        new_class = self.visit_Call(
+            ast.Call(
+                #_ParsedValue(build_class),
+                _ParsedValue(self.get_const(pyinternals.build_class)),
+                [_ParsedValue(body_func),_ParsedValue(self.get_name(node.name))] + node.bases,
+                node.keywords,
+                None,
+                None))
+
+        self.visit(ast.Assign(
+            [ast.Name(node.name,ast.Store())],
+            self.apply_decorators(new_class,node.decorator_list),
+            lineno=node.lineno,
+            col_offset=node.col_offset))
+
+        new_class.discard(self.code)
 
     def visit_Return(self,node):
         if node.value:
@@ -1112,6 +1151,8 @@ class ExprCompiler:
         for oval,depth in self.code.state.owned_items():
             if oval is not val:
                 oval.discard(self.code)
+        if isinstance(val,TrackedValue):
+            self.code.state.disown(val)
 
         self.code.jmp(self.func_end)
 
@@ -1262,7 +1303,31 @@ class ExprCompiler:
             (itr.discard))
 
     def visit_While(self,node):
-        raise NotImplementedError()
+        context = self.new_context(LoopContext)
+
+        if_quit = else_quit = False
+
+        self.code(context.begin)
+        self.test_condition(node.test)
+
+        for stmt in node.body:
+            if self.visit(stmt):
+                if_quit = True
+                break
+
+        self.code.jmp(context.begin)
+        self.end_context(context)
+
+        if node.orelse:
+            self.code.else_()
+            for stmt in node.orelse:
+                if self.visit(stmt):
+                    else_quit = True
+                    break
+
+        self.code(context.break_)
+
+        return if_quit and else_quit
 
     def visit_If(self,node):
         self.test_condition(node.test)
@@ -1286,7 +1351,86 @@ class ExprCompiler:
         return if_quit and else_quit
 
     def visit_With(self,node):
-        raise NotImplementedError()
+        items_head,*items_tail = node.items
+
+        val = self.visit(items_head)
+        exit_ = PyObject(Var('exit'))
+        enter = PyObject(Var('enter'))
+        as_obj = PyObject(Var('as_obj'))
+
+        (self.code
+            .call('special_lookup',val,'PyId__exit__',store_ret=exit_)
+            (self.check_err(exit_))
+            .own(exit_)
+            .call('special_lookup',val,'PyId__enter__',store_ret=enter)
+            (val.discard)
+            (self.check_err(enter))
+            .own(enter)
+            .call('PyObject_CallObject',enter,0,store_ret=as_obj)
+            (enter.discard)
+            .own(as_obj))
+
+        context = self.new_context(TryContext)
+
+        if items_head.optional_vars is not None:
+            self.assign_expr(items_head.optional_vars,as_obj)
+        as_obj.discard(self.code)
+
+        if items_tail:
+            self.visit_With(ast.With(items_tail,node.body))
+        else:
+            for stmt in node.body:
+                self.visit(stmt)
+
+        self.unwind_to(context.target,context)
+
+        self.end_context(context)
+        self.code(context.target)
+
+        ret_addr = Var()
+        exit_r = PyObject(Var('exit_r'))
+        self.code.get_return_address(ret_addr)
+
+        exc_vals = [PyObject(),PyObject(),PyObject()]
+        exc_addrs = [Var(),Var(),Var()]
+
+        for val,addr in zip(exc_vals,exc_addrs):
+            self.code.lea(val,addr)
+
+        self.code.call('PyErr_Fetch',*exc_addrs)
+
+        for val in exc_vals:
+            self.code.touched_indirectly(val).own(val)
+
+        tmp = Var()
+
+        (self.code
+            .if_(exc_vals[0]))
+        for i,val in enumerate(exc_vals): self.code.mov(val,self.code.cgen.get_func_arg(i))
+        (self.code
+            .else_()
+                .mov('Py_None',tmp))
+        for i in range(len(exc_vals)): self.code.mov(tmp,self.code.cgen.get_func_arg(i))
+        (self.code
+            .endif())
+
+        args_tup = self.visit_Tuple(
+            ast.Tuple([_ParsedValue(borrow(v)) for v in exc_vals],ast.Load()))
+
+        (self.code
+            .call('PyObject_CallObject',exit_,args_tup,store_ret=exit_r)
+            (args_tup.discard)
+            (self.check_err(exit_r))
+            .own(exit_r)
+            .if_(exc_vals[0])
+                .call('PyObject_IsTrue',exit_r,store_ret=tmp)
+                .if_(tmp)
+                    .call('PyErr_Restore',*[steal(v) for v in exc_vals])
+                .endif()
+            .endif()
+            (exit_r.discard))
+
+        self.code.jmp(ret_addr)
 
     def visit_Raise(self,node):
         raise NotImplementedError()
@@ -1381,7 +1525,7 @@ class ExprCompiler:
             ret_addr = Var()
             self.code.get_return_address(ret_addr)
 
-            exc_vals = [Var(),Var(),Var()]
+            exc_vals = [PyObject(),PyObject(),PyObject()]
             exc_addrs = [Var(),Var(),Var()]
 
             for val,addr in zip(exc_vals,exc_addrs):
@@ -1390,14 +1534,16 @@ class ExprCompiler:
             self.code.call('PyErr_Fetch',*exc_addrs)
 
             for val in exc_vals:
-                self.code.touched_indirectly(val)
+                self.code.touched_indirectly(val).own(val)
 
             for stmt in node.finalbody:
-                if self.visit(stmt): break
+                if self.visit(stmt):
+                    for v in exc_vals: v.discard(self.code)
+                    break
             else:
                 (self.code
                     .if_(exc_vals[0])
-                        .call('PyErr_Restore',*exc_vals)
+                        .call('PyErr_Restore',*[steal(v) for v in exc_vals])
                     .endif())
 
                 self.code.jmp(ret_addr)
@@ -1428,10 +1574,12 @@ class ExprCompiler:
     def visit_Break(self,node):
         context = self.top_context(LoopContext)
         self.code.jmp(context.break_)
+        return True
 
     def visit_Continue(self,node):
         context = self.top_context(LoopContext)
         self.code.jmp(context.begin)
+        return True
 
     def  _boolop_iteration(self,op,values,r):
         if len(values) > 1:
@@ -1773,13 +1921,13 @@ class ExprCompiler:
 
             (self.code
                 .if_(not_(r))
-                    .call('PyErr_Format',
+                    .call('format_exc_check_arg',
                         'PyExc_UnboundLocalError',
                         'UNBOUNDLOCAL_ERROR_MSG',
                         self.get_name(node.id))
                     (self.exc_cleanup())
-                .endif()
-                .own(r))
+                .endif())
+            # we don't call own because we didn't increment the reference count
 
             return r
 
@@ -1828,7 +1976,7 @@ class ExprCompiler:
 def simple_frame(func_name):
     def decorator(func_name,f):
         def inner(abi):
-            s = Stitch(abi)
+            s = Stitch(abi.code_gen(abi))
             f(s)
             r = resolve_jumps(s.cgen,abi.gen_regs,destitch(s),assembly=abi.assembly)
             r.name = func_name
@@ -1953,7 +2101,7 @@ def global_name_func(s : Stitch):
 def resume_generator_func(abi):
     # the parameter is expected to be an address to a Generator instance
 
-    s = Stitch(abi)
+    s = Stitch(abi.code_gen(abi))
 
     generator = CType('Generator')
     body = CType('FunctionBody')
@@ -1962,7 +2110,7 @@ def resume_generator_func(abi):
     stack_b_size = Var('stack_b_size')
     i = Var('i')
     (s
-        .create_var(generator,s.cgen.get_cur_func_arg(0))
+        .create_var(generator,s.cgen.get_func_arg(0,True))
         .mov(generator.stack_size,i)
         .mov(generator.body,body)
         .mov(generator.stack,stack)
@@ -1986,9 +2134,10 @@ def resume_generator_func(abi):
 ProtoFunction = namedtuple('ProtoFunction',['name','code'])
 
 class PyFunction:
-    def __init__(self,fb_obj,func,names,args,free_names,cells,consts):
+    def __init__(self,fb_obj,func,cgen,names,args,free_names,cells,consts):
         self.fb_obj = fb_obj or create_uninitialized(pyinternals.FunctionBody)
         self.func = func
+        self.cgen = cgen
 
         self.names = names
         self.args = args
@@ -2038,7 +2187,7 @@ class UtilityFunction:
 def compile_eval(
         scope_ast : Union[ast.Module,ast.FunctionDef,ast.ClassDef],
         sym_map : Dict[int,symtable.SymbolTable],
-        abi : abi.Abi,
+        abi_ : abi.Abi,
         u_funcs : Dict[str,UtilityFunction],
         entry_points : List,
         global_scope : bool,
@@ -2050,8 +2199,10 @@ def compile_eval(
     #move_throw_flag = (code.co_flags & CO_GENERATOR and len(abi.r_arg) >= 2)
     #mov_throw_flag = False
 
+    cgen = abi_.code_gen(abi_)
+
     # noinspection PyUnresolvedReferences
-    ec = ExprCompiler(abi,sym_map[scope_ast._raw_id],sym_map,u_funcs,global_scope,entry_points)
+    ec = ExprCompiler(cgen,sym_map[scope_ast._raw_id],sym_map,u_funcs,global_scope,entry_points)
 
     #state.throw_flag_store = ec.func_arg(1)
 
@@ -2062,10 +2213,10 @@ def compile_eval(
         #state.throw_flag_store = state.temp_store
         #state.temp_store = state.pstack_addr(-stack_first-1)
 
-    fast_end = Target()
+    #fast_end = Target()
 
     f_obj = CType('PyFrameObject',ec.var_frame)
-    tstate = CType('PyThreadState',Var('tstate'))
+    #tstate = CType('PyThreadState',Var('tstate'))
     func_self = CType('Function',Var('fun_self'))
     func_args = None
     func_kwds = None
@@ -2076,33 +2227,33 @@ def compile_eval(
     if args:
         func_args = Var('func_args')
         func_kwds = Var('func_kwds')
-        ec.code.create_var(func_args,ec.code.cgen.get_cur_func_arg(2))
-        ec.code.create_var(func_kwds,ec.code.cgen.get_cur_func_arg(3))
+        ec.code.create_var(func_args,ec.code.cgen.get_func_arg(2,True))
+        ec.code.create_var(func_kwds,ec.code.cgen.get_func_arg(3,True))
 
-    ec.code.create_var(f_obj,ec.code.cgen.get_cur_func_arg(0))
-    ec.code.create_var(func_self,ec.code.cgen.get_cur_func_arg(1))
+    ec.code.create_var(f_obj,ec.code.cgen.get_func_arg(0,True))
+    ec.code.create_var(func_self,ec.code.cgen.get_func_arg(1,True))
 
-    tmp = Var('tmp')
-    (ec.code
-        .call('_EnterRecursiveCall',store_ret=tmp)
-        .if_(tmp)
-            .mov(0,ec.var_return)
-            .jmp(fast_end)
-        .endif()
-
-        .get_threadstate(tstate)
-
-        .mov(f_obj,tstate.frame))
+    # tmp = Var('tmp')
+    # (ec.code
+    #     .call('_EnterRecursiveCall',store_ret=tmp)
+    #     .if_(tmp)
+    #         .mov(0,ec.var_return)
+    #         .jmp(fast_end)
+    #     .endif()
+    #
+    #     .get_threadstate(tstate)
+    #     .mov(f_obj,tstate.frame))
 
     #if ec.stable.get_globals():
     if True:
-        (ec.code
-            .mov(f_obj.f_globals,ec.var_globals))
+        ec.code.mov(f_obj.f_globals,ec.var_globals)
+
+    if not ec.stable.is_optimized():
+        ec.code.mov(f_obj.f_locals,ec.var_locals)
 
     has_free = isinstance(ec.stable,symtable.Function) and ec.stable.get_frees()
     if has_free:
-        (ec.code
-            .mov(func_self.closure,ec.var_free))
+        ec.code.mov(func_self.closure,ec.var_free)
 
     #naddr = steal(ec.code.fit_addr('Py_None',R_RET))
 
@@ -2167,26 +2318,24 @@ def compile_eval(
     for n in scope_ast.body:
         ec.visit(n)
 
-    # if this is jumped over, it will be elided in a subsequent pass
     (ec.code
+        # if this is jumped over, it will be elided in a subsequent pass
         .mov(ec.get_const(None),ec.var_return)
-        .incref(ec.var_return))
+        .incref(ec.var_return)
 
-    tstate = CType('PyThreadState')
-
-    (ec.code
         (ec.func_end)
         .comment('epilogue')
         (ec.deallocate_locals)
-        (fast_end)
-        .call('_LeaveRecursiveCall')
-        .get_threadstate(tstate)
-        .mov(f_obj.f_back,tstate.frame)
+        #(fast_end)
+        #.call('_LeaveRecursiveCall')
+        #.get_threadstate(tstate)
+        #.mov(f_obj.f_back,tstate.frame)
         .return_value(ec.var_return))
 
     r = PyFunction(
         fb_obj,
-        ProtoFunction(name,DelayedCompile.process(ec.code.code)),
+        ProtoFunction(name,DelayedCompile.process(cgen,ec.code.code)),
+        cgen,
         tuple(ec.names.keys()),
         args,
         tuple(ec.free_var_indexes.keys()),
@@ -2222,7 +2371,7 @@ def compile_raw(code,abi,u_funcs):
 
     for pyfunc in entry_points:
         name,fcode = pyfunc.func
-        pyfunc.func = resolve_jumps(abi.code_gen(abi),abi.gen_regs,fcode,assembly=abi.assembly)
+        pyfunc.func = resolve_jumps(pyfunc.cgen,abi.gen_regs,fcode,assembly=abi.assembly)
         pyfunc.func.name = name
         pyfunc.func.pyfunc = True
         pyfunc.func.returns = debug.TPtr(debug.t_void)

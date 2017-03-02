@@ -174,6 +174,12 @@ void unregister_gdb(const void *addr) {
 
 
 PyObject *str_close=NULL;
+_Py_IDENTIFIER(__import__);
+_Py_IDENTIFIER(__enter__);
+_Py_IDENTIFIER(__exit__);
+_Py_IDENTIFIER(send);
+_Py_IDENTIFIER(__prepare__);
+_Py_IDENTIFIER(metaclass);
 
 
 struct _CompiledCode;
@@ -460,8 +466,8 @@ static void FunctionBody_dealloc(FunctionBody *self) {
 
 /* There is no reason to modify a FunctionBody instance once it's initialized,
    but initialization is done in tp_init and not tp_new so that an instance can
-   be created and have an address in memory, before it is initialized. This is
-   so the function's address can be hard-coded into its own code object. */
+   be created and have an address in memory before it is initialized. This is so
+   the function's address can be hard-coded into its own code object. */
 static int FunctionBody_init(FunctionBody *self,PyObject *args,PyObject *kwds) {
     CompiledCode *code;
     PyObject *name, *names, *free_names, *consts;
@@ -606,27 +612,37 @@ typedef struct {
     FunctionBody *body;
 } Function;
 
-static PyObject *Function_call(Function *self,PyObject *args,PyObject *kwds) {
+static PyObject *exec_function(Function *func,PyObject *args,PyObject *kwds,PyObject *globals,PyObject *locals) {
     PyFrameObject *f;
     PyCodeObject *dummy_code;
     PyThreadState *tstate = PyThreadState_GET();
     PyObject *r = NULL;
 
 
-    assert(self->body && self->globals);
+    assert(func->body && func->globals);
 
     dummy_code = PyCode_NewEmpty("<string>","generated",0);
     if(!dummy_code) return NULL;
 
-    f = PyFrame_New(tstate,dummy_code,self->globals,NULL);
+    if(!globals) globals = func->globals;
+    f = PyFrame_New(tstate,dummy_code,globals,locals);
     Py_DECREF(dummy_code);
 
     if(f) {
-        r = (*(PyObject *(*)(PyFrameObject*,Function*,PyObject*,PyObject*))(self->body->code->data + self->body->offset))(f,self,args,kwds);
+        if(!Py_EnterRecursiveCall("")) {
+            tstate->frame = f;
+            r = (*(PyObject *(*)(PyFrameObject*,Function*,PyObject*,PyObject*))(func->body->code->data + func->body->offset))(f,func,args,kwds);
+            tstate->frame = f->f_back;
+            Py_LeaveRecursiveCall();
+        }
         Py_DECREF(f);
     }
 
     return r;
+}
+
+static PyObject *Function_call(Function *self,PyObject *args,PyObject *kwds) {
+    return exec_function(self,args,kwds,NULL,NULL);
 }
 
 #define FOR_FUNCTION_ATTR(X) \
@@ -1957,7 +1973,172 @@ static PyObject *_load_build_class(PyObject *f_builtins) {
 
 /* end of functions copied from Python/ceval.c */
 
+/* modified function copied from Python/bltinmodule.c */
+static PyObject *
+builtin___build_class__(PyObject *self, PyObject *args, PyObject *kwds)
+{
+    PyObject *func, *name, *bases, *mkw, *meta, *winner, *prep, *ns, *cell;
+    PyObject *cls = NULL;
+    Py_ssize_t nargs;
+    int isclass;
+    int iscompiledfunc = 0;
 
+    assert(args != NULL);
+    if (!PyTuple_Check(args)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "__build_class__: args is not a tuple");
+        return NULL;
+    }
+    nargs = PyTuple_GET_SIZE(args);
+    if (nargs < 2) {
+        PyErr_SetString(PyExc_TypeError,
+                        "__build_class__: not enough arguments");
+        return NULL;
+    }
+    func = PyTuple_GET_ITEM(args, 0);
+    if(PyObject_TypeCheck(func,&FunctionType)) {
+        iscompiledfunc = 1;
+    } else if (!PyFunction_Check(func)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "__build_class__: func must be a function");
+        return NULL;
+    }
+    name = PyTuple_GET_ITEM(args, 1);
+    if (!PyUnicode_Check(name)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "__build_class__: name is not a string");
+        return NULL;
+    }
+    bases = PyTuple_GetSlice(args, 2, nargs);
+    if (bases == NULL)
+        return NULL;
+
+    if (kwds == NULL) {
+        meta = NULL;
+        mkw = NULL;
+    }
+    else {
+        mkw = PyDict_Copy(kwds); /* Don't modify kwds passed in! */
+        if (mkw == NULL) {
+            Py_DECREF(bases);
+            return NULL;
+        }
+        meta = _PyDict_GetItemId(mkw, &PyId_metaclass);
+        if (meta != NULL) {
+            Py_INCREF(meta);
+            if (_PyDict_DelItemId(mkw, &PyId_metaclass) < 0) {
+                Py_DECREF(meta);
+                Py_DECREF(mkw);
+                Py_DECREF(bases);
+                return NULL;
+            }
+            /* metaclass is explicitly given, check if it's indeed a class */
+            isclass = PyType_Check(meta);
+        }
+    }
+    if (meta == NULL) {
+        /* if there are no bases, use type: */
+        if (PyTuple_GET_SIZE(bases) == 0) {
+            meta = (PyObject *) (&PyType_Type);
+        }
+        /* else get the type of the first base */
+        else {
+            PyObject *base0 = PyTuple_GET_ITEM(bases, 0);
+            meta = (PyObject *) (base0->ob_type);
+        }
+        Py_INCREF(meta);
+        isclass = 1;  /* meta is really a class */
+    }
+
+    if (isclass) {
+        /* meta is really a class, so check for a more derived
+           metaclass, or possible metaclass conflicts: */
+        winner = (PyObject *)_PyType_CalculateMetaclass((PyTypeObject *)meta,
+                                                        bases);
+        if (winner == NULL) {
+            Py_DECREF(meta);
+            Py_XDECREF(mkw);
+            Py_DECREF(bases);
+            return NULL;
+        }
+        if (winner != meta) {
+            Py_DECREF(meta);
+            meta = winner;
+            Py_INCREF(meta);
+        }
+    }
+    /* else: meta is not a class, so we cannot do the metaclass
+       calculation, so we will use the explicitly given object as it is */
+    prep = _PyObject_GetAttrId(meta, &PyId___prepare__);
+    if (prep == NULL) {
+        if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+            PyErr_Clear();
+            ns = PyDict_New();
+        }
+        else {
+            Py_DECREF(meta);
+            Py_XDECREF(mkw);
+            Py_DECREF(bases);
+            return NULL;
+        }
+    }
+    else {
+        PyObject *pargs = PyTuple_Pack(2, name, bases);
+        if (pargs == NULL) {
+            Py_DECREF(prep);
+            Py_DECREF(meta);
+            Py_XDECREF(mkw);
+            Py_DECREF(bases);
+            return NULL;
+        }
+        ns = PyEval_CallObjectWithKeywords(prep, pargs, mkw);
+        Py_DECREF(pargs);
+        Py_DECREF(prep);
+    }
+    if (ns == NULL) {
+        Py_DECREF(meta);
+        Py_XDECREF(mkw);
+        Py_DECREF(bases);
+        return NULL;
+    }
+    if(iscompiledfunc) {
+        PyObject *args = PyTuple_New(0);
+        cell = NULL;
+        if(args) {
+            cell = exec_function((Function*)func,args,NULL,NULL,ns);
+            Py_DECREF(args);
+        }
+    } else {
+        cell = PyEval_EvalCodeEx(
+            PyFunction_GET_CODE(func),
+            PyFunction_GET_GLOBALS(func),
+            ns,
+            NULL,
+            0,
+            NULL,
+            0,
+            NULL,
+            0,
+            NULL,
+            PyFunction_GET_CLOSURE(func));
+    }
+    if (cell != NULL) {
+        PyObject *margs;
+        margs = PyTuple_Pack(3, name, bases, ns);
+        if (margs != NULL) {
+            cls = PyEval_CallObjectWithKeywords(meta, margs, mkw);
+            Py_DECREF(margs);
+        }
+        if (cls != NULL && PyCell_Check(cell))
+            PyCell_Set(cell, cls);
+        Py_DECREF(cell);
+    }
+    Py_DECREF(ns);
+    Py_DECREF(meta);
+    Py_XDECREF(mkw);
+    Py_DECREF(bases);
+    return cls;
+}
 
 /* Py_EnterRecursiveCall and Py_LeaveRecursiveCall are somewhat complicated
  * macros so they are wrapped in the following two functions */
@@ -1972,17 +2153,11 @@ static void _LeaveRecursiveCall(void) {
 
 
 
-_Py_IDENTIFIER(__import__);
-_Py_IDENTIFIER(__enter__);
-_Py_IDENTIFIER(__exit__);
-_Py_IDENTIFIER(send);
-
-
-
 static PyMethodDef functions[] = {
     {"read_address",read_address,METH_VARARGS,read_address_doc},
     {"create_cell",create_cell,METH_VARARGS,create_cell_doc},
     {"set_utility_funcs",set_utility_funcs,METH_O,set_utility_funcs_doc},
+    {"build_class",(PyCFunction)builtin___build_class__,METH_VARARGS|METH_KEYWORDS,NULL},
     {NULL}
 };
 
@@ -2324,9 +2499,7 @@ PyInit_pyinternals(void) {
 
     if(!str_close) {
         if(!(str_close = PyUnicode_FromString("close"))) return NULL;
-    } else {
-        Py_INCREF(str_close);
-    }
+    } else Py_INCREF(str_close);
 
     return m;
 }
