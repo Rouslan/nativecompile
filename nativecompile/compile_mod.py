@@ -63,11 +63,14 @@ BINOP_IFUNCS = {
 
 CONST_NODES = ast.Num,ast.Str,ast.Bytes,ast.NameConstant,ast.Ellipsis
 
+# these MUST have the order that the Py_* macros in object.h prescribe
+RICH_CMP_NODES = [ast.Lt,ast.LtE,ast.Eq,ast.NotEq,ast.Gt,ast.GtE]
+
 utility_funcs = None
 
 
 class SyntaxTreeError(Exception):
-    """The abstract syntax tree is malformed or has an incorrect value"""
+    """The abstract syntax tree is malformed or has an invalid value"""
 
 
 def ast_and_symtable_map(code,filename,compile_type):
@@ -111,18 +114,16 @@ class FinallyContext(ScopeContext):
         self.depth = depth
         self.target = Target()
 
-        # A set of targets that the code jumps to, after the end of the finally
-        # block. Normally the finally block needs to be called as a function,
-        # but if there is only one target, we can just jump into the block and
-        # jump to the next target at the end.
-        self.next_targets = set()
+        # A list of targets that the code jumps to, after the end of the
+        # finally block. This is needed for variable lifetime determination
+        self.next_targets = []
 
 
 def maybe_unicode(node : ast.AST) -> bool:
     """Return False iff node will definitely not produce an instance of str"""
     return not isinstance(node,(ast.Num,ast.Bytes,ast.Ellipsis,ast.List,ast.Tuple))
 
-class _ParsedValue:
+class _ParsedValue(ast.AST):
     """A fake AST node to allow inserting arbitrary values into AST trees.
 
     Note that since AST nodes normally create new Python objects, this class
@@ -137,9 +138,10 @@ class _ParsedValue:
 class CallTargetAction:
     def __init__(self,target):
         self.target = target
+        self.ret_target = Target()
 
     def __call__(self,s):
-        s.call(self.target)
+        s.call(self.target)(self.ret_target)
 
     def __hash__(self):
         return hash(self.target)
@@ -284,7 +286,7 @@ class ExprCompiler:
         miss_flag = Var()
 
         def mark_miss(s):
-            s.add(1,miss_flag)
+            s.add(miss_flag,1)
 
         hit_count = Var()
 
@@ -298,7 +300,7 @@ class ExprCompiler:
                         .call('PyDict_DelItem',r_kwds,name,store_ret=r)
                         (self.check_err(r,True)))
                 else:
-                    s.add(1,hit_count)
+                    s.add(hit_count,1)
 
             return inner
 
@@ -809,18 +811,18 @@ class ExprCompiler:
 
         func = compile_eval(node,self.sym_map,self.abi,self.u_funcs,self.entry_points,False,node.name,body,args)
 
-        doc = 0
+        doc = None # type: Optional[ConstValue]
 
         if sys.flags.optimize < 2:
             d_str = ast.get_docstring(node)
             if d_str is not None:
                 doc = self.get_const(d_str)
 
-        defaults = 0
+        defaults = None # type: Optional[MaybeTrackedValue]
         if args and args.defaults:
             defaults = self.visit_Tuple(ast.Tuple(args.defaults,ast.Load()))
 
-        kwdefaults = 0
+        kwdefaults = None # type: Optional[ObjArrayValue]
         if args and args.kw_defaults:
             kwdefaults = ObjArrayValue(Var('kwdefaults'))
 
@@ -838,7 +840,7 @@ class ExprCompiler:
                 else:
                     self.code.mov(0,SIndirect(i*SIZE_PTR,kwdefaults.value))
 
-        free_items = 0
+        free_items = None # type: Optional[ObjArrayValue]
         if func.free_names:
             free_items = ObjArrayValue(Var('free_items'))
 
@@ -864,9 +866,9 @@ class ExprCompiler:
                 else:
                     self.code.if_(tmp).incref(tmp).endif()
 
-        annots = 0
-        a_keys = []
-        a_vals = []
+        annots = None # type: Optional[MaybeTrackedValue]
+        a_keys = [] # type: List[ast.AST]
+        a_vals = [] # type: List[ast.AST]
 
         def add_annot(k,v):
             a_keys.append(ast.Str(k))
@@ -892,17 +894,17 @@ class ExprCompiler:
                 self.get_const(body),
                 self.get_name(node.name),
                 self.var_globals,
-                doc,
-                defaults,
-                kwdefaults and steal(kwdefaults),
-                free_items and steal(free_items),
-                annots,
+                doc or 0,
+                defaults or 0,
+                steal(kwdefaults) if kwdefaults else 0,
+                steal(free_items) if free_items else 0,
+                annots or 0,
                 store_ret=fobj)
             (self.check_err(fobj))
             .own(fobj))
 
-        if defaults: defaults.discard(self.code)
-        if annots: annots.discard(self.code)
+        if defaults is not None: defaults.discard(self.code)
+        if annots is not None: annots.discard(self.code)
 
         return fobj
 
@@ -973,9 +975,9 @@ class ExprCompiler:
             for ec in c.extra_callbacks: callbacks.append(ec)
 
             if isinstance(c,FinallyContext):
-                item_groups.append((
-                    clean_context(c.depth),
-                    CallTargetAction(c.target)))
+                action = CallTargetAction(c.target)
+                item_groups.append((clean_context(c.depth),action))
+                c.next_targets.append(action.ret_target)
                 callbacks.clear()
             if c is until:
                 item_groups.append((clean_context(c.depth),None))
@@ -1353,16 +1355,16 @@ class ExprCompiler:
     def visit_With(self,node):
         items_head,*items_tail = node.items
 
-        val = self.visit(items_head)
+        val = self.visit(items_head.context_expr)
         exit_ = PyObject(Var('exit'))
         enter = PyObject(Var('enter'))
         as_obj = PyObject(Var('as_obj'))
 
         (self.code
-            .call('special_lookup',val,'PyId__exit__',store_ret=exit_)
+            .call('special_lookup',val,self.get_name('__exit__'),store_ret=exit_)
             (self.check_err(exit_))
             .own(exit_)
-            .call('special_lookup',val,'PyId__enter__',store_ret=enter)
+            .call('special_lookup',val,self.get_name('__enter__'),store_ret=enter)
             (val.discard)
             (self.check_err(enter))
             .own(enter)
@@ -1370,7 +1372,8 @@ class ExprCompiler:
             (enter.discard)
             .own(as_obj))
 
-        context = self.new_context(TryContext)
+        t_context = self.new_context(TryContext)
+        f_context = self.new_context(FinallyContext)
 
         if items_head.optional_vars is not None:
             self.assign_expr(items_head.optional_vars,as_obj)
@@ -1382,16 +1385,18 @@ class ExprCompiler:
             for stmt in node.body:
                 self.visit(stmt)
 
-        self.unwind_to(context.target,context)
+        self.unwind_to(t_context.target,t_context)
 
-        self.end_context(context)
-        self.code(context.target)
+        self.end_context(f_context)
+        self.code(f_context.target)
 
+        # the "finally" body is implemented as a local function that uses the
+        # same stack
         ret_addr = Var()
         exit_r = PyObject(Var('exit_r'))
         self.code.get_return_address(ret_addr)
 
-        exc_vals = [PyObject(),PyObject(),PyObject()]
+        exc_vals = [PyObject(nullable=True),PyObject(nullable=True),PyObject(nullable=True)]
         exc_addrs = [Var(),Var(),Var()]
 
         for val,addr in zip(exc_vals,exc_addrs):
@@ -1402,24 +1407,31 @@ class ExprCompiler:
         for val in exc_vals:
             self.code.touched_indirectly(val).own(val)
 
-        tmp = Var()
-
+        args_tup = PyObject()
         (self.code
+            .call('PyTuple_New',3,store_ret=args_tup)
+            (self.check_err(args_tup))
+            .own(args_tup)
             .if_(exc_vals[0]))
-        for i,val in enumerate(exc_vals): self.code.mov(val,self.code.cgen.get_func_arg(i))
+
+        for i,val in enumerate(exc_vals):
+            (self.code
+                .mov(val,tuple_item(args_tup,i))
+                .incref(val))
+
+        tmp = Var()
         (self.code
             .else_()
                 .mov('Py_None',tmp))
-        for i in range(len(exc_vals)): self.code.mov(tmp,self.code.cgen.get_func_arg(i))
+        for i in range(len(exc_vals)): self.code.mov(tmp,tuple_item(args_tup,i))
         (self.code
+                .incref(tmp,3)
             .endif())
-
-        args_tup = self.visit_Tuple(
-            ast.Tuple([_ParsedValue(borrow(v)) for v in exc_vals],ast.Load()))
 
         (self.code
             .call('PyObject_CallObject',exit_,args_tup,store_ret=exit_r)
             (args_tup.discard)
+            (exit_.discard)
             (self.check_err(exit_r))
             .own(exit_r)
             .if_(exc_vals[0])
@@ -1428,9 +1440,11 @@ class ExprCompiler:
                     .call('PyErr_Restore',*[steal(v) for v in exc_vals])
                 .endif()
             .endif()
-            (exit_r.discard))
+            (exit_r.discard)
+            .jmp(ret_addr,f_context.next_targets))
 
-        self.code.jmp(ret_addr)
+        self.end_context(t_context)
+        self.code(t_context.target)
 
     def visit_Raise(self,node):
         raise NotImplementedError()
@@ -1458,14 +1472,17 @@ class ExprCompiler:
 
         if node.handlers:
             exc_val_block = Block(6)
-            exc_vals = [PyObject(v,True) for v in exc_val_block]
+            exc_vals = [PyObject(v) for v in exc_val_block]
             exc_tb,exc_val,exc_type = exc_vals[0:3]
 
             tmp = Var()
             (self.code
                 (e_context.target)
                 .lea(exc_val_block,tmp)
-                .call('prepare_exc_handler',tmp))
+                .call('prepare_exc_handler',tmp)
+                .touched_indirectly(exc_val_block))
+
+            for v in exc_vals: self.code.own(v)
 
             def do_handler(handlers):
                 exc = handlers.pop(0)
@@ -1482,7 +1499,7 @@ class ExprCompiler:
                         cleanup = self.delete_name_cleanup(exc.name)
                         top_context.extra_callbacks.append(cleanup)
 
-                for val in exc_vals[3:]: val.discard(self.code)
+                for val in exc_vals[0:3]: val.discard(self.code)
 
 
                 for stmt in exc.body:
@@ -1514,7 +1531,7 @@ class ExprCompiler:
                 .lea(exc_vals[3],tmp)
                 .call('end_exc_handler',tmp))
 
-            for val in exc_vals[0:3]: val.discard(self.code)
+            for val in exc_vals[3:]: val.discard(self.code)
 
             self.unwind_to(t_context.target,t_context)
 
@@ -1522,6 +1539,8 @@ class ExprCompiler:
             self.end_context(f_context)
             self.code(f_context.target)
 
+            # the "finally" body is implemented as a local function that uses
+            # the same stack
             ret_addr = Var()
             self.code.get_return_address(ret_addr)
 
@@ -1546,7 +1565,7 @@ class ExprCompiler:
                         .call('PyErr_Restore',*[steal(v) for v in exc_vals])
                     .endif())
 
-                self.code.jmp(ret_addr)
+                self.code.jmp(ret_addr,f_context.next_targets)
 
         self.end_context(t_context)
         self.code(t_context.target)
@@ -1761,8 +1780,88 @@ class ExprCompiler:
         raise NotImplementedError()
     def visit_YieldFrom(self,node,node_var=None):
         raise NotImplementedError()
+
+    def _compare_check_bool(self,istrue,invert_test,b,ops,comparators,r,end):
+        (self.code
+            .if_((istrue > 0) if invert_test else (istrue == 0))
+            .mov('Py_False',r)
+            .incref(r)
+            .jmp(end)
+            .elif_(istrue < 0)
+                (self.exc_cleanup())
+            .endif())
+
+        if len(ops) > 1:
+            self._compare_iteration(b,ops[1:],comparators[1:],r,end)
+        else:
+            b.discard(self.code)
+            (self.code
+                .mov('Py_True',r)
+                .incref(r))
+
+    def _compare_iteration(self,a,ops,comparators,r,end):
+        assert len(ops) == len(comparators)
+
+        b = self.visit(comparators[0])
+        istrue = signed(Var('istrue'))
+
+        op_t = ops[0].__class__
+        if op_t in (ast.In,ast.NotIn):
+            (self.code
+                .call('PySequence_Contains',b,a,store_ret=istrue)
+                (a.discard))
+
+            self._compare_check_bool(istrue,op_t == ast.NotIn,b,ops,comparators,r,end)
+        elif op_t in (ast.Is,ast.IsNot):
+            # we don't need its value, only its address
+            a.discard(self.code)
+
+            isfalse = (a != b) if op_t == ast.Is else (a == b)
+
+            if len(ops) > 1:
+                (self.code
+                    .if_(isfalse)
+                        .mov('Py_False',r)
+                        .incref(r)
+                        .jmp(end)
+                    .endif())
+
+                self._compare_iteration(b,ops[1:],comparators[1:],r,end)
+            else:
+                (self.code
+                    (b.discard)
+                    .mov('Py_True',r)
+                    .if_(isfalse)
+                        .mov('Py_False',r)
+                    .endif()
+                    .incref(r))
+        else:
+            assert op_t in RICH_CMP_NODES
+            (self.code
+                .call('PyObject_RichCompare',a,b,RICH_CMP_NODES.index(op_t),store_ret=r)
+                (a.discard))
+
+            if len(ops) > 1:
+                (self.code
+                    (self.check_err(r))
+                    .call('PyObject_IsTrue',r,store_ret=istrue)
+                    .decref(r))
+
+                self._compare_check_bool(istrue,False,b,ops,comparators,r,end)
+            else:
+                (self.code
+                    (self.check_err(r))
+                    (b.discard))
+
     def visit_Compare(self,node,node_var=None):
-        raise NotImplementedError()
+        a = self.visit(node.left)
+        r = PyObject() if node_var is None else node_var
+        end = Target()
+
+        self._compare_iteration(a,node.ops,node.comparators,r,end)
+        self.code(end).own(r)
+        return r
+
     def visit_Call(self,node,node_var=None):
         fobj = self.visit(node.func)
 

@@ -174,12 +174,8 @@ void unregister_gdb(const void *addr) {
 
 
 PyObject *str_close=NULL;
-_Py_IDENTIFIER(__import__);
-_Py_IDENTIFIER(__enter__);
-_Py_IDENTIFIER(__exit__);
-_Py_IDENTIFIER(send);
-_Py_IDENTIFIER(__prepare__);
-_Py_IDENTIFIER(metaclass);
+PyObject *str_prepare=NULL;
+PyObject *str_metaclass=NULL;
 
 
 struct _CompiledCode;
@@ -1835,13 +1831,31 @@ import_all_from(PyObject *locals, PyObject *v)
     return err;
 }
 
+/* modified to use plain string objects instead of _Py_Identifier */
 static PyObject *
-special_lookup(PyObject *o, _Py_Identifier *id)
+lookup_maybe(PyObject *self, PyObject *attrid)
 {
     PyObject *res;
-    res = _PyObject_LookupSpecial(o, id);
+
+    res = _PyType_Lookup(Py_TYPE(self), attrid);
+    if (res != NULL) {
+        descrgetfunc f;
+        if ((f = Py_TYPE(res)->tp_descr_get) == NULL)
+            Py_INCREF(res);
+        else
+            res = f(res, self, (PyObject *)(Py_TYPE(self)));
+    }
+    return res;
+}
+
+/* modified to use plain string objects instead of _Py_Identifier */
+static PyObject *
+special_lookup(PyObject *o, PyObject *id)
+{
+    PyObject *res;
+    res = lookup_maybe(o, id);
     if (res == NULL && !PyErr_Occurred()) {
-        PyErr_SetObject(PyExc_AttributeError, id->object);
+        PyErr_SetObject(PyExc_AttributeError, id);
         return NULL;
     }
     return res;
@@ -2023,10 +2037,10 @@ builtin___build_class__(PyObject *self, PyObject *args, PyObject *kwds)
             Py_DECREF(bases);
             return NULL;
         }
-        meta = _PyDict_GetItemId(mkw, &PyId_metaclass);
+        meta = PyDict_GetItem(mkw, str_metaclass);
         if (meta != NULL) {
             Py_INCREF(meta);
-            if (_PyDict_DelItemId(mkw, &PyId_metaclass) < 0) {
+            if (PyDict_DelItem(mkw, str_metaclass) < 0) {
                 Py_DECREF(meta);
                 Py_DECREF(mkw);
                 Py_DECREF(bases);
@@ -2069,7 +2083,7 @@ builtin___build_class__(PyObject *self, PyObject *args, PyObject *kwds)
     }
     /* else: meta is not a class, so we cannot do the metaclass
        calculation, so we will use the explicitly given object as it is */
-    prep = _PyObject_GetAttrId(meta, &PyId___prepare__);
+    prep = PyObject_GetAttr(meta, str_prepare);
     if (prep == NULL) {
         if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
             PyErr_Clear();
@@ -2140,17 +2154,6 @@ builtin___build_class__(PyObject *self, PyObject *args, PyObject *kwds)
     return cls;
 }
 
-/* Py_EnterRecursiveCall and Py_LeaveRecursiveCall are somewhat complicated
- * macros so they are wrapped in the following two functions */
-
-static int _EnterRecursiveCall(void) {
-    return Py_EnterRecursiveCall("");
-}
-
-static void _LeaveRecursiveCall(void) {
-    Py_LeaveRecursiveCall();
-}
-
 
 
 static PyMethodDef functions[] = {
@@ -2164,6 +2167,8 @@ static PyMethodDef functions[] = {
 void free_module(void *data) {
     Py_XDECREF(((module_data_t*)data)->resume_gen_code);
     Py_DECREF(str_close);
+    Py_DECREF(str_prepare);
+    Py_DECREF(str_metaclass);
 }
 
 static struct PyModuleDef this_module = {
@@ -2358,6 +2363,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR(PyObject_Call),
         ADD_ADDR(PyObject_CallFunctionObjArgs),
         ADD_ADDR(_PyObject_CallMethodId),
+        ADD_ADDR(PyObject_CallObject),
         ADD_ADDR(PyEval_GetGlobals),
         ADD_ADDR(PyEval_GetBuiltins),
         ADD_ADDR(PyEval_GetLocals),
@@ -2416,8 +2422,6 @@ PyInit_pyinternals(void) {
         ADD_ADDR(PyCell_Set),
         ADD_ADDR(PyCell_New),
         ADD_ADDR(_PyGen_FetchStopIterationValue),
-        ADD_ADDR(_EnterRecursiveCall),
-        ADD_ADDR(_LeaveRecursiveCall),
 
         ADD_ADDR(new_function),
         ADD_ADDR(new_generator),
@@ -2470,12 +2474,7 @@ PyInit_pyinternals(void) {
         ADD_ADDR(IMPORT_NOT_FOUND_MSG),
         ADD_ADDR(BAD_EXCEPTION_MSG),
         ADD_ADDR(UNEXPECTED_KW_ARG_MSG),
-        ADD_ADDR(DUPLICATE_VAL_MSG),
-        ADD_ADDR_STR("__build_class__"),
-        ADD_ADDR_OF(PyId___import__),
-        ADD_ADDR_OF(PyId___exit__),
-        ADD_ADDR_OF(PyId___enter__),
-        ADD_ADDR_OF(PyId_send)
+        ADD_ADDR(DUPLICATE_VAL_MSG)
     };
 
     for(i=0; i<sizeof(addr_records)/sizeof(AddrRec); ++i) {
@@ -2499,7 +2498,20 @@ PyInit_pyinternals(void) {
 
     if(!str_close) {
         if(!(str_close = PyUnicode_FromString("close"))) return NULL;
-    } else Py_INCREF(str_close);
+        if(!(str_prepare = PyUnicode_FromString("__prepare__"))) {
+            Py_DECREF(str_close);
+            return NULL;
+        }
+        if(!(str_metaclass = PyUnicode_FromString("metaclass"))) {
+            Py_DECREF(str_close);
+            Py_DECREF(str_prepare);
+            return NULL;
+        }
+    } else {
+        Py_INCREF(str_close);
+        Py_INCREF(str_prepare);
+        Py_INCREF(str_metaclass);
+    }
 
     return m;
 }

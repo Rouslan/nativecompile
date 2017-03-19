@@ -61,6 +61,11 @@ move_op = ir.OpDescription(
         ir.Overload([ir.FixedRegister,ir.AddressType],(lambda a,b: None))],
     [ir.ParamDir(True,False),ir.ParamDir(False,True)])
 
+lea_op = ir.OpDescription(
+    'lea_op',
+    [ir.Overload([ir.AddressType],(lambda a: None))],
+    [ir.ParamDir(False,False)])
+
 
 class DIRCompiler(ir.IRCompiler):
     def __init__(self,abi):
@@ -75,8 +80,8 @@ class DIRCompiler(ir.IRCompiler):
     def get_reg(self,index,size):
         return DRegister(self.abi.reg_indices[index],size)
 
-    def get_stack_addr(self,index,size,sect):
-        return DAddress(index*self.abi.ptr_size,self.abi.r_sp)
+    def get_stack_addr(self,index,offset,size,sect):
+        return DAddress(index*self.abi.ptr_size+offset,self.abi.r_sp)
 
     def get_displacement(self,amount,force_wide):
         return amount
@@ -132,33 +137,12 @@ class IndirectionAdapter(ir.RegAllocatorOverloads):
 
         return self.base_op.assembly(splice(args,self.param,self.base+self.index,(m,)),addr,binary,annot)
 
-class DOpGen(ir.JumpCondOpGen):
+class DOpGen(ir.JumpCondIROpGen):
     def __init__(self):
         super().__init__(DAbi())
 
-    def _basic_jump_if(self,dest,cond):
-        raise AssertionError()
-
-    def _call_impl(self,func,args,store_ret):
-        raise AssertionError()
-
-    def load_addr(self,addr,dest):
-        raise AssertionError()
-
-    def shift(self,src,shift_dir,amount,dest):
-        raise AssertionError()
-
-    def get_cur_func_arg(self,i):
-        raise AssertionError()
-
     def move(self,src,dest):
         return [ir.Instr(move_op,src,dest)]
-
-    def jump_table(self,val,targets):
-        raise AssertionError()
-
-    def jump(self,dest):
-        raise AssertionError()
 
     def process_indirection(self,instr,ov,inds):
         i = inds[0]
@@ -181,20 +165,13 @@ class DOpGen(ir.JumpCondOpGen):
             scale)
         return ir.Instr(op,*splice(instr.args,i,1,insert)),op.wrap_overload(ov)
 
-    def unary_op(self,a,dest,op_type):
-        raise AssertionError()
-
-    def bin_op(self,a,b,dest,op_type):
-        raise AssertionError()
-
-    def get_return_address(self,v):
-        raise AssertionError()
-
     def get_compiler(self,regs_used,stack_used,args_used):
         return DIRCompiler(self.abi)
 
-    def return_value(self,v):
-        raise AssertionError()
+    def __getattr__(self,item):
+        def func(*args):
+            raise AssertionError()
+        return func
 
 class DAbi(abi.Abi):
     code_gen = None
@@ -350,24 +327,24 @@ class MyTestCase(unittest.TestCase):
         endif = ir.Target()
 
         code = [
-            ir.Instr(dummy_op),                   # 0
-            ir.Instr(write_op,a),                 # 1
-            ir.Instr(dummy_op),                   # 2
-            ir.Instr(write_op,b),                 # 3
-            ir.IRJump(else_,True,0),              # 4
-            ir.Instr(dummy_op),                   # 5
-            ir.Instr(write_op,b),                 # 6
-            ir.Instr(write_op,c),                 # 7
-            ir.Instr(read_op,a),                  # 8
-            ir.Instr(dummy_op),                   # 9
-            ir.IRJump(endif,False,0),             # 10
-            else_,                                # 11
-            ir.Instr(read_op,a),                  # 12
-            ir.Instr(write_op,c),                 # 13
-            endif,                                # 14
-            ir.Instr(readwrite_op,a),             # 15
-            ir.Instr(read_op,b),                  # 16
-            ir.Instr(read_op,c)                   # 17
+            ir.Instr(dummy_op),                         # 0
+            ir.Instr(write_op,a),                       # 1
+            ir.Instr(dummy_op),                         # 2
+            ir.Instr(write_op,b),                       # 3
+            ir.IRJump(else_,True,0),                    # 4
+            ir.Instr(dummy_op),                         # 5
+            ir.Instr(write_op,b),                       # 6
+            ir.IndirectMod(c,ir.LocationType.register), # 7
+            ir.Instr(read_op,a),                        # 8
+            ir.Instr(dummy_op),                         # 9
+            ir.IRJump(endif,False,0),                   # 10
+            else_,                                      # 11
+            ir.Instr(read_op,a),                        # 12
+            ir.Instr(write_op,c),                       # 13
+            endif,                                      # 14
+            ir.Instr(readwrite_op,a),                   # 15
+            ir.Instr(read_op,b),                        # 16
+            ir.Instr(read_op,c)                         # 17
         ]
         ir.calc_var_intervals(code)
 
@@ -375,6 +352,24 @@ class MyTestCase(unittest.TestCase):
         self.assertEqual(b.lifetime.intervals,DInterval([(4,5),(7,17)]))
         self.assertEqual(c.lifetime.intervals,DInterval([(8,11),(14,18)]))
         self.assertEqual(block.lifetime.intervals,DInterval([(2,18)]))
+
+        block = ir.Block(2)
+        a,b = block.parts
+
+        code = [
+            ir.Instr(dummy_op),       # 0
+            ir.Instr(write_op,block), # 1
+            ir.Instr(dummy_op),       # 2
+            ir.Instr(read_op,a),      # 3
+            ir.Instr(dummy_op),       # 4
+            ir.Instr(read_op,b),      # 5
+            ir.Instr(readwrite_op,a)  # 6
+        ]
+        ir.calc_var_intervals(code)
+
+        self.assertEqual(a.lifetime.intervals,DInterval([(2,7)]))
+        self.assertEqual(b.lifetime.intervals,DInterval([(2,6)]))
+        self.assertEqual(block.lifetime.intervals,DInterval([(2,7)]))
 
     def test_back_jump_lifetime(self):
         a = ir.Var('a')
@@ -482,6 +477,29 @@ class MyTestCase(unittest.TestCase):
         self.assertEqual(b.lifetime.intervals,DInterval([(3,4),(18,19),(27,28),(38,39),(47,51)]))
         self.assertEqual(c.lifetime.intervals,DInterval([(24,26),(28,32)]))
         self.assertEqual(d.lifetime.intervals,DInterval([(35,37),(39,42)]))
+
+    def test_lea(self):
+        # Instruction parameters that that neither read nor write are a special
+        # case.
+        a = ir.Var('a')
+        b = ir.Var('b')
+
+        code = [                   #    a b
+            ir.Instr(dummy_op),    # 0
+            ir.Instr(write_op,a),  # 1  w
+            ir.Instr(dummy_op),    # 2  |
+            ir.Instr(lea_op,b),    # 3  | l
+            ir.Instr(lea_op,a),    # 4  l
+            ir.Instr(dummy_op),    # 5  |
+            ir.Instr(write_op,b),  # 6  | w
+            ir.Instr(read_op,a),   # 7  r |
+            ir.Instr(dummy_op),    # 8    |
+            ir.Instr(read_op,b)    # 9    r
+        ]
+        ir.calc_var_intervals(code)
+
+        self.assertEqual(a.lifetime.intervals,DInterval([(2,8)]))
+        self.assertEqual(b.lifetime.intervals,DInterval([(3,4),(7,10)]))
 
 
 if __name__ == '__main__':

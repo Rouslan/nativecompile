@@ -1,4 +1,4 @@
-#  Copyright 2015 Rouslan Korneychuk
+#  Copyright 2017 Rouslan Korneychuk
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -16,10 +16,11 @@
 import unittest
 
 from .. import x86_ops as ops
+from ..intermediate import StackSection
 
 
-class TestAddress(unittest.TestCase):
-    def runTest(self):
+class TestX86(unittest.TestCase):
+    def test_address(self):
         self.assertEqual(
             ops.Address(base=ops.eax).mod_rm_sib_disp(0),
             b'\x00'
@@ -60,4 +61,14 @@ class TestAddress(unittest.TestCase):
             b'\x3c\x24'
         )
 
+    def test_stack_positions(self):
+        comp = ops.X86OpGen(ops.CdeclAbi()).get_compiler(4,15,3)
 
+        self.assertEqual(comp.get_stack_addr(0,0,4,4,StackSection.local),ops.Address(68,ops.esp,size=4))
+        self.assertEqual(comp.get_stack_addr(1,0,4,4,StackSection.local),ops.Address(64,ops.esp,size=4))
+        self.assertEqual(comp.get_stack_addr(0,0,4,4,StackSection.args),ops.Address(0,ops.esp,size=4))
+        self.assertEqual(comp.get_stack_addr(1,0,4,4,StackSection.args),ops.Address(4,ops.esp,size=4))
+        self.assertEqual(comp.get_stack_addr(0,0,4,4,StackSection.previous),ops.Address(88,ops.esp,size=4))
+        self.assertEqual(comp.get_stack_addr(1,0,4,4,StackSection.previous),ops.Address(92,ops.esp,size=4))
+        self.assertEqual(comp.get_stack_addr(1,0,4,16,StackSection.local),ops.Address(52,ops.esp,size=4))
+        self.assertEqual(comp.get_stack_addr(1,4,4,16,StackSection.local),ops.Address(56,ops.esp,size=4))

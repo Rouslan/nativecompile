@@ -14,7 +14,7 @@
 
 import copy
 from functools import partial
-from typing import cast,List,Optional,Sequence,Tuple,Union
+from typing import cast,Iterable,List,Optional,Sequence,Tuple,Union
 
 from . import abi
 from . import debug
@@ -622,12 +622,14 @@ class IndirectionAdapter(RegAllocatorOverloads):
             splice(o.params,self.param,1,(FixedRegister,) * regs),
             self._wrap_func(o.func))
 
+    def exact_match(self,args):
+        return self.wrap_overload(self.base_op.exact_match(self._to_base_args(args)))
+
     def best_match(self,args):
         return self.wrap_overload(self.base_op.best_match(self._to_base_args(args)))
 
     def to_ir2(self,args):
-        o = self.base_op.exact_match(self._to_base_args(args))
-        return Instr2(self.base_op,self.wrap_overload(o),args)
+        return Instr2(self.base_op,self.exact_match(args),args)
 
     def assembly(self,args : Sequence,addr : int,binary : bytes,annot : Optional[str]=None):
         m = self.Address(
@@ -856,7 +858,7 @@ class BasicOps:
         ],[R])
 
         def lea(a: Address,b: Register) -> bytes:
-            assert a.size == b.size and a.size == abi.ptr_size
+            assert b.size == abi.ptr_size
             return rex(b,a) + b'\x8D' + a.mod_rm_sib_disp(b.reg)
 
         self.lea = X86OpDescription('lea',[
@@ -1040,7 +1042,7 @@ class BasicOps:
             Overload([reg,reg],
                 (lambda a,b: _op_reg_reg(0b10000100,a,b))),
             Overload([m,reg],
-                (lambda a,b: _op_addr_reg(0b10000100,a,b,True))),
+                (lambda a,b: _op_addr_reg(0b10000100,a,b,False))),
             Overload([imm,reg],
                 (lambda a,b: _op_imm_reg(0b11110110,0,0b10101000,a,b))),
             Overload([imm,m],
@@ -1285,9 +1287,11 @@ class X86OpGen(JumpCondOpGen):
     def move(self,src : Value,dest : MutableValue) -> IRCode:
         return [Instr(self.ops.macro_mov,src,dest)]
 
-    def jump(self,dest : Union[Value,Target]) -> IRCode:
+    def jump(self,dest : Union[Target,Value],targets : Union[Iterable[Target],Target,None]=None) -> IRCode:
         r = [Instr(self.ops.jmp,dest)] # type: IRCode
-        if isinstance(dest,Target):
+        if targets is not None:
+            r.append(IRJump(targets,False,1))
+        elif isinstance(dest,Target):
             r.append(IRJump(dest,False,1))
         return r
 
@@ -1347,6 +1351,9 @@ class X86OpGen(JumpCondOpGen):
 
         if store_ret is not None:
             r.append(CreateVar(store_ret,self._reg_to_ir(self.abi.r_ret)))
+
+        if isinstance(func,Target):
+            r.append(IRJump(func,False,len(r)))
 
         return r
 
@@ -1464,15 +1471,19 @@ class X86Compiler(IRCompiler):
     def get_reg(self,index : int,size : int):
         return self.abi.Register(size or self.abi.ptr_size,cast(Register,self.abi.all_regs[index]).code)
 
-    def get_stack_addr(self,index : int,offset : int,size : int,sect : StackSection):
+    def get_stack_addr(self,index : int,offset : int,size : int,block_size : int,sect : StackSection):
+        if size == 0: size = self.abi.ptr_size
+        if block_size == 0: block_size = self.abi.ptr_size
+
         if sect == StackSection.local:
-            offset += (self.stack_size - (index + self.unreserved_offset) - 1) * self.abi.ptr_size
+            offset += (self.stack_size - (index + self.unreserved_offset)) * self.abi.ptr_size - block_size
         elif sect == StackSection.args:
             offset += index * self.abi.ptr_size
         else:
             assert sect == StackSection.previous
             offset += (self.stack_size + index) * self.abi.ptr_size
-        return self.abi.Address(offset,self.abi.r_sp,size=size or self.abi.ptr_size)
+        assert offset >= 0
+        return self.abi.Address(offset,self.abi.r_sp,size=size)
 
     def get_displacement(self,amount : int,force_wide : bool):
         return Displacement(amount,force_wide)

@@ -38,15 +38,12 @@ __all__ = ['SIZE_B','SIZE_W','SIZE_D','SIZE_Q','StackSection','LocationType',
     'UnlockRegs','IRAnnotation','annotate','IRSymbolLocDescr','Instr2',
     'CmpType','Cmp','BinCmp','AndCmp','OrCmp','OpType','commutative_ops',
     'UnaryOpType','ShiftDir','IROp','IRCode','IROp2','IRCode2','ExtraState',
-    'OpGen','JumpCondOpGen','IRCompiler','reg_allocate']
+    'OpGen','IROpGen','JumpCondOpGen','IRCompiler','reg_allocate']
 
 import enum
 import collections
-import functools
-import operator
 import weakref
 import binascii
-import copy
 from typing import (Any,Callable,cast,Container,DefaultDict,Dict,Generic,
     Iterable,List,Optional,NamedTuple,NewType,Sequence,Sized,Set,Tuple,
     TypeVar,Union)
@@ -121,7 +118,13 @@ class Lifetime:
 class VarLifetime(Lifetime):
     def __init__(self,*,dbg_symbol : Optional[str]=None) -> None:
         super().__init__()
+
+        # Every variable will have, at most, one stack location. This is to
+        # allow efficient merging of variable locations from converging
+        # branches and to allow instructions like x86's LEA to work correctly
+        # with variables that don't have a value.
         self.preferred_stack_i = None # type: Optional[int]
+
         self.aliases = weakref.WeakSet()
 
         # if not None and not empty and debug.GDB_JIT_SUPPORT is true,
@@ -195,10 +198,13 @@ def generic_type(x : object) -> type:
 
 
 class Target:
-    __slots__ = 'displacement',
+    if not __debug__:
+        __slots__ = 'displacement',
 
     def __init__(self):
         self.displacement = None # type: Optional[int]
+        if __debug__:
+            self.origin = _get_origin()
 
     def __repr__(self):
         return '<Target {:#x}>'.format(id(self))
@@ -335,21 +341,31 @@ class FixedRegister(MutableValue,metaclass=_RegisterMetaType):
         return 'FixedRegister({},{})'.format(self.reg_index,self.size)
 
 class StackItem(MutableValue,AddressType):
-    __slots__ = 'index','offset'
+    __slots__ = 'index',
 
-    def __init__(self,index : int,size : int=SIZE_DEFAULT,offset : int=0) -> None:
+    def __init__(self,index : int,size : int=SIZE_DEFAULT) -> None:
         super().__init__(size)
         self.index = index
-        self.offset = offset
 
     def __repr__(self):
         size_str = ''
         if self.size != SIZE_DEFAULT:
             size_str = ','+str(self.size)
-        offset_str = ''
-        if self.offset:
-            offset_str = ','+str(self.offset)
-        return 'StackItem({}{}{})'.format(self.index,size_str,offset_str)
+        return 'StackItem({}{})'.format(self.index,size_str)
+
+class StackItemPart(MutableValue,AddressType):
+    __slots__ = 'block','offset'
+
+    def __init__(self,block : StackItem,offset : int,size : int=SIZE_DEFAULT) -> None:
+        super().__init__(size)
+        self.block = block
+        self.offset = offset
+
+    def __repr__(self):
+        size_str = ''
+        if self.size != SIZE_DEFAULT:
+            size_str = ',' + str(self.size)
+        return 'StackItemPart({!r},{}{})'.format(self.block,self.offset,size_str)
 
 class ArgStackItem(MutableValue,AddressType):
     """A function argument passed via the stack.
@@ -494,10 +510,13 @@ class RegAllocatorOverloads:
         self.param_dirs = param_dirs
 
     def best_match(self,args : Sequence) -> Overload:
+        return self.exact_match(args)
+
+    def exact_match(self,args : Sequence) -> Overload:
         raise NotImplementedError()
 
     def to_ir2(self,args : Sequence) -> 'Instr2':
-        raise NotImplementedError()
+        return Instr2(self,self.exact_match(args),args)
 
     def __call__(self,*args):
         return self.to_ir2(args)
@@ -561,9 +580,6 @@ class OpDescription(RegAllocatorOverloads):
 
         raise ValueError('one or more arguments contains a disallowed value')
 
-    def to_ir2(self,args):
-        return Instr2(self,self.exact_match(args),args)
-
     def __repr__(self):
         return '<{} "{}">'.format(self.__class__.__name__,self.name)
 
@@ -583,11 +599,11 @@ class OpDescription(RegAllocatorOverloads):
         name = self.assembly_name(args)
 
         return '{:8x}: {:22}{:8} {}{}'.format(
-                    addr,
-                    binascii.hexlify(binary).decode(),
-                    name,
-                    ', '.join(self.assembly_arg(nextaddr,arg) for arg in args),
-                    ('  ; '+annot) if annot else '')
+            addr,
+            binascii.hexlify(binary).decode(),
+            name,
+            ', '.join(self.assembly_arg(nextaddr,arg) for arg in args),
+            ('  ; '+annot) if annot else '')
 
 class CommentDesc(RegAllocatorOverloads):
     _sole_overload = Overload([str],lambda x: b'')
@@ -596,7 +612,7 @@ class CommentDesc(RegAllocatorOverloads):
         super().__init__([ParamDir(True,False)])
         self.inline = inline
 
-    def best_match(self,args : Sequence) -> Overload:
+    def exact_match(self,args : Sequence) -> Overload:
         if len(args) != 1:
             raise TypeError('there must be exactly one argument')
 
@@ -604,9 +620,6 @@ class CommentDesc(RegAllocatorOverloads):
 
     def assembly(self,args : Sequence,addr : int,binary: bytes,annot : Optional[str] = None):
         return '; {} {}'.format(args[0],annot or '')
-
-    def to_ir2(self,args : Sequence):
-        return Instr2(self,self.best_match(args),args)
 
 comment_desc = CommentDesc(False)
 inline_comment_desc = CommentDesc(True)
@@ -659,7 +672,7 @@ class IRJump:
     __slots__ = 'dests','conditional','jump_ops'
 
     def __init__(self,dests : Union[Target,Iterable[Target]],conditional : bool,jump_ops : int) -> None:
-        self.dests = (dests,) if isinstance(dests,Target) else tuple(dests)
+        self.dests = (dests,) if isinstance(dests,Target) else tuple(dests) # type: Tuple[Target]
         self.conditional = conditional
         self.jump_ops = jump_ops
 
@@ -715,7 +728,7 @@ def annotate(descr=None):
 class IRSymbolLocDescr:
     def __init__(self,symbol : str,loc : 'ItvLocation') -> None:
         self.symbol = symbol
-        self.loc = copy.copy(loc)
+        self.loc = loc.copy()
 
     def __repr__(self):
         return 'IRSymbolDescr({!r},{!r})'.format(self.symbol,self.loc)
@@ -837,7 +850,7 @@ class IRCompiler:
     def get_reg(self,index: int,size : int) -> Any:
         raise NotImplementedError()
 
-    def get_stack_addr(self,index : int,offset : int,size : int,sect : StackSection) -> Any:
+    def get_stack_addr(self,index : int,offset : int,size : int,block_size : int,sect : StackSection) -> Any:
         raise NotImplementedError()
 
     def get_displacement(self,amount : int,force_wide : bool) -> Any:
@@ -850,11 +863,14 @@ class IRCompiler:
         if isinstance(arg,FixedRegister):
             return self.get_reg(arg.reg_index,arg.size)
         if isinstance(arg,StackItem):
-            return self.get_stack_addr(arg.index,arg.offset,arg.size,StackSection.local)
+            return self.get_stack_addr(arg.index,0,arg.size,arg.size,StackSection.local)
+        if isinstance(arg,StackItemPart):
+            return self.get_stack_addr(arg.block.index,arg.offset,arg.size,arg.block.size,StackSection.local)
         if isinstance(arg,ArgStackItem):
             return self.get_stack_addr(
                 arg.index,
                 0,
+                arg.size,
                 arg.size,
                 StackSection.previous if arg.prev_frame else StackSection.args)
         if isinstance(arg,Target):
@@ -925,11 +941,6 @@ class NullState(ExtraState):
         pass
 
 class OpGen:
-    max_args_used = 0
-
-    def __init__(self,abi : abi.Abi) -> None:
-        self.abi = abi
-
     def bin_op(self,a : Value,b : Value,dest : MutableValue,op_type : OpType) -> IRCode:
         raise NotImplementedError()
 
@@ -938,6 +949,58 @@ class OpGen:
 
     def load_addr(self,addr : IndirectVar,dest : MutableValue) -> IRCode:
         raise NotImplementedError()
+
+    def call(self,func,args : Sequence[Value]=(),store_ret : Optional[Var]=None) -> IRCode:
+        raise NotImplementedError()
+
+    def call_preloaded(self,func,args : int,store_ret : Optional[Var]=None) -> IRCode:
+        raise NotImplementedError()
+
+    def get_func_arg(self,i : int,prev_frame : bool=False) -> MutableValue:
+        raise NotImplementedError()
+
+    def jump(self,dest : Union[Target,Value],targets : Union[Iterable[Target],Target,None]=None) -> IRCode:
+        raise NotImplementedError()
+
+    def jump_if(self,dest : Target,cond : Cmp) -> IRCode:
+        raise NotImplementedError()
+
+    def if_(self,cond : Cmp,on_true : IRCode,on_false : Optional[IRCode]) -> IRCode:
+        raise NotImplementedError()
+
+    def do_while(self,action : IRCode,cond : Cmp) -> IRCode:
+        raise NotImplementedError()
+
+    def jump_table(self,val : Value,targets : Sequence[Target]) -> IRCode:
+        raise NotImplementedError()
+
+    def move(self,src : Value,dest : MutableValue) -> IRCode:
+        raise NotImplementedError()
+
+    def shift(self,src : Value,shift_dir : ShiftDir,amount : Value,dest : MutableValue) -> IRCode:
+        raise NotImplementedError()
+
+    def return_value(self,v : Value) -> IRCode:
+        raise NotImplementedError()
+
+    def get_return_address(self,v : Value) -> IRCode:
+        """Store the address of the next instruction to be called after the
+        current function returns, into 'v'.
+
+        If the address was pushed to the stack, this will pop it and restore
+        the stack pointer to what it was before the current function was
+        called, as long as the stack isn't altered between the function call
+        and the current point of execution.
+
+        """
+        raise NotImplementedError()
+
+# noinspection PyAbstractClass
+class IROpGen(OpGen):
+    max_args_used = 0
+
+    def __init__(self,abi: abi.Abi) -> None:
+        self.abi = abi
 
     def call(self,func,args : Sequence[Value]=(),store_ret : Optional[Var]=None) -> IRCode:
         self.max_args_used = max(self.max_args_used,len(args))
@@ -966,46 +1029,8 @@ class OpGen:
     def _call_preloaded_impl(self,func,args : int,store_ret : Optional[Var]) -> IRCode:
         raise NotImplementedError()
 
-    def get_func_arg(self,i : int,prev_frame : bool=False) -> MutableValue:
-        raise NotImplementedError()
-
-    def jump(self,dest : Target) -> IRCode:
-        raise NotImplementedError()
-
-    def jump_if(self,dest : Target,cond : Cmp) -> IRCode:
-        raise NotImplementedError()
-
-    def if_(self,cond : Cmp,on_true : IRCode,on_false : Optional[IRCode]) -> IRCode:
-        raise NotImplementedError()
-
-    def do_while(self,action : IRCode,cond : Cmp) -> IRCode:
-        raise NotImplementedError()
-
-    def jump_table(self,val : Value,targets : Sequence[Target]) -> IRCode:
-        raise NotImplementedError()
-
-    def move(self,src : Value,dest : MutableValue) -> IRCode:
-        raise NotImplementedError()
-
-    def shift(self,src : Value,shift_dir : ShiftDir,amount : Value,dest : MutableValue) -> IRCode:
-        raise NotImplementedError()
-
-    def return_value(self,v : Value) -> IRCode:
-        raise NotImplementedError()
-
-    def get_compiler(self,regs_used : int,stack_used : int,args_used : int) -> IRCompiler:
-        raise NotImplementedError()
-
-    def get_return_address(self,v : Value) -> IRCode:
-        """Store the address of the next instruction to be called after the
-        current function returns, into 'v'.
-
-        If the address was pushed to the stack, this will pop it and restore
-        the stack pointer to what it was before the current function was
-        called, as long as the stack isn't altered between the function call
-        and the current point of execution.
-
-        """
+    def get_compiler(self,regs_used: int,stack_used: int,
+        args_used: int) -> IRCompiler:
         raise NotImplementedError()
 
     def allocater_extra_state(self) -> ExtraState:
@@ -1021,7 +1046,8 @@ class OpGen:
         """
         return NullState()
 
-    def process_indirection(self,instr : Instr,ov : Overload,inds : Sequence[int]) -> Tuple[Instr,Overload]:
+    def process_indirection(self,instr: Instr,ov: Overload,
+        inds: Sequence[int]) -> Tuple[Instr,Overload]:
         """Remove instances of IndirectVar.
 
         The return value is equivalent to the input parameters, except each
@@ -1036,8 +1062,8 @@ class OpGen:
         raise NotImplementedError()
 
 # noinspection PyAbstractClass
-class JumpCondOpGen(OpGen):
-    """An implementation of OpGen that uses jumps for control flow"""
+class JumpCondOpGen(IROpGen):
+    """An implementation of IROpGen that uses jumps for control flow"""
 
     def jump_if(self,dest : Target,cond : Cmp) -> IRCode:
         if isinstance(cond,OrCmp):
@@ -1065,20 +1091,19 @@ class JumpCondOpGen(OpGen):
         return cast(IRCode,[t]) + action + self.jump_if(t,cond.complement())
 
 class FollowNonlinear(Generic[T,U]):
-    """Follow 'code' non-linearly by splitting and merging state with the
-    branches.
-
-    Note that back-tracking has not been implemented. Thus it must be possible
-    to reach any instruction that is reachable, without jumping backwards.
-
-    """
+    """Follow code non-linearly by splitting and merging state with the
+    branches."""
     def __init__(self,state : T) -> None:
         self.state = state # type: Optional[T]
         self.prior_states = {} # type: Dict[Target,T]
         self.pending_states = collections.defaultdict(list) # type: DefaultDict[Target,List[U]]
 
-        if __debug__:
-            self.elided_targets = set() # type: Set[Target]
+        self.elided_targets = {} # type: Dict[Target,int]
+
+        self.farthest_i = -1
+
+    def backtracking(self,op_i):
+        return self.farthest_i is not None and op_i <= self.farthest_i
 
     def handle_instr(self,op_i : int,op : Instr) -> None:
         pass
@@ -1095,19 +1120,32 @@ class FollowNonlinear(Generic[T,U]):
     def handle_target(self,op_i : int,op : Target) -> None:
         pass
 
-    def handle_irjump(self,op_i : int,op : IRJump) -> None:
+    def handle_elided_target(self,op_i : int,op : Target) -> None:
+        pass
+
+    def handle_irjump(self,op_i : int,op : IRJump,code : IRCode) -> None:
         assert self.state is not None and op.dests
         assert all((d in self.prior_states) == (op.dests[0] in self.prior_states) for d in op.dests[1:]),(
             'a jump is not allowed to have both forward and backward targets')
 
-        assert not any(d in self.elided_targets for d in op.dests),'back-tracking support has not been added to this procedure'
+        unhandled_dests = [] # type: List[Target]
+        for d in op.dests:
+            prev_i = self.elided_targets.get(d)
+            if prev_i is not None:
+                old_s = self.state
+                self.state = self.make_prior_state(prev_i)
+                self.run(code,prev_i)
+                self.state = old_s
+            else:
+                unhandled_dests.append(d)
 
-        if op.dests[0] in self.prior_states:
-            self.conform_prior_states(op_i,op,[self.prior_states[d] for d in op.dests])
-        else:
-            pending = self.make_pending_state(op_i,op)
-            for d in op.dests:
-                self.pending_states[d].append(pending)
+        if unhandled_dests:
+            if unhandled_dests[0] in self.prior_states:
+                self.conform_prior_states(op_i,op.jump_ops,[self.prior_states[d] for d in unhandled_dests])
+            else:
+                pending = self.make_pending_state(op_i,op)
+                for d in unhandled_dests:
+                    self.pending_states[d].append(pending)
 
         if not op.conditional:
             old = self.state
@@ -1117,13 +1155,15 @@ class FollowNonlinear(Generic[T,U]):
     def handle_lock_regs(self,op_i : int,op : LockRegs):
         pass
 
-    def handle_unlock_regs(self,op_i : int,op :UnlockRegs):
+    def handle_unlock_regs(self,op_i : int,op : UnlockRegs):
         pass
 
+    # occurs when merging states at a target we just reached
     def conform_states_to(self,op_i : int,state : Sequence[U]) -> None:
         pass
 
-    def conform_prior_states(self,op_i : int,op : IRJump,states : Sequence[T]) -> None:
+    # occurs when merging states at a target we already went over
+    def conform_prior_states(self,op_i : int,jump_ops : int,states : Sequence[T]) -> None:
         pass
 
     def after_state_change(self,old_state : Optional[T]) -> None:
@@ -1138,7 +1178,9 @@ class FollowNonlinear(Generic[T,U]):
     def recall_pending_state(self,op_i : int,state : U) -> T:
         raise NotImplementedError()
 
-    def handle_op(self,op_i : int,op : IROp) -> None:
+    def handle_op(self,op_i : int,code : IRCode) -> bool:
+        op = code[op_i]
+
         if isinstance(op,Instr):
             if self.state is not None:
                 self.handle_instr(op_i,op)
@@ -1152,7 +1194,11 @@ class FollowNonlinear(Generic[T,U]):
             if self.state is not None:
                 self.handle_indirect_mod(op_i,op)
         elif isinstance(op,Target):
-            assert op not in self.prior_states
+            ps = self.prior_states.get(op)
+            if ps is not None:
+                if self.state is not None:
+                    self.conform_prior_states(op_i,0,[ps])
+                return False
 
             states = self.pending_states.get(op)
 
@@ -1171,12 +1217,17 @@ class FollowNonlinear(Generic[T,U]):
 
             if self.state is not None:
                 self.prior_states[op] = self.make_prior_state(op_i)
+                try:
+                    del self.elided_targets[op]
+                except KeyError:
+                    pass
                 self.handle_target(op_i,op)
-            elif __debug__:
-                self.elided_targets.add(op)
+            else:
+                self.elided_targets[op] = op_i
+                self.handle_elided_target(op_i,op)
         elif isinstance(op,IRJump):
             if self.state is not None:
-                self.handle_irjump(op_i,op)
+                self.handle_irjump(op_i,op,code)
         elif isinstance(op,LockRegs):
             if self.state is not None:
                 self.handle_lock_regs(op_i,op)
@@ -1185,9 +1236,20 @@ class FollowNonlinear(Generic[T,U]):
             if self.state is not None:
                 self.handle_unlock_regs(op_i,op)
 
-    def run(self,code : Iterable[IROp]) -> None:
-        for op_i,op in enumerate(code):
-            self.handle_op(op_i,op)
+        return True
+
+    def next_i(self,i : int,code : Sequence[IROp]) -> Optional[int]:
+        return i + 1 if (i + 1) < len(code) else None
+
+    def run(self,code : IRCode,start : int=-1) -> None:
+        op_i = start
+        while True:
+            next_i = self.next_i(op_i,code)
+            if next_i is None: break
+            op_i = next_i
+
+            if not self.handle_op(op_i,code): break
+            self.farthest_i = max(op_i,self.farthest_i)
 
 
 class VarState:
@@ -1225,11 +1287,12 @@ class _CalcVarIntervalsCommon(FollowNonlinear[VarState,Tuple[VarState,int]]):
         raise NotImplementedError()
 
     def handle_instr(self,op_i : int,op : Instr) -> None:
-        var_dirs = collections.defaultdict(ParamDir) # type: DefaultDict[Var,ParamDir]
+        var_dirs = collections.defaultdict(ParamDir) # type: DefaultDict[Union[Var,Block],ParamDir]
         for var,pd in zip(op.args,op.op.param_dirs):
-            if isinstance(var,Var):
+            if isinstance(var,(Var,Block)):
                 var_dirs[var] |= pd
             elif isinstance(var,IndirectVar):
+                assert not (isinstance(var.base,Block) or isinstance(var.index,Block))
                 if isinstance(var.base,Var):
                     var_dirs[var.base].reads = True
                 if isinstance(var.index,Var):
@@ -1241,11 +1304,14 @@ class _CalcVarIntervalsCommon(FollowNonlinear[VarState,Tuple[VarState,int]]):
     def handle_create_var(self,op_i : int,op : CreateVar) -> None:
         self.create_var_life(op.var,op_i,False,True)
 
-    def handle_irjump(self,op_i : int,op : IRJump) -> None:
+    def handle_indirect_mod(self,op_i : int,op : IndirectMod) -> None:
+        self.create_var_life(op.var,op_i,False,True)
+
+    def handle_irjump(self,op_i : int,op : IRJump,code : IRCode) -> None:
         assert self.state is not None
         state = self.state
 
-        super().handle_irjump(op_i,op)
+        super().handle_irjump(op_i,op,code)
 
         if self.state is None:
             state.apply_all(op_i+1)
@@ -1272,7 +1338,7 @@ class _CalcVarIntervalsCommon(FollowNonlinear[VarState,Tuple[VarState,int]]):
     def recall_pending_state(self,op_i : int,state : Tuple[VarState,int]) -> VarState:
         return state[0]
 
-    def conform_prior_states(self,op_i : int,op : IRJump,states : Sequence[VarState]) -> None:
+    def conform_prior_states(self,op_i : int,jump_ops : int,states : Sequence[VarState]) -> None:
         assert self.state is not None
 
         for state in states:
@@ -1283,6 +1349,9 @@ class _CalcVarIntervalsCommon(FollowNonlinear[VarState,Tuple[VarState,int]]):
                     m_rs = op_i + 1
 
                 self.state.read_starts[life] = m_rs
+
+    def next_i(self,i : int,code : Sequence[IROp]) -> Optional[int]:
+        return i - 1 if i > 0 else None
 
 class _CalcVarIntervals(_CalcVarIntervalsCommon):
     def __init__(self):
@@ -1296,11 +1365,13 @@ class _CalcVarIntervals(_CalcVarIntervalsCommon):
 
     # Here, "write" means completely overwrite. In the case of partial write,
     # both "read" and "write" will be false.
-    def create_var_life(self,var,i,read,write):
+    def create_var_life(self,var,_i,read,write):
         assert self.state is not None
 
+        i = _i
+
         # the variable doesn't officially exist until after the instruction
-        if not read: i += 1
+        if write and not read: i += 1
 
         if var.lifetime is None:
             if isinstance(var,VarPart):
@@ -1317,12 +1388,17 @@ class _CalcVarIntervals(_CalcVarIntervalsCommon):
                 var.lifetime.name = getattr(var,'name',None)
                 var.lifetime.origin = getattr(var,'origin',None)
 
-            var.lifetime.intervals |= Interval(i,i + 1)
-        elif write:
+        if write:
             self.state.apply(var.lifetime,i)
+            if isinstance(var,Block):
+                for part in var:
+                    self.create_var_life(part,_i,False,True)
+        elif not read:
+            # even if a variable is neither read-from nor written-to, it still
+            # has to exist
+            var.lifetime.intervals |= Interval(i,i+1)
 
         if read:
-            assert var.lifetime is not None
             self.state.read_starts.setdefault(var.lifetime,i + 1)
 
     def conform_states_to(self,op_i : int,states : Sequence[Tuple[VarState,int]]) -> None:
@@ -1336,6 +1412,10 @@ class _CalcVarIntervals(_CalcVarIntervalsCommon):
                 self.back_starts[state[1]].add(life)
 
 class _CalcBackVarIntervals(_CalcVarIntervalsCommon):
+    def __init__(self,back_starts):
+        super().__init__()
+        self.back_starts = back_starts
+
     def create_var_life(self,var,i,read,write):
         assert self.state
 
@@ -1349,11 +1429,20 @@ class _CalcBackVarIntervals(_CalcVarIntervalsCommon):
         assert var.lifetime is not None
         self.state.apply(var.lifetime,i,True)
 
+    def handle_op(self,op_i : int,code : IRCode):
+        r = super().handle_op(op_i,code)
+
+        lives = self.back_starts.get(op_i)
+        if lives:
+            assert self.state is not None
+            for life in lives:
+                self.state.read_starts.setdefault(life,op_i + 1)
+
+        return r
 
 def calc_var_intervals(code : IRCode) -> None:
     c = _CalcVarIntervals()
-    for op_i in range(len(code) - 1,-1,-1):
-        c.handle_op(op_i,code[op_i])
+    c.run(code,len(code))
 
     # This only checks for read-violations from code that is reachable from the
     # start, which is fine, since code that isn't reachable from the start,
@@ -1368,15 +1457,8 @@ def calc_var_intervals(code : IRCode) -> None:
             b.lifetime.intervals |= a.intervals
 
     if c.back_starts:
-        cb = _CalcBackVarIntervals()
-        for op_i in range(len(code)-1,-1,-1):
-            cb.handle_op(op_i,code[op_i])
-
-            lives = c.back_starts.get(op_i)
-            if lives:
-                assert cb.state is not None
-                for life in lives:
-                    cb.state.read_starts.setdefault(life,op_i+1)
+        cb = _CalcBackVarIntervals(c.back_starts)
+        cb.run(code,len(code))
 
 
 class Filter(Container[T],Generic[T]):
@@ -1391,6 +1473,9 @@ class ItvLocation:
     def __init__(self,reg : Optional[int]=None,stack_loc : Optional[StackLocation]=None) -> None:
         self.reg = reg
         self.stack_loc = stack_loc
+
+    def copy(self) -> 'ItvLocation':
+        return ItvLocation(self.reg,self.stack_loc)
 
     def __bool__(self):
         return self.reg is not None or self.stack_loc is not None
@@ -1497,7 +1582,7 @@ class LocationScan:
         r.reg_pool = self.reg_pool[:]
         r.stack_pool = self.stack_pool # there is only ever one stack pool
         # noinspection PyArgumentList
-        r.itv_locs = collections.defaultdict(ItvLocation,((life,copy.copy(loc)) for life,loc in self.itv_locs.items()))
+        r.itv_locs = collections.defaultdict(ItvLocation,((life,loc.copy()) for life,loc in self.itv_locs.items()))
         r.cur_pos = self.cur_pos
         r.extra = self.extra.copy()
         r.locked_regs = self.locked_regs.copy()
@@ -1549,14 +1634,6 @@ class LocationScan:
 
         return True
 
-    # stack 'blocks' occupy more than one contiguous spot
-    #def _stack_pool_remove(self,itv,i):
-    #    assert self.stack_pool[i] is itv
-    #    for j in range(i,len(self.stack_pool)):
-    #        if self.stack_pool[j] is not itv:
-    #            break
-    #        self.stack_pool[j] = None
-
     def is_reg_free(self,r):
         return self.reg_pool[r] is None
 
@@ -1594,7 +1671,6 @@ class LocationScan:
             try:
                 new_itv = life.itv_at(pos)
             except ValueError:
-                #self._stack_pool_remove(life,loc.stack_loc.index)
                 loc.stack_loc = None
                 if on_loc_expire: on_loc_expire(life)
             else:
@@ -1694,15 +1770,15 @@ class LocationScan:
         self.itv_locs[life].stack_loc = loc
 
     @consistency_check
-    def to_stack(self,itv : VarLifetime) -> bool:
+    def to_stack(self,life : VarLifetime) -> bool:
         """Copy the value to the stack.
 
         This will place a value onto the stack, if it's not already there. This
         will not free a register.
 
         """
-        if self.itv_locs[itv].stack_loc is not None: return False
-        self._alloc_s(itv)
+        if self.itv_locs[life].stack_loc is not None: return False
+        self._alloc_s(life)
         return True
 
     # @consistency_check
@@ -1740,6 +1816,9 @@ class LocationScan:
         """
         itvl = self.itv_locs[life]
         if where == LocationType.register:
+            if itvl.reg is None:
+                raise ValueError('cannot update the register content of a variable that is not currently in a register')
+
             if itvl.stack_loc is not None:
                 if itvl.stack_loc.sect == StackSection.local:
                     #self._stack_pool_remove(life,itvl.stack_loc.index)
@@ -1747,6 +1826,9 @@ class LocationScan:
                 itvl.stack_loc = None
         else:
             assert where == LocationType.stack
+            if itvl.stack_loc is None:
+                raise ValueError('cannot update the address content of a variable that is not currently in memory')
+
             if itvl.reg is not None:
                 self.reg_pool[itvl.reg] = None
                 self._remove_active(life,self.active_r)
@@ -1766,11 +1848,10 @@ class LocationScan:
             while i < n:
                 for j in range(i,min(n,i+size)):
                     if self.stack_pool[j] is not None:
-                        i = j
+                        i = j + 1
                         break
                 else:
                     break
-                n += 1
 
             for j in range(i,i + size):
                 if j == len(self.stack_pool):
@@ -1789,10 +1870,10 @@ class LocationScan:
         assert isinstance(itv,VarLifetime)
         return self.itv_locs[itv]
 
-    def to_ir(self,itv : Lifetime) -> Union[FixedRegister,StackItem,ArgStackItem]:
-        return self.interval_loc(itv).to_ir()
+    def to_ir(self,itv : Lifetime,size : int=SIZE_DEFAULT) -> Union[FixedRegister,StackItem,ArgStackItem]:
+        return self.interval_loc(itv).to_ir(size)
 
-def load_to_reg(alloc : LocationScan,itv : VarLifetime,allowed_reg : Container[int],cgen : OpGen,code : IRCode2,val : Optional[Value]=None) -> FixedRegister:
+def load_to_reg(alloc : LocationScan,itv : VarLifetime,allowed_reg : Container[int],cgen : IROpGen,code : IRCode2,val : Optional[Value]=None) -> FixedRegister:
     displaced = alloc.load_reg(itv,Filter(allowed_reg))
     dest = alloc.interval_loc(itv)
     ir_dest = dest.to_ir()
@@ -1806,10 +1887,13 @@ def load_to_reg(alloc : LocationScan,itv : VarLifetime,allowed_reg : Container[i
 
     return ir_dest
 
-def load_to_block(alloc,block):
-    assert block.lifetime is not None
-    alloc.alloc_block(block.lifetime,len(block))
-    return alloc.to_ir(block.lifetime)
+def alloc_stack(alloc,var):
+    if isinstance(var,Block):
+        alloc.alloc_block(var.lifetime,len(var))
+    elif isinstance(var,VarPart):
+        alloc.alloc_block(var.block.lifetime,len(var.block))
+    else:
+        alloc.to_stack(var.lifetime)
 
 class JumpState:
     def __init__(self,alloc : LocationScan,code : IRCode2,jump_ops : int,branches : bool=False) -> None:
@@ -1825,7 +1909,7 @@ class JumpState:
         else:
             self.code.extend(ops)
 
-    def conform_to(self,cgen : OpGen,other : LocationScan) -> None:
+    def conform_to(self,cgen : IROpGen,other : LocationScan) -> None:
         """Move values so that they have the same locations in self.alloc as
         'other'."""
 
@@ -1860,7 +1944,7 @@ class JumpState:
             if loc_self.reg != loc_o.reg:
                 assert loc_o.reg is None
                 assert loc_self.stack_loc is not None
-                loc_self.reg = None
+                self.alloc.free_reg(loc_self.reg)
 
 def hassubclass(cls : Union[type,Tuple[type,...]],classinfo : Union[type,Tuple[type,...]]) -> Optional[type]:
     if isinstance(cls,tuple):
@@ -1870,6 +1954,16 @@ def hassubclass(cls : Union[type,Tuple[type,...]],classinfo : Union[type,Tuple[t
         return cls
 
     return None
+
+def process_indirection(cgen : IROpGen,instr : Instr,overload : Overload) -> Tuple[Instr,Overload]:
+    inds = []
+    for i,ta in enumerate(zip(overload.params,instr.args)):
+        if hassubclass(ta[0],AddressType) and isinstance(ta[1],IndirectVar):
+            inds.append(i)
+    if inds:
+        instr,overload = cgen.process_indirection(instr,overload,inds)
+
+    return instr,overload
 
 def ir_preallocated_to_ir2(code):
     r = []
@@ -1882,16 +1976,39 @@ def ir_preallocated_to_ir2(code):
 
     return r
 
+class ListChainLink(Generic[T],List[T]):
+    """A basic singly-linked list of arrays"""
+    def __init__(self):
+        super().__init__()
+        self.next = None # type: Optional[ListChainLink[T]]
+
+    def new_link(self):
+        r = ListChainLink()
+        r.next = self.next
+        self.next = r
+        return r
+
 class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
-    def __init__(self,cgen : OpGen,alloc : LocationScan) -> None:
+    def __init__(self,cgen : IROpGen,alloc : LocationScan) -> None:
         super().__init__(alloc)
         self.cgen = cgen
         self.stack_pool = alloc.stack_pool
 
-        self.new_code = [] # type: List[IRCode2]
-        self.new_code_head = [] # type: IRCode2
+        self.new_code = ListChainLink() # type: ListChainLink[IROp2]
+        self.new_code_head = self.new_code # type: ListChainLink[IROp2]
+        self.elided_links = {} # type: Dict[int,ListChainLink[IROp2]]
 
         self.active_symbols = set() # type: Set[str]
+
+    @property
+    def _ptr_size(self):
+        return self.cgen.abi.ptr_size
+
+    def _load_to_block(self,block):
+        assert self.state is not None
+        assert block.lifetime is not None
+        self.state.alloc_block(block.lifetime,len(block))
+        return self.state.to_ir(block.lifetime,len(block)*self._ptr_size)
 
     def _copy_val_to_stack(self,state,val,itv,code):
         moved = state.to_stack(itv)
@@ -1904,7 +2021,8 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
 
         return dest
 
-    def move_for_param(self,i,p,new_args,reads):
+    # if non_var_moves is not None, the value is to be written-to
+    def move_for_param(self,i,p,new_args,reads,non_var_moves=None):
         assert self.state is not None
 
         arg = new_args[i]
@@ -1930,17 +2048,24 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
                 assert hassubclass(p,AddressType)
                 if isinstance(arg,Block):
                     assert not reads
-                    dest = load_to_block(self.state,arg)
+                    dest = self._load_to_block(arg)
                 elif isinstance(arg,VarPart):
                     assert not reads
-                    dest = load_to_block(self.state,arg.block)
+                    dest = self._load_to_block(arg.block)
                     assert isinstance(dest,StackItem)
-                    dest.offset = arg.offset * self.cgen.abi.ptr_size
+                    dest = StackItemPart(dest,arg.offset * self._ptr_size,self._ptr_size)
                 else:
                     assert isinstance(itv,VarLifetime)
                     dest = self._copy_val_to_stack(self.state,arg,itv,self.new_code_head if reads else None)
 
+            if non_var_moves is not None and not isinstance(arg,Var):
+                if not isinstance(arg,MutableValue):
+                    raise ValueError('cannot write to a read-only value')
+                non_var_moves.append((arg,dest))
             new_args[i] = dest
+
+    def _block_to_stackitem(self,b,itvl):
+        return StackItem(itvl.stack_loc.index,len(b) * self._ptr_size)
 
     def get_var_loc(self,var):
         assert var.lifetime is not None
@@ -1952,12 +2077,32 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
         assert itvl.stack_loc is not None
         if isinstance(var,VarPart):
             assert itvl.stack_loc.sect == StackSection.local
-            return StackItem(itvl.stack_loc.index,offset=var.offset*self.cgen.abi.ptr_size)
+            return StackItemPart(self._block_to_stackitem(var.block,itvl),var.offset*self._ptr_size,self._ptr_size)
+        if isinstance(var,Block):
+            return self._block_to_stackitem(var,itvl)
 
         return to_stack_item(itvl.stack_loc)
 
     def _on_loc_expire(self,life):
         self.new_code_head.extend(annotate_symbol_loc(life,ItvLocation()))
+
+    def _supporting_instr(self,code : IRCode):
+        for op in code:
+            if isinstance(op,Instr):
+                op,overload = process_indirection(self.cgen,op,op.op.exact_match(op.args))
+                new_args = [] # type: List[Any]
+                for i,a in enumerate(op.args):
+                    new_args.append(a)
+                    if isinstance(a,Block):
+                        new_args[i] = self._load_to_block(a)
+                    elif isinstance(a,Var):
+                        new_args[i] = self.get_var_loc(a)
+                processed = Instr2(op.op,overload,new_args) # type: IROp2
+            else:
+                assert isinstance(op,Target)
+                processed = op
+
+            self.new_code_head.append(processed)
 
     def handle_instr(self,op_i : int,op : Instr):
         assert self.state is not None
@@ -1965,6 +2110,14 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
         tmp = self.state.extra.process_instr(op_i,op)
         if tmp is None: return
         op = tmp
+
+        if self.backtracking(op_i) and any(isinstance(a,(Var,Block)) for a in op.args):
+            # The LocationScan class only works if instructions are processed
+            # in order. Since back-tracking is only needed when returning from
+            # "finally" statement bodies, and calls to "finally" statement
+            # bodies are always followed by jumps past the body, this is good
+            # enough.
+            raise ValueError('cannot use variables while back-tracking')
 
         new_args = []  # type: List[Any]
 
@@ -1979,23 +2132,18 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
             if not pd.reads:
                 continue
 
-            if isinstance(a,Var):
+            if isinstance(a,(Var,Block)):
                 new_args[i] = self.get_var_loc(a)
-            elif isinstance(a,Block):
-                new_args[i] = self.get_var_loc(a[0])
 
-        overload = op.op.best_match(new_args)
-        inds = []
-        for i,ta in enumerate(zip(overload.params,op.args)):
-            if hassubclass(ta[0],AddressType) and isinstance(ta[1],IndirectVar):
-                inds.append(i)
-        if inds:
-            op,overload = self.cgen.process_indirection(op,overload,inds)
+        op,overload = process_indirection(self.cgen,op,op.op.best_match(new_args))
 
         new_args = []
+        non_var_moves = [] # type: List[Any]
 
         # Second pass: every argument we read-from should already have a
-        # location. Some arguments will need to be moved.
+        # location. Some arguments will need to be moved. Arguments that are
+        # neither read-from nor written-to (as in the case of the first
+        # argument of x86's 'lea') will still need a location.
         for i,a in enumerate(op.args):
             pd = op.op.param_dirs[i]
 
@@ -2011,31 +2159,29 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
                     self.new_code_head.extend(annotate_symbol_loc(displaced,d_loc))
                 continue
             if not pd.reads:
+                if not pd.writes:
+                    self.move_for_param(i,overload.params[i],new_args,False)
                 continue
 
             if isinstance(a,Block):
-                assert a.lifetime is not None
-                self.state.alloc_block(a.lifetime,len(a))
-                new_args[i] = self.get_var_loc(a[0])
+                new_args[i] = self._load_to_block(a)
             elif isinstance(a,Var):
                 new_args[i] = self.get_var_loc(a)
 
-            self.move_for_param(i,overload.params[i],new_args,True)
+            self.move_for_param(i,overload.params[i],new_args,True,non_var_moves if pd.writes else None)
 
         # writes always apply after the instruction
-        self.state.advance(op_i + 1,self._on_loc_expire)
+        if not self.backtracking(op_i):
+            self.state.advance(op_i + 1,self._on_loc_expire)
 
         # Third pass: for the rest of the arguments, create a physical location
-        # or if needed, move to another location. Arguments that are neither
-        # read-from nor written-to (as in the case of the first argument of
-        # x86's 'lea') will still need a location.
         for i,p in enumerate(overload.params):
             pd = op.op.param_dirs[i]
 
-            if not pd.reads:
-                self.move_for_param(i,p,new_args,False)
-
             if pd.writes:
+                if not pd.reads:
+                    self.move_for_param(i,p,new_args,False,non_var_moves)
+
                 arg = op.args[i]
 
                 if isinstance(arg,Var) and not isinstance(arg,VarPart):
@@ -2048,6 +2194,11 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
 
         self.new_code_head.append(Instr2(op.op,overload,new_args))
 
+        # arguments written-to that represent specific locations need to be
+        # actually written to those locations
+        for src,dest in non_var_moves:
+            self._supporting_instr(self.cgen.move(dest,src))
+
     def handle_invalidate_regs(self,op_i : int,op : InvalidateRegs):
         assert self.state is not None
 
@@ -2056,7 +2207,8 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
             if displaced is not None:
                 disp_l = self.state.interval_loc(displaced)
                 self.new_code_head.extend(
-                    ir_preallocated_to_ir2(self.cgen.move(FixedRegister(r),disp_l.to_ir())))
+                    ir_preallocated_to_ir2(
+                        self.cgen.move(FixedRegister(r),disp_l.to_ir())))
                 self.new_code_head.extend(annotate_symbol_loc(displaced,disp_l))
 
     def handle_create_var(self,op_i : int,op : CreateVar):
@@ -2087,12 +2239,21 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
 
     def handle_indirect_mod(self,op_i : int,op : IndirectMod):
         assert self.state is not None
-
         assert isinstance(op.var.lifetime,VarLifetime)
+
+        # variables' lifetimes always start after the instruction
+        self.state.advance(op_i + 1,self._on_loc_expire)
+
+        if op.loc_type == LocationType.stack:
+            alloc_stack(self.state,op.var)
         self.state.value_updated(op.var.lifetime,op.loc_type)
 
     def handle_target(self,op_i : int,op : Target):
         self.new_code_head.append(op)
+
+    def handle_elided_target(self,op_i : int,op : Target):
+        self.elided_links[op_i] = self.new_code_head
+        self.new_code_head = self.new_code_head.new_link()
 
     def handle_lock_regs(self,op_i : int,op : LockRegs):
         assert self.state is not None
@@ -2117,7 +2278,7 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
             # different places
 
             bad_vars = set() # type: Set[VarLifetime]
-            for state in states:
+            for state in cond_states:
                 for life,loc in self.state.itv_locs.items():
                     if loc:
                         loc_b = state.alloc.itv_locs.get(life)
@@ -2125,7 +2286,7 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
                             bad_vars.add(life)
                             self._copy_val_to_stack(self.state,loc.to_ir(),life,self.new_code_head)
 
-            for state in states:
+            for state in cond_states:
                 for life in bad_vars:
                     self._copy_val_to_stack(state.alloc,state.alloc.itv_locs[life],life,state.code)
 
@@ -2136,11 +2297,12 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
                     state.alloc.advance(self.state.cur_pos,self._on_loc_expire)
                 state.conform_to(self.cgen,self.state)
 
-    def conform_prior_states(self,op_i : int,op : IRJump,states : Sequence[LocationScan]):
+    def conform_prior_states(self,op_i : int,jump_ops : int,states : Sequence[LocationScan]):
+        assert self.state is not None
         assert len(states)
         if len(states) > 1:
-            raise ValueError('jumps with multiple backward targets are not supported')
-        JumpState(self.state,self.new_code_head,op.jump_ops).conform_to(self.cgen,states[0])
+            raise ValueError('a jump cannot have multiple backward targets unless the jump is the only way to reach the targets')
+        JumpState(self.state,self.new_code_head,jump_ops).conform_to(self.cgen,states[0])
 
     def make_prior_state(self,op_i : int) -> LocationScan:
         assert self.state is not None
@@ -2150,8 +2312,7 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
         assert self.state is not None
 
         r = JumpState(self.state.branch(),self.new_code_head,op.jump_ops,op.conditional or len(op.dests) > 1)
-        self.new_code.append(self.new_code_head)
-        self.new_code_head = []
+        self.new_code_head = self.new_code_head.new_link()
 
         return r
 
@@ -2173,12 +2334,20 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
                 if loc:
                     self.new_code_head.extend(annotate_symbol_loc(itv,loc))
 
-    def handle_op(self,op_i : int,op : IROp):
-        if self.state is not None and self.state.cur_pos != op_i: self.state.advance(op_i,self._on_loc_expire)
+    def handle_op(self,op_i : int,code : IRCode):
+        if self.state is not None and self.state.cur_pos < op_i:
+            self.state.advance(op_i,self._on_loc_expire)
 
-        super().handle_op(op_i,op)
+        return super().handle_op(op_i,code)
 
-def reg_allocate(cgen : OpGen,code : IRCode,regs : int) -> Tuple[IRCode2,int,int]:
+    def run(self,code : IRCode,start : int=-1):
+        prev_head = self.new_code_head
+        link = self.elided_links.get(start)
+        if link is not None: self.new_code_head = link
+        super().run(code,start)
+        self.new_code_head = prev_head
+
+def reg_allocate(cgen : IROpGen,code : IRCode,regs : int) -> Tuple[IRCode2,int,int]:
     """Convert IRCode into IRCode2.
 
     This converts all instances of Var into FixedRegister or StackItem, and
@@ -2187,9 +2356,6 @@ def reg_allocate(cgen : OpGen,code : IRCode,regs : int) -> Tuple[IRCode2,int,int
 
     As a side-effect, this will also remove unreachable code.
 
-    Note that back-tracking has not been implemented. Thus it must be possible
-    to reach any instruction that is reachable, without jumping backwards.
-
     """
     calc_var_intervals(code)
     ls = LocationScan(regs,cgen.allocater_extra_state())
@@ -2197,9 +2363,13 @@ def reg_allocate(cgen : OpGen,code : IRCode,regs : int) -> Tuple[IRCode2,int,int
     allocater = _RegAllocate(cgen,ls)
     allocater.run(code)
 
-    allocater.new_code.append(allocater.new_code_head)
     # TODO: return actual registers used
-    return functools.reduce(operator.concat,allocater.new_code,[]),regs,len(stack_pool)
+    code2 = [] # type: IRCode2
+    nc = allocater.new_code # type: Optional[ListChainLink[IROp2]]
+    while nc is not None:
+        code2.extend(nc)
+        nc = nc.next
+    return code2,regs,len(stack_pool)
 
 
 def debug_gen_code(code):

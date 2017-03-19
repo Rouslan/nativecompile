@@ -151,7 +151,7 @@ def make_asm_if_needed(instr,assembly):
 
     return instr
 
-def resolve_jumps(cgen : OpGen,regs : int,code1 : IRCode,end_targets=(),*,assembly=False) -> Function:
+def resolve_jumps(cgen : IROpGen,regs : int,code1 : IRCode,end_targets=(),*,assembly=False) -> Function:
     code,r_used,s_used = reg_allocate(cgen,code1,regs)
     irc = cgen.get_compiler(r_used,s_used,cgen.max_args_used)
 
@@ -222,6 +222,7 @@ class DelayedCompile:
     @staticmethod
     def process(cgen,code):
         r = []
+
         for op in code:
             if isinstance(op,DelayedCompile):
                 r.extend(op.compile(cgen))
@@ -561,10 +562,18 @@ class TrackedValue(MaybeTrackedValue):
             s.state.disown(self)
 
 class PyObject(TrackedValue):
-    def __init__(self,value : Optional[Value]=None,own : bool=False) -> None:
+    @staticmethod
+    def cleanup(s,val):
+        s.decref(val)
+
+    @staticmethod
+    def nullable_cleanup(s,val):
+        s.if_(val).decref(val).endif()
+
+    def __init__(self,value : Optional[Value]=None,own : bool=False,nullable : bool=False) -> None:
         super().__init__(
             Var() if value is None else value,
-            (lambda s,val: s.decref(val)),
+            PyObject.nullable_cleanup if nullable else PyObject.cleanup,
             own)
 
         if __debug__ and value is None:
@@ -746,34 +755,53 @@ class DoWhileScope(Scope,Branch):
     def cur_single_scope(self) -> 'Branch':
         return self
 
-class CompareByID(weakref.ref):
-    def __init__(self,val,callback=None):
-        super().__init__(val,callback)
+if __debug__:
+    class CompareByID(weakref.ref):
+        def __init__(self,val,callback=None):
+            super().__init__(val,callback)
 
-        self._hash = id(val)
+            self._hash = id(val)
 
-        if __debug__:
             self.origin = getattr(val,'origin',None)
 
-    def __eq__(self,b):
-        val = self()
-        if val is None: return False
+        def __eq__(self,b):
+            val = self()
+            if val is None: return False
 
-        if isinstance(b,CompareByID):
-            b = b()
-            if b is None: return False
+            if isinstance(b,CompareByID):
+                b = b()
+                if b is None: return False
 
-        return val is b
+            return val is b
 
-    def __hash__(self):
-        return self._hash
+        def __hash__(self):
+            return self._hash
 
-    def __repr__(self):
-        val = self()
-        if val is not None:
-            return 'CompareByID({!r})'.format(val)
+        def __repr__(self):
+            val = self()
+            if val is not None:
+                return 'CompareByID({!r})'.format(val)
 
-        return '<expired CompareByID object>'
+            return '<expired CompareByID object>'
+else:
+    class CompareByID:
+        def __init__(self,val,callback=None):
+            self.val = val
+
+        def __eq__(self,b):
+            if isinstance(b,CompareByID):
+                return self.val is b.val
+
+            return self.val is b
+
+        def __hash__(self):
+            return id(self)
+
+        def __repr__(self):
+            return 'CompareByID({!r})'.format(self.val)
+
+        def __call__(self):
+            return self.val
 
 class State:
     """Keeps track of implied state in machine code as it's generated."""
@@ -811,11 +839,13 @@ class State:
         return CompareByID(val)
 
     def owned_items(self) -> Iterable[Tuple[TrackedValue,int]]:
+        r = []
         for wrap,cd in self._tracked_vals.items():
             val = wrap()
             if val is None:
                 raise ValueError('one or more instances of TrackedValue was never disowned')
-            yield val,cd
+            r.append((val,cd))
+        return r
 
     def own(self,x : TrackedValue,cleanup_depth : int) -> None:
         """Mark x as being owned.
@@ -872,7 +902,7 @@ else:
 class Stitch:
     """Create machine code concisely using method chaining"""
 
-    def __init__(self,cgen : OpGen,state : Optional[State]=None,cleanup : Optional[StackCleanup]=None) -> None:
+    def __init__(self,cgen : IROpGen,state : Optional[State]=None,cleanup : Optional[StackCleanup]=None) -> None:
         self.cgen = cgen
         self._scopes = [MainScope(state or State())] # type: List[Scope]
 
@@ -1057,8 +1087,8 @@ class Stitch:
     def neg(self,a,dest=None):
         return self._unary_op(a,dest,UnaryOpType.neg)
 
-    def jmp(self,dest):
-        return self._debug_append(self.cgen.jump(dest))
+    def jmp(self,dest,targets=None):
+        return self._debug_append(self.cgen.jump(dest,targets))
 
     def jmp_if(self,dest,test):
         test = make_value(self,make_cmp(test))
