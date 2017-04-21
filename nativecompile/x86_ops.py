@@ -14,11 +14,11 @@
 
 import copy
 from functools import partial
-from typing import cast,Iterable,List,Optional,Sequence,Tuple,Union
+from typing import cast,Iterable,List,Optional,Sequence,Set,Tuple,TYPE_CHECKING,Union
 
-from . import abi
 from . import debug
 from . import dwarf
+from . import pyinternals
 from .intermediate import *
 
 
@@ -49,7 +49,7 @@ def immediate_data64(w,data):
 
 
 
-class Register(abi.Register,debug.DwarfLocation):
+class Register(AbiRegister,debug.DwarfLocation):
     def __init__(self,size : int,code : int) -> None:
         assert size in (SIZE_B,SIZE_D,SIZE_Q)
         self.size = size
@@ -259,7 +259,7 @@ class Address(debug.DwarfLocation):
 
         return op.breg(self.base.dwarf_reg(op.mode),self.offset)
 
-class _Rip(abi.Register):
+class _Rip(AbiRegister):
     size = SIZE_Q
 
     def __repr__(self):
@@ -665,7 +665,7 @@ class BasicOps:
         reg = (FixedRegister,Register)
         if abi.ptr_size == 8: reg += (Register64,)
         m = (AddressType,abi.Address)
-        imm = Immediate[imm_min,imm_max]
+        imm = Immediate[abi,imm_min,imm_max]
         d = (Target,Displacement)
         test = Test
 
@@ -886,7 +886,7 @@ class BasicOps:
 
         mov_imm = imm
         if abi.ptr_size == 8:
-            mov_imm = Immediate[-0x8000000000000000,0xffffffffffffffff]
+            mov_imm = Immediate[abi,-0x8000000000000000,0xffffffffffffffff]
 
         self.mov = X86OpDescription('mov',[
             Overload([reg,reg],
@@ -1138,15 +1138,14 @@ class BasicOps:
                 index = tmp2
                 r += imul_reg_imm_reg(val,spacing,index)
 
-            rip = getattr(abi,'r_rip',None)
-            if rip:
+            if abi.r_rip is not None:
                 # RIP addresses cannot have indexes so we have to load the start
                 # address into a register first
 
                 jmp = (
-                    lea(abi.Address(0,tmp1,index,scale),tmp1)
+                    lea(Address64(0,tmp1,index,scale),tmp1)
                     + jmp_reg(tmp1))
-                r += lea(abi.Address(len(jmp),rip),tmp1) + jmp
+                r += lea(Address64(len(jmp),abi.r_rip),tmp1) + jmp
             else:
                 # the offset of the JMP instruction needs to include its own size
                 proto_jmp = jmp_m(abi.Address(127,tmp1,val,scale))
@@ -1230,13 +1229,30 @@ class X86ExtraState(ExtraState):
                         break
         return instr
 
+def resolve_symbol(x):
+    if isinstance(x,Symbol):
+        return Immediate(pyinternals.raw_addresses[x.name] if x.address is None else x.address,x.data_type)
+
+    if isinstance(x,PyConst):
+        return Immediate(x.address)
+
+    return x
+
 class X86OpGen(JumpCondOpGen):
-    def __init__(self,abi : 'X86Abi') -> None:
-        super().__init__(abi)
-        self.ops = abi.ops
+    if TYPE_CHECKING:
+        abi = ... # type: X86Abi
+
+        def __init__(self,abi : 'X86Abi',func_args : Iterable[Var]=(),callconv : CallConvType=CallConvType.default,pyinfo: Optional[PyFuncInfo]=None) -> None:
+            super().__init__(abi,func_args,callconv,pyinfo)
+
+    @property
+    def ops(self):
+        return self.abi.ops
 
     def bin_op(self,a : Value,b : Value,dest : MutableValue,op_type : OpType) -> IRCode:
-        ensure_same_size(self.abi.ptr_size,a,b)
+        a = resolve_symbol(a)
+        b = resolve_symbol(b)
+        ensure_same_size(self.abi,a,b)
 
         op = {
             OpType.add : self.ops.add,
@@ -1270,6 +1286,7 @@ class X86OpGen(JumpCondOpGen):
         return r
 
     def unary_op(self,a : Value,dest : MutableValue,op_type : UnaryOpType) -> IRCode:
+        a = resolve_symbol(a)
         op = {
             UnaryOpType.neg : self.ops.neg
         }[op_type]
@@ -1281,13 +1298,14 @@ class X86OpGen(JumpCondOpGen):
         r.append(Instr(op,dest))
         return r
 
-    def load_addr(self,addr : IndirectVar,dest : MutableValue) -> IRCode:
+    def load_addr(self,addr : MutableValue,dest : MutableValue) -> IRCode:
         return [Instr(self.ops.lea,addr,dest)]
 
     def move(self,src : Value,dest : MutableValue) -> IRCode:
-        return [Instr(self.ops.macro_mov,src,dest)]
+        return [Instr(self.ops.macro_mov,resolve_symbol(src),dest)]
 
     def jump(self,dest : Union[Target,Value],targets : Union[Iterable[Target],Target,None]=None) -> IRCode:
+        dest = resolve_symbol(dest)
         r = [Instr(self.ops.jmp,dest)] # type: IRCode
         if targets is not None:
             r.append(IRJump(targets,False,1))
@@ -1296,11 +1314,13 @@ class X86OpGen(JumpCondOpGen):
         return r
 
     def _basic_jump_if(self,dest,cond) -> IRCode:
+        dest = resolve_symbol(dest)
+
         if cond.a == 0 or (isinstance(cond.b,(Immediate,int)) and cond.b != 0):
             if cond.a == 0:
                 instr = Instr(self.ops.test,cond.b,cond.b)
             else:
-                instr = Instr(self.ops.cmp,cond.b,cond.a)
+                instr = Instr(self.ops.cmp,cond.a,cond.b)
 
             test_t = ([test_E,test_NE,test_G,test_GE,test_L,test_LE]
                     if cond.signed else
@@ -1318,6 +1338,8 @@ class X86OpGen(JumpCondOpGen):
         return [instr,Instr(self.ops.jcc,test_t,dest),IRJump(dest,True,2)]
 
     def jump_table(self,val : Value,targets : Sequence[Target]) -> IRCode:
+        val = resolve_symbol(val)
+
         if len(targets) < 2:
             if not targets: return []
 
@@ -1328,29 +1350,22 @@ class X86OpGen(JumpCondOpGen):
         # the two Vars are just temporaries needed by the rather involved "op"
         return [Instr(self.ops.jump_table,jt,val,Var(),Var()),jt.here,IRJump(targets,True,2)]
 
-    def _reg_to_ir(self,reg):
-        return FixedRegister(self.abi.reg_indices[reg])
+    def _call_preloaded_impl(self,func,args : int,store_ret : Optional[Var],callconv : CallConvType):
+        func = resolve_symbol(func)
 
-    def get_func_arg(self,i,prev_frame=False):
-        if i < len(self.abi.r_arg):
-            return self._reg_to_ir(self.abi.r_arg[i])
+        cc = self.abi.callconvs[callconv.value]
 
-        if not self.abi.shadow:
-            i -= len(self.abi.r_arg)
-        return ArgStackItem(i,prev_frame)
-
-    def _call_preloaded_impl(self,func,args : int,store_ret : Optional[Var]):
-        scratch = self.abi.r_scratch[:]
-        scratch.append(self.abi.r_ret)
-        scratch.extend(self.abi.r_arg[min(len(self.abi.r_arg),args):])
+        scratch = cc.r_scratch[:]
+        scratch.append(cc.r_ret)
+        scratch.extend(cc.r_arg[min(len(cc.r_arg),args):])
 
         r = [InvalidateRegs(
                 [self.abi.reg_indices[reg] for reg in scratch],
-                [self.abi.reg_indices[reg] for reg in self.abi.r_pres]),
+                [self.abi.reg_indices[reg] for reg in cc.r_pres]),
             Instr(self.ops.call,func)] # type: IRCode
 
         if store_ret is not None:
-            r.append(CreateVar(store_ret,self._reg_to_ir(self.abi.r_ret)))
+            r.append(CreateVar(store_ret,self.abi.reg_to_ir(cc.r_ret)))
 
         if isinstance(func,Target):
             r.append(IRJump(func,False,len(r)))
@@ -1364,14 +1379,11 @@ class X86OpGen(JumpCondOpGen):
         r.append(Instr(self.ops.shl if shift_dir == ShiftDir.left else self.ops.shr,amount,dest))
         return r
 
-    def get_return_address(self,v : Value) -> IRCode:
+    def get_return_address(self,v : MutableValue) -> IRCode:
         return [Instr(self.ops.pop,v)]
 
-    def return_value(self,v : Value):
-        return self.move(v,FixedRegister(self.abi.reg_indices[self.abi.r_ret]))
-
-    def get_compiler(self,regs_used : int,stack_used : int,args_used : int):
-        return X86Compiler(self.abi,self.ops,regs_used,stack_used,args_used)
+    def get_compiler(self,regs_used : Set[int],stack_used : int,args_used : int):
+        return X86Compiler(self.abi,self.callconv,self.ops,regs_used,stack_used,args_used)
 
     def allocater_extra_state(self):
         return X86ExtraState(self.ops)
@@ -1380,15 +1392,17 @@ class X86OpGen(JumpCondOpGen):
         assert len(inds) == 1
         i = inds[0]
         arg = instr.args[i]
+        assert isinstance(arg,IndirectVar)
 
-        scale = arg.scale or self.abi.ptr_size
+        offset = arg.offset.realize(self.abi)
+        scale = arg.scale.realize(self.abi)
 
-        if not fits_imm32(self.abi,arg.offset):
+        if not fits_imm32(self.abi,offset):
             assert arg.base is None and arg.index is None, (
                 "if it ever comes up, this case should be implemented")
             return Instr(
                 self.abi.IndirectionAdapter(instr.op,i,0,True,False,0),
-                *splice(instr.args,i,1,(Immediate(arg.offset),)))
+                *splice(instr.args,i,1,(Immediate(offset),)))
 
         insert = ()
         if arg.base is not None:
@@ -1399,32 +1413,31 @@ class X86OpGen(JumpCondOpGen):
         op = self.abi.IndirectionAdapter(
             instr.op,
             i,
-            arg.offset,
+            offset,
             arg.base is not None,
             arg.index is not None,
             scale)
         return Instr(op,*splice(instr.args,i,1,insert)), op.wrap_overload(ov)
 
 class X86Compiler(IRCompiler):
-    def __init__(self,abi : 'X86Abi',ops : BasicOps,regs_used : int,stack_used : int,args_used : int) -> None:
-        self.abi = abi
+    def __init__(self,abi : 'X86Abi',cc_type : CallConvType,ops : BasicOps,regs_used : Set[int],stack_used : int,args_used : int) -> None:
+        super().__init__(abi)
         self.ops = ops
 
-        # we rely on the indices of abi.r_pres being 0 to len(abi.r_pres)-1
-        # for this calculation
-        assert max(abi.reg_indices[r] for r in abi.r_pres) < len(abi.r_pres)
-        self.regs_saved = min(regs_used,len(abi.r_pres))
+        cc = abi.callconvs[cc_type.value]
+
+        self.regs_saved = tuple(regs_used.intersection(self.abi.reg_indices[r] for r in cc.r_pres))
 
         self.stack_size = stack_used + self.unreserved_offset
-        if abi.shadow:
+        if cc.shadow:
             self.stack_size += args_used
         else:
-            self.stack_size += max(args_used-len(abi.r_arg),0)
+            self.stack_size += max(args_used-len(cc.r_arg),0)
 
     @property
     def unreserved_offset(self):
         # plus 1 for the function return address
-        return self.regs_saved + 1
+        return len(self.regs_saved) + 1
 
     def _reg_to_ir(self,reg):
         return FixedRegister(self.abi.reg_indices[reg])
@@ -1437,14 +1450,13 @@ class X86Compiler(IRCompiler):
         # registers that we need to preserve, onto the stack and move the stack
         # pointer down, to reserve the stack space we will need.
         r = annotate(debug.RETURN_ADDRESS)
-        for i in range(self.regs_saved):
-            reg = self.abi.r_pres[i]
-            r.append(self.ops.push(self._reg_to_ir(reg)))
-            r.extend(annotate(debug.SaveReg(reg)))
+        for reg in self.regs_saved:
+            r.append(self.ops.push(FixedRegister(reg)))
+            r.extend(annotate(debug.SaveReg(self.abi.all_regs[reg])))
 
         sp_shift = self._sp_shift()
         if sp_shift:
-            r.append(self.ops.sub(Immediate(sp_shift),self._reg_to_ir(self.abi.r_sp)))
+            r.append(self.ops.sub(Immediate(sp_shift),self.abi.reg_to_ir(self.abi.r_sp)))
         r.extend(annotate(debug.PrologEnd(self.stack_size)))
         return r
 
@@ -1459,10 +1471,9 @@ class X86Compiler(IRCompiler):
 
         r.extend(annotate(debug.EPILOG_START))
 
-        for i in range(self.regs_saved-1,-1,-1):
-            reg = self.abi.r_pres[i]
-            r.append(self.ops.pop(self._reg_to_ir(reg)))
-            r.extend(annotate(debug.RestoreReg(reg)))
+        for reg in reversed(self.regs_saved):
+            r.append(self.ops.pop(FixedRegister(reg)))
+            r.extend(annotate(debug.RestoreReg(self.abi.all_regs[reg])))
 
         r.append(self.ops.ret())
 
@@ -1510,8 +1521,9 @@ def fits_imm32(abi,x):
     return True
 
 
-class X86Abi(abi.Abi):
+class X86Abi(BinaryAbi):
     code_gen = X86OpGen
+    r_rip = None # type: Optional[_Rip]
 
     Address = Address
     Register = Register
@@ -1521,12 +1533,18 @@ class X86Abi(abi.Abi):
         super().__init__(*args,**kwds)
         self.ops = BasicOps(self)
 
+_pres = [ebx,esi,edi]
+_scratch = [ecx,edx,ebp]
+cdecl_calling_convention = CallingConvention(eax,_pres,_scratch,[])
+cdecl_utility_calling_convention = CallingConvention(eax,_pres[2:],_scratch,_pres[0:2])
+
 class CdeclAbi(X86Abi):
-    r_ret = eax
-    r_scratch = [ecx,edx,ebp]
-    r_pres = [ebx,esi,edi]
+    all_regs = _pres + _scratch + [eax,esp]
+    gen_regs = len(_pres) + len(_scratch) + 1
     r_sp = esp
-    r_arg = [] # type: List[Register]
+
+    callconvs = (cdecl_calling_convention,cdecl_utility_calling_convention)
+
     ptr_size = 4
     char_size = 1
     short_size = 2
@@ -1537,7 +1555,6 @@ class CdeclAbi(X86Abi):
 class X86_64Abi(X86Abi):
     has_cmovecc = True
 
-    r_ret = rax
     r_sp = rsp
     r_rip = rip
 
@@ -1551,16 +1568,28 @@ class X86_64Abi(X86Abi):
     Register = Register64
     IndirectionAdapter = IndirectionAdapter64
 
+_pres = [rbx,rbp,r12,r13,r14,r15]
+_scratch = [r10,r11]
+_arg = [rdi,rsi,rdx,rcx,r8,r9]
+sysv_calling_convention = CallingConvention(rax,_pres,_scratch,_arg)
+sysv_utility_calling_convention = CallingConvention(rax,_pres[2:],_scratch+_arg,_pres[0:2])
+
 class SystemVAbi(X86_64Abi):
-    r_scratch = [r10,r11]
-    r_pres = [rbx,rbp,r12,r13,r14,r15]
+    callconvs = (sysv_calling_convention,sysv_utility_calling_convention)
 
-    r_arg = [rdi,rsi,rdx,rcx,r8,r9]
+    all_regs = _pres + _scratch + [rax] + _arg + [rsp,rip]
+    gen_regs = len(_pres) + len(_scratch) + 1 + len(_arg)
 
+_pres = [rbx,rsi,rdi,rbp,r12,r13,r14,r15]
+_scratch = [r10,r11]
+_arg = [rcx,rdx,r8,r9]
+ms64_calling_convention = CallingConvention(rax,_pres,_scratch,_arg,True)
+ms64_utility_calling_convention = CallingConvention(rax,_pres[2:],_scratch+_arg,_pres[0:2])
 
 class MicrosoftX64Abi(X86_64Abi):
-    shadow = True
+    callconvs = (ms64_calling_convention,ms64_utility_calling_convention)
 
-    r_scratch = [r10,r11]
-    r_pres = [rbx,rsi,rdi,rbp,r12,r13,r14,r15]
-    r_arg = [rcx,rdx,r8,r9]
+    all_regs = _pres + _scratch + [rax] + _arg + [rsp,rip]
+    gen_regs = len(_pres) + len(_scratch) + 1 + len(_arg)
+
+del _pres,_scratch,_arg

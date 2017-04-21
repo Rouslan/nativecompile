@@ -1,4 +1,4 @@
-#  Copyright 2016 Rouslan Korneychuk
+#  Copyright 2017 Rouslan Korneychuk
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ raw_addresses = ... # type: Dict[str,int]
 def create_cell(*args): ...
 def read_address(address : int,length : int) -> bytes: ...
 def set_utility_funcs(value : Dict): ...
+def build_class(__func,__name,*bases,**keywords) -> type: ...
 
 class CompiledCode:
     size = ... # type: int
@@ -50,7 +51,7 @@ class Function:
 
 class FunctionBody:
     cells = ... # type: int
-    code = ... # type: CompiledCode
+    code = ... # type: Optional[CompiledCode]
     consts = ... # type: Tuple[object]
     free_names = ... # type: Tuple[str]
     kwonly_params = ... # type: int
@@ -60,7 +61,7 @@ class FunctionBody:
     var_kw = ... # type: bool
     var_pos = ... # type: bool
     def __init__(self,
-        code : CompiledCode,
+        code : Optional[CompiledCode],
         offset : int,
         name : str,
         names : Sequence[str],

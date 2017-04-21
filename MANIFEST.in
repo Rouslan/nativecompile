@@ -1,2 +1,2 @@
-include LICENSE NOTICE make_ast_loader.py
+include LICENSE NOTICE make_ast_loader.py nativecompile/pyinternals.h
 recursive-include cpython *.py README LICENSE Python.asdl

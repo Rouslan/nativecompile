@@ -1,4 +1,4 @@
-/* Copyright 2016 Rouslan Korneychuk
+/* Copyright 2017 Rouslan Korneychuk
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,22 +30,7 @@
     #define USE_WIN 1
 #endif
 
-#if defined(__GNUC__) && !defined(NDEBUG)
-#define GDB_JIT_SUPPORT 1
-#endif
-
-
-#if defined(__x86_64__) || defined(_M_X64)
-    #define ARCHITECTURE "X86_64"
-#elif defined(__i386__) || defined(__i386) || defined(_M_IX86) || defined(_X86_) || defined(__THW_INTEL__) || defined(__I86__) || defined(__INTEL__)
-    #define ARCHITECTURE "X86"
-#elif defined(__ppc__) || defined(_M_PPC) || defined(_ARCH_PPC)
-    #define ARCHITECTURE "PowerPC"
-#elif defined(__ia64__) || defined(__ia64) || defined(_M_IA64)
-    #define ARCHITECTURE "IA64"
-#else
-    #define ARCHITECTURE "unknown"
-#endif
+#include "pyinternals.h"
 
 
 #ifdef Py_REF_DEBUG
@@ -178,9 +163,6 @@ PyObject *str_prepare=NULL;
 PyObject *str_metaclass=NULL;
 
 
-struct _CompiledCode;
-typedef struct _CompiledCode CompiledCode;
-
 typedef struct {
     CompiledCode *resume_gen_code;
     Py_ssize_t resume_gen_offset;
@@ -189,17 +171,6 @@ typedef struct {
 static module_data_t *get_module_data_from(PyObject *m);
 static module_data_t *get_module_data(void);
 
-
-struct _CompiledCode {
-    PyObject_HEAD
-
-    void *data;
-    Py_ssize_t size;
-
-#ifdef GDB_JIT_SUPPORT
-    unsigned char gdb_reg;
-#endif
-};
 
 static void CompiledCode_dealloc(CompiledCode *self) {
     if(self->data) {
@@ -405,41 +376,12 @@ static PyTypeObject CompiledCodeType = {
 };
 
 
-typedef struct {
-    PyObject_HEAD
-
-    PyObject *name;
-
-    /* The function parameter names are always at the beginning and in order.
-       The positional parameter names are at the start, followed by the name of
-       the * parameter if var_pos is 1, followed by the keyword-only parameters,
-       followed by the ** parameter if var_kw if 1.
-
-       All code that relies on this order (including python code) will have a
-       comment containing "FUNCTION_BODY_NAME_ORDER". */
-    PyObject *names;
-
-    PyObject *free_names;
-
-    PyObject *consts;
-
-    CompiledCode *code;
-
-    Py_ssize_t offset;
-
-    int pos_params;
-    int kwonly_params;
-    int cells;
-    char var_pos;
-    char var_kw;
-} FunctionBody;
-
 static int FunctionBody_traverse(FunctionBody *self,visitproc visit,void *arg) {
     Py_VISIT(self->name);
     Py_VISIT(self->names);
     Py_VISIT(self->free_names);
     Py_VISIT(self->consts);
-    Py_VISIT(self->code);
+    if(self->code) Py_VISIT(self->code);
 
     return 0;
 }
@@ -465,20 +407,20 @@ static void FunctionBody_dealloc(FunctionBody *self) {
    be created and have an address in memory before it is initialized. This is so
    the function's address can be hard-coded into its own code object. */
 static int FunctionBody_init(FunctionBody *self,PyObject *args,PyObject *kwds) {
-    CompiledCode *code;
-    PyObject *name, *names, *free_names, *consts;
+    unsigned long off_l;
+    PyObject *code, *offset, *name, *names, *free_names, *consts;
     int var_pos, var_kw;
 
     static char *kwlist[] = {"code","offset","name","names","pos_params","var_pos","kwonly_params","var_kw","free_names","cells","consts",NULL};
 
-    if(self->code) {
+    if(self->name) {
         PyErr_SetString(PyExc_ValueError,"an instance of FunctionBody can only be initialized once");
         return -1;
     }
 
-    if(!PyArg_ParseTupleAndKeywords(args,kwds,"O!nUOipipOiO",kwlist,
-        &CompiledCodeType,&code,
-        &self->offset,
+    if(!PyArg_ParseTupleAndKeywords(args,kwds,"OOUOipipOiO",kwlist,
+        &code,
+        &offset,
         &name,
         &names,
         &self->pos_params,
@@ -491,6 +433,22 @@ static int FunctionBody_init(FunctionBody *self,PyObject *args,PyObject *kwds) {
 
     /* in case of prior incomplete initialization due to an error */
     FunctionBody_clear(self);
+
+    off_l = PyLong_AsUnsignedLong(offset);
+    if(PyErr_Occurred()) return -1;
+
+    if(code == Py_None) {
+        self->entry = (function_entry)off_l;
+    } else {
+        if(!PyObject_TypeCheck(code,&CompiledCodeType)) {
+            PyErr_SetString(PyExc_TypeError,"\"code\" must be None or an instance of CompiledCodeType");
+            return -1;
+        }
+        self->code = (CompiledCode*)code;
+        Py_INCREF(code);
+
+        self->entry = (function_entry)((unsigned long)self->code->data + off_l);
+    }
 
     self->names = PySequence_Tuple(names);
     if(!self->names) return -1;
@@ -514,9 +472,6 @@ static int FunctionBody_init(FunctionBody *self,PyObject *args,PyObject *kwds) {
     self->name = name;
     Py_INCREF(name);
 
-    self->code = code;
-    Py_INCREF(code);
-
     self->var_pos = var_pos;
     self->var_kw = var_kw;
 
@@ -529,6 +484,7 @@ static PyMemberDef FunctionBody_members[] = {
     {"free_names",T_OBJECT_EX,offsetof(FunctionBody,free_names),READONLY,NULL},
     {"consts",T_OBJECT_EX,offsetof(FunctionBody,consts),READONLY,NULL},
     {"code",T_OBJECT_EX,offsetof(FunctionBody,code),READONLY,NULL},
+    {"entry",T_ULONG,offsetof(FunctionBody,entry),READONLY,NULL},
     {"pos_params",T_INT,offsetof(FunctionBody,pos_params),READONLY,NULL},
     {"kwonly_params",T_INT,offsetof(FunctionBody,kwonly_params),READONLY,NULL},
     {"cells",T_INT,offsetof(FunctionBody,cells),READONLY,NULL},
@@ -541,6 +497,9 @@ PyDoc_STRVAR(FunctionBody_doc,
 "FunctionBody(code : CompiledCode,offset : int,name : str,names,pos_params : int,var_pos : bool,kwonly_params : int,var_kw : bool,free_names,cells : int,consts)\n\
 \n\
 Compiled Function Body\n\
+\n\
+If \"code\" is not None, \"offset\" is the byte-offset in the code object of\n\
+the function. Otherwise, it is an absolute address (i.e. starts at zero).\n\
 ");
 
 static PyTypeObject FunctionBodyType = {
@@ -591,22 +550,6 @@ void free_pyobj_array(PyObject **array,Py_ssize_t size) {
     PyMem_Free(array);
 }
 
-typedef struct {
-    PyObject_HEAD
-
-    PyObject *name;
-    PyObject *doc;
-    PyObject *globals;
-    PyObject *defaults;
-    PyObject **kwdefaults;
-    PyObject **closure;
-    PyObject *annotations;
-    PyObject *module;
-    PyObject *dict;
-    PyObject *weakrefs;
-
-    FunctionBody *body;
-} Function;
 
 static PyObject *exec_function(Function *func,PyObject *args,PyObject *kwds,PyObject *globals,PyObject *locals) {
     PyFrameObject *f;
@@ -627,7 +570,7 @@ static PyObject *exec_function(Function *func,PyObject *args,PyObject *kwds,PyOb
     if(f) {
         if(!Py_EnterRecursiveCall("")) {
             tstate->frame = f;
-            r = (*(PyObject *(*)(PyFrameObject*,Function*,PyObject*,PyObject*))(func->body->code->data + func->body->offset))(f,func,args,kwds);
+            r = (*func->body->entry)(f,func,args,kwds);
             tstate->frame = f->f_back;
             Py_LeaveRecursiveCall();
         }
@@ -740,7 +683,7 @@ static PyObject *Function_new(PyTypeObject *type,PyObject *args,PyObject *kwds) 
         return NULL;
     }
 
-    if(!body->code) {
+    if(!body->name) {
         PyErr_SetString(PyExc_ValueError,"\"body\" was not initialized");
         return NULL;
     }
@@ -884,27 +827,6 @@ static PyObject *new_function(FunctionBody *body,PyObject *name,PyObject *global
     return _new_function(self,body,name,globals,doc,defaults,kwdefaults,closure,annotations);
 }
 
-
-enum generator_state {
-    GEN_INITIAL,
-    GEN_RUNNING,
-    GEN_PAUSED,
-    GEN_FINISHED
-} state;
-
-typedef struct {
-    PyObject_HEAD
-
-    size_t stack_size;
-    void **stack;
-    enum generator_state state;
-    size_t offset;
-    PyObject *name;
-    PyObject **closure;
-    FunctionBody *body;
-    PyObject *sub_generator;
-    PyObject *weakrefs;
-} Generator;
 
 static PyFrameObject* Generator_frame(Generator *g) {
     return (PyFrameObject*)g->stack[g->stack_size-1];
@@ -2155,6 +2077,77 @@ builtin___build_class__(PyObject *self, PyObject *args, PyObject *kwds)
 }
 
 
+/* The next two functions are for the benefit of the C backend (c_ops.py). The
+other backends compile their own versions with a custom calling convention. */
+
+static PyObject *c_global_name(PyObject *item,PyFrameObject *frame) {
+    PyObject *r;
+    PyObject *globals = frame->f_globals;
+    PyObject *builtins = frame->f_builtins;
+
+    if((Py_TYPE(globals) == &PyDict_Type) && (Py_TYPE(builtins) == &PyDict_Type)) {
+        r = _PyDict_LoadGlobal((PyDictObject*)globals,(PyDictObject*)builtins,item);
+        if(!r) {
+            r = PyErr_Occurred();
+            if(!r) goto name_err;
+            return NULL;
+        }
+        Py_INCREF(r);
+    } else {
+        r = PyObject_GetItem(globals,item);
+        if(!r) {
+            r = PyObject_GetItem(builtins,item);
+            if(!r) {
+                if(!PyErr_ExceptionMatches(PyExc_KeyError)) {
+                name_err:
+                    format_exc_check_arg(PyExc_NameError,GLOBAL_NAME_ERROR_MSG,item);
+                }
+                return NULL;
+            }
+        }
+    }
+
+    return r;
+}
+
+static PyObject *c_local_name(PyObject *item,PyFrameObject *frame) {
+    PyObject *r;
+    PyObject *builtins;
+    PyObject *locals = frame->f_locals;
+
+    if(!locals) {
+        return PyErr_Format(PyExc_SystemError,NO_LOCALS_LOAD_MSG,item);
+    }
+    if(Py_TYPE(locals) != &PyDict_Type) {
+        r = PyObject_GetItem(locals,item);
+        if(r) return r;
+        if(!PyErr_ExceptionMatches(PyExc_KeyError)) return NULL;
+        PyErr_Clear();
+    } else {
+        r = PyDict_GetItem(locals,item);
+        if(r) goto end;
+    }
+    r = PyDict_GetItem(frame->f_globals,item);
+    if(!r) {
+        builtins = frame->f_builtins;
+        if(Py_TYPE(builtins) != &PyDict_Type) {
+            r = PyObject_GetItem(builtins,item);
+            if(r) return r;
+            if(!PyErr_ExceptionMatches(PyExc_KeyError)) return NULL;
+            goto name_err;
+        } else {
+            r = PyDict_GetItem(builtins,item);
+            if(r) goto end;
+        name_err:
+            format_exc_check_arg(PyExc_NameError,NAME_ERROR_MSG,item);
+            return NULL;
+        }
+    }
+end:
+    Py_INCREF(r);
+    return r;
+}
+
 
 static PyMethodDef functions[] = {
     {"read_address",read_address,METH_VARARGS,read_address_doc},
@@ -2270,7 +2263,7 @@ static OffsetStruct member_offsets[] = {
     {"CompiledCode",(OffsetMember[]){M_OFFSET(CompiledCode,data),{NULL}}},
     {"FunctionBody",(OffsetMember[]){
         M_OFFSET(FunctionBody,code),
-        M_OFFSET(FunctionBody,offset),
+        M_OFFSET(FunctionBody,entry),
         {NULL}}},
     {"Function",(OffsetMember[]){
         M_OFFSET(Function,name),
@@ -2443,6 +2436,8 @@ PyInit_pyinternals(void) {
         ADD_ADDR(call_exc_trace),
         ADD_ADDR(_print_expr),
         ADD_ADDR(_load_build_class),
+        ADD_ADDR(c_global_name),
+        ADD_ADDR(c_local_name),
 
         ADD_ADDR(Py_True),
         ADD_ADDR(Py_False),

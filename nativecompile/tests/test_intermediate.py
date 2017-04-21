@@ -16,11 +16,10 @@
 import unittest
 
 from .. import intermediate as ir
-from .. import abi
 from ..dinterval import *
 
 
-class DRegister(abi.Register):
+class DRegister(ir.AbiRegister):
     def __init__(self,reg,size=3):
         self.reg = reg
         self.size = size
@@ -69,7 +68,7 @@ lea_op = ir.OpDescription(
 
 class DIRCompiler(ir.IRCompiler):
     def __init__(self,abi):
-        self.abi = abi
+        super().__init__(abi)
 
     def prolog(self):
         return []
@@ -80,7 +79,7 @@ class DIRCompiler(ir.IRCompiler):
     def get_reg(self,index,size):
         return DRegister(self.abi.reg_indices[index],size)
 
-    def get_stack_addr(self,index,offset,size,sect):
+    def get_stack_addr(self,index,offset,size,block_size,sect):
         return DAddress(index*self.abi.ptr_size+offset,self.abi.r_sp)
 
     def get_displacement(self,amount,force_wide):
@@ -124,6 +123,9 @@ class IndirectionAdapter(ir.RegAllocatorOverloads):
     def best_match(self,args):
         return self.wrap_overload(self.base_op.best_match(self._to_base_args(args)))
 
+    def exact_match(self,args):
+        return self.wrap_overload(self.base_op.exact_match(self._to_base_args(args)))
+
     def to_ir2(self,args):
         o = self.base_op.exact_match(self._to_base_args(args))
         return ir.Instr2(self.base_op,self.wrap_overload(o),args)
@@ -137,7 +139,7 @@ class IndirectionAdapter(ir.RegAllocatorOverloads):
 
         return self.base_op.assembly(splice(args,self.param,self.base+self.index,(m,)),addr,binary,annot)
 
-class DOpGen(ir.JumpCondIROpGen):
+class DOpGen(ir.JumpCondOpGen):
     def __init__(self):
         super().__init__(DAbi())
 
@@ -173,14 +175,25 @@ class DOpGen(ir.JumpCondIROpGen):
             raise AssertionError()
         return func
 
-class DAbi(abi.Abi):
-    code_gen = None
+_ret = DRegister(0)
+_sp = DRegister(1)
+_scratch = [DRegister(i) for i in range(2,4)]
+_pres = [DRegister(i) for i in range(4,10)]
+_arg = [DRegister(i) for i in range(10,16)]
+callconv = ir.CallingConvention(_ret,_pres,_scratch,_arg)
 
-    r_ret = DRegister(0)
-    r_sp = DRegister(1)
-    r_scratch = [DRegister(i) for i in range(2,4)]
-    r_pres = [DRegister(i) for i in range(4,10)]
-    r_arg = [DRegister(i) for i in range(10,16)]
+class DAbi(ir.BinaryAbi):
+    code_gen = None
+    callconvs = (callconv,callconv)
+
+    all_regs = _pres + _scratch + [_ret] + _arg + [_sp]
+    gen_regs = len(_pres) + len(_scratch) + 1 + len(_arg)
+
+    r_ret = _ret
+    r_sp = _sp
+    r_scratch = _scratch
+    r_pres = _pres
+    r_arg = _arg
 
     ptr_size = 5
     char_size = 1
@@ -257,9 +270,9 @@ class MyTestCase(unittest.TestCase):
                                                               #     a b c d e
         code = [ir.CreateVar(a,ir.FixedRegister(0)),          # 0   w
             ir.CreateVar(b,ir.FixedRegister(1)),              # 1   | w
-            ir.Instr(read_op,ir.IndirectVar(64,b,None,0,0)),  # 2   | r
+            ir.Instr(read_op,ir.IndirectVar(64,b,None,0)),    # 2   | r
             ir.Instr(write_op,c),                             # 3   | | w
-            ir.Instr(read_op,ir.IndirectVar(56,b,None,0,0)),  # 4   | r |
+            ir.Instr(read_op,ir.IndirectVar(56,b,None,0)),    # 4   | r |
             ir.Instr(write_op,d),                             # 5   |   | w
             ir.Instr(read_op,c),                              # 6   |   r |
             ir.IRJump(target1,True,0),                        # 7   |   | |
@@ -420,7 +433,7 @@ class MyTestCase(unittest.TestCase):
 
         to5 = [0, 1, 2, 3, 4, 5]
         code = [                                             #     a b c d
-            ir.CreateVar(a,ir.FixedRegister(9,0)),           # 0   w
+            ir.CreateVar(a,ir.FixedRegister(9)),             # 0   w
             ir.IRJump(target_1,True,0),                      # 1   |
             ir.Instr(write_op,b),                            # 2   | w
             ir.IRJump(target_2,False,0),                     # 3   | |
@@ -443,7 +456,7 @@ class MyTestCase(unittest.TestCase):
             ir.LockRegs((0,)),                               # 20  |
             ir.InvalidateRegs([6,7,8,10,11,12,13,14],to5),   # 21  |
             ir.UnlockRegs((0,)),                             # 22  |
-            ir.CreateVar(c,ir.FixedRegister(8,0)),           # 23  |   w
+            ir.CreateVar(c,ir.FixedRegister(8)),             # 23  |   w
             ir.Instr(read_op,c),                             # 24  |   r
             ir.IRJump(target_10,True,0),                     # 25  |   |
             ir.Instr(write_op,b),                            # 26  | w
@@ -454,7 +467,7 @@ class MyTestCase(unittest.TestCase):
             ir.Instr(read_op,c),                             # 31  |   r
             ir.InvalidateRegs([6,7,8,12,13,14],to5),         # 32  |
             ir.UnlockRegs((0, 1, 2)),                        # 33  |
-            ir.CreateVar(d,ir.FixedRegister(8,0)),           # 34  |     w
+            ir.CreateVar(d,ir.FixedRegister(8)),             # 34  |     w
             ir.Instr(read_op,d),                             # 35  |     r
             ir.IRJump(target_11,True,0),                     # 36  |     |
             ir.Instr(write_op,b),                            # 37  | w
@@ -479,7 +492,7 @@ class MyTestCase(unittest.TestCase):
         self.assertEqual(d.lifetime.intervals,DInterval([(35,37),(39,42)]))
 
     def test_lea(self):
-        # Instruction parameters that that neither read nor write are a special
+        # Instruction parameters that neither read nor write are a special
         # case.
         a = ir.Var('a')
         b = ir.Var('b')

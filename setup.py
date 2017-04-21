@@ -84,9 +84,11 @@ setup(
         'Programming Language :: Python :: Implementation :: CPython',
         'Topic :: Software Development :: Compilers'],
     packages=['nativecompile','nativecompile.tests'],
+    test_suite='nativecompile.tests',
     ext_modules=[
         Extension('nativecompile.pyinternals',['nativecompile/pyinternals.c']),
         Extension('nativecompile.astloader',[DUMMY_PATH])],
+    headers=['nativecompile/pyinternals.h'],
     install_requires=['typing>=3.5.3'],
     zip_safe=True,
     cmdclass={'build_ext':CustomBuildExt})

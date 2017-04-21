@@ -64,7 +64,7 @@ class Interval(tuple,Container[T_co],Generic[T_co]):
 
 T = TypeVar('T')
 
-class DInterval(Container[T],Iterable[Interval[T]],Generic[T]):
+class DInterval(Container[T],Iterable[Interval[T]]):
     """A discontinuous interval.
 
     This can be thought of as a union of left-closed right-open intervals. The

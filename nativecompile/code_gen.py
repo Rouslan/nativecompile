@@ -13,207 +13,27 @@
 #  limitations under the License.
 
 
-import operator
+__all__ = ['string_addr','DelayedCompile','CleanupItem','StackCleanupSection',
+    'StackCleanup','StitchValue','check_args','Signedness','signed','unsigned',
+    'SCmp','make_value','make_arg','make_cmp','SBinCmp','SAndCmp','SOrCmp',
+    'SNotCmp','and_','or_','not_','MaybeTrackedValue','TrackedValue',
+    'PyObject','BorrowedValue','borrow','StolenValue','steal','ConstValue',
+    'TupleItem','tuple_item','ObjArrayValue','CType','type_of','type_flags_of',
+    'SImmediate','SIndirect','State','Stitch','destitch']
+
 import sys
 import weakref
 from functools import reduce
-from typing import Callable,Dict,FrozenSet,Generic,Iterable,List,Optional,Sized,Tuple,TYPE_CHECKING,TypeVar,Union
+from typing import Any,Callable,cast,Dict,FrozenSet,Generic,Iterable,List,Optional,overload,Tuple,TypeVar,Union
 
 from . import pyinternals
-from . import debug
+from . import c_types
 from .intermediate import *
 
-if TYPE_CHECKING:
-    from . import abi
-
-
-CALL_ALIGN_MASK = 0xf
-
-
-def aligned_for_call(x):
-    return (x + CALL_ALIGN_MASK) & ~CALL_ALIGN_MASK
 
 def string_addr(x):
-    if isinstance(x,str): return Immediate(pyinternals.raw_addresses[x])
+    if isinstance(x,str): return Symbol(x)
     return x
-
-address_of = id
-
-class Function:
-    def __init__(self,code,padding=0,offset=0,name=None,pyfunc=False,annotation=None,returns=None,params=None):
-        self.code = code
-
-        # the size, in bytes, of the trailing padding (nop instructions) in
-        # "code"
-        self.padding = padding
-
-        self.offset = offset
-        self.name = name
-        self.pyfunc = pyfunc
-        self.annotation = annotation or []
-        self.returns = returns
-        self.params = params or []
-
-    def __len__(self):
-        return len(self.code)
-
-class CompilationUnit:
-    def __init__(self,functions):
-        self.functions = functions
-
-    def __len__(self):
-        return sum(map(len,self.functions))
-
-    def write(self,out):
-        for f in self.functions:
-            out.write(f.code)
-
-
-def code_join(x):
-    if isinstance(x[0],bytes):
-        return b''.join(x)
-    return reduce(operator.add,x)
-
-class AsmOp:
-    __slots__ = 'op','args','binary','annot'
-
-    def __init__(self,op,args,binary,annot=''):
-        self.op = op
-        self.args = args
-        self.binary = binary
-        self.annot = annot
-
-    def __len__(self):
-        return len(self.binary)
-
-    def emit(self,addr):
-        return self.op.assembly(self.args,addr,self.binary,self.annot)
-
-    @property
-    def inline_comment(self):
-        return isinstance(self.op,CommentDesc) and self.op.inline
-
-class AsmSequence:
-    def __init__(self,ops=None):
-        self.ops = ops or []
-
-    def __len__(self):
-        return sum((len(op.binary) for op in self.ops),0)
-
-    def __add__(self,b):
-        if isinstance(b,AsmSequence):
-            return AsmSequence(self.ops+b.ops)
-
-        return NotImplemented
-
-    def __iadd__(self,b):
-        if isinstance(b,AsmSequence):
-            self.ops += b.ops
-            return self
-
-        return NotImplemented
-
-    def __mul__(self,b):
-        if isinstance(b,int):
-            return AsmSequence(self.ops*b)
-
-        return NotImplemented
-
-    def __imul__(self,b):
-        if isinstance(b,int):
-            self.ops *= b
-            return self
-
-        return NotImplemented
-
-    def emit(self,base=0):
-        lines = []
-        addr = base
-        for op in self.ops:
-            line = op.emit(addr)
-            if op.inline_comment:
-                assert lines
-                lines[-1] = ' '.join((lines[-1],line))
-            else:
-                lines.append(line)
-            addr += len(op)
-
-        return '\n'.join(lines)
-
-def asm_converter(op,f):
-    return lambda *args: AsmSequence([AsmOp(op,args,f(*args))])
-
-def make_asm_if_needed(instr,assembly):
-    if assembly:
-        return Instr2(instr.op,instr.overload.variant(
-            instr.overload.params,
-            asm_converter(instr.op,instr.overload.func)),instr.args)
-
-    return instr
-
-def resolve_jumps(cgen : IROpGen,regs : int,code1 : IRCode,end_targets=(),*,assembly=False) -> Function:
-    code,r_used,s_used = reg_allocate(cgen,code1,regs)
-    irc = cgen.get_compiler(r_used,s_used,cgen.max_args_used)
-
-    displacement = 0
-    pad_size = 0
-    annot_size = 0
-    annots = [] # type: List[debug.Annotation]
-
-    # this item will be replaced with padding if needed
-    late_chunks = [None] # type: List[Optional[Sized]]
-
-    code = irc.prolog() + code + irc.epilog()
-
-    for instr in reversed(code):
-        if isinstance(instr,IRAnnotation):
-            descr = instr.descr
-            if isinstance(descr,IRSymbolLocDescr):
-                descr = debug.VariableLoc(
-                    descr.symbol,
-                    irc.get_machine_arg(descr.loc.to_ir(),displacement) if descr.loc else None)
-
-            annot = debug.Annotation(descr,annot_size)
-
-            if assembly:
-                late_chunks.append(AsmSequence([AsmOp(comment_desc,('annotation: {!r}'.format(annot.descr),),b'')]))
-
-            # since appending to a list is O(1) while prepending is O(n), we
-            # add the items backwards and reverse the list afterwards
-            annots.append(annot)
-
-            annot_size = 0
-        elif isinstance(instr,Target):
-            instr.displacement = displacement
-        else:
-            assert isinstance(instr,Instr2)
-            chunk = irc.compile_early(make_asm_if_needed(instr,assembly),displacement)
-
-            # items are added backwards for the same reason as above
-            late_chunks.append(chunk)
-            displacement -= len(chunk)
-            annot_size += len(chunk)
-
-    assert annot_size == 0 or not annots, "if there are any annotations, there should be one at the start"
-
-    annots.reverse()
-
-    # add padding for alignment
-    if CALL_ALIGN_MASK:
-        unpadded = displacement
-        displacement = aligned_for_call(displacement)
-        pad_size = displacement - unpadded
-        if pad_size:
-            late_chunks[0] = code_join([irc.compile_early(make_asm_if_needed(c,assembly),0) for c in irc.nops(pad_size)])
-
-    for et in end_targets:
-        et.displacement -= displacement
-
-    return Function(
-        code_join([irc.compile_late(c) for c in reversed(late_chunks) if c is not None]),
-        pad_size,
-        annotation=annots)
-
 
 class DelayedCompile:
     def compile(self,s):
@@ -333,7 +153,7 @@ class StackCleanup:
 
 T = TypeVar('T')
 
-class StitchValue:
+class StitchValue(Generic[T]):
     """A value dependent on the state of a Stitch object.
 
     This is a lazily evaluated value that can be used directly but also serves
@@ -358,10 +178,10 @@ class StitchValue:
     def __ge__(self,b):
         return SBinCmp.from_dsl(self,b,CmpType.ge)
 
-    def __call__(self,s : 'Stitch') -> T:
+    def __call__(self,s: 'Stitch') -> T:
         raise NotImplementedError()
 
-#StitchT = Union[T,StitchValue['StitchT']]
+StitchT = Union[T,StitchValue[T]]
 
 if __debug__:
     def check_args(f):
@@ -372,82 +192,8 @@ if __debug__:
 
     Instr.__init__ = check_args(Instr.__init__)
 
-class PtrBinomial(StitchValue):
-    """A numeric value dependent on the size of a pointer.
 
-    This is a binomial equal to "ptr_factor * ptr_size + val" where ptr_size is
-    the size of a pointer on the host machine.
-
-    """
-
-    @staticmethod
-    def __new__(cls,val: Union['PtrBinomial',int],
-        ptr_factor: int = 0) -> 'PtrBinomial':
-        if isinstance(val,PtrBinomial):
-            if ptr_factor != 0:
-                raise TypeError(
-                    'ptr_factor cannot be non-zero if val is already an instance of PtrBinomial')
-            return val
-
-        r = super().__new__(cls)
-        r.val = val
-        r.ptr_factor = ptr_factor
-        return r
-
-    if TYPE_CHECKING:
-        # noinspection PyUnusedLocal
-        def __init__(self,val: Union['PtrBinomial',int],
-            ptr_factor: int = 0) -> None:
-            self.val = 0
-            self.ptr_factor = ptr_factor
-
-    def __call__(self,s):
-        return self.ptr_factor * s.cgen.abi.ptr_size + self.val
-
-    def __add__(self,b):
-        if isinstance(b,PtrBinomial):
-            return PtrBinomial(self.val + b.val,self.ptr_factor + b.ptr_factor)
-
-        if isinstance(b,int):
-            return PtrBinomial(self.val + b,self.ptr_factor)
-
-        return NotImplemented
-
-    __radd__ = __add__
-
-    def __neg__(self):
-        return PtrBinomial(-self.val,-self.ptr_factor)
-
-    def __sub__(self,b):
-        if isinstance(b,PtrBinomial):
-            return PtrBinomial(self.val - b.val,self.ptr_factor - b.ptr_factor)
-
-        if isinstance(b,int):
-            return PtrBinomial(self.val - b,self.ptr_factor)
-
-        return NotImplemented
-
-    def __rsub__(self,b):
-        if isinstance(b,int):
-            return PtrBinomial(b - self.val,-self.ptr_factor)
-
-        return NotImplemented
-
-    def __mul__(self,b):
-        if isinstance(b,int):
-            return PtrBinomial(self.val * b,self.ptr_factor * b)
-
-        return NotImplemented
-
-    __rmul__ = __mul__
-
-    def __floordiv__(self,b):
-        if isinstance(b,int):
-            return PtrBinomial(self.val // b,self.ptr_factor // b)
-
-SIZE_PTR = PtrBinomial(0,1)
-
-class Signedness(StitchValue):
+class Signedness(StitchValue[T]):
     def __init__(self,val,signed : bool) -> None:
         self.val = val
         self.signed = signed
@@ -462,17 +208,50 @@ def unsigned(x) -> Signedness:
     return Signedness(x,False)
 
 # noinspection PyAbstractClass
-class SCmp(StitchValue):
+class SCmp(StitchValue[Cmp]):
     pass
 
-def make_value(s : 'Stitch',x):
+def make_value(s: 'Stitch',x):
     if isinstance(x,StitchValue):
         return x(s)
     return string_addr(x)
 
-def make_arg(s : 'Stitch',x):
+def make_arg(s: 'Stitch',x):
+    """Convert x into an instance of Value, if a conversion exists, or return
+    x unchanged."""
     r = make_value(s,x)
     return Immediate(r) if isinstance(r,int) else r
+
+def _get_type(x):
+    return x.data_type if isinstance(x,Value) else None
+
+def _common_type(a,b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a == b:
+        return a
+    return c_types.t_void_ptr
+
+def make_args(s: 'Stitch',*args):
+    """Convert arguments to instances of Value.
+
+    This is equivalent to "[make_arg(a) for a in args]" except untyped
+    literals will get the same type as the common type of all typed arguments,
+    if such a type exists.
+
+    """
+    vals = [make_value(s,a) for a in args]
+    common_t = reduce(_common_type,map(_get_type,vals),None)
+    if common_t is None: common_t = c_types.t_void_ptr
+
+    for i,a in enumerate(vals):
+        if isinstance(a,int):
+            vals[i] = Immediate(a,common_t)
+
+    return vals
+
 
 def make_cmp(x):
     if isinstance(x,SCmp):
@@ -533,13 +312,14 @@ and_ = SAndCmp
 or_ = SOrCmp
 not_ = SNotCmp
 
-# noinspection PyAbstractClass
-class MaybeTrackedValue(StitchValue):
-    def discard(self,s):
-        raise NotImplementedError()
+ValueT = TypeVar('ValueT',bound=Value)
 
 # noinspection PyAbstractClass
-class TrackedValue(MaybeTrackedValue):
+class MaybeTrackedValue(StitchValue[ValueT]):
+    def discard(self,s: 'Stitch') -> None:
+        raise NotImplementedError()
+
+class TrackedValue(MaybeTrackedValue[ValueT]):
     """A value that requires clean-up.
 
     When the value is no longer needed in the generated code, 'discard' must be
@@ -547,7 +327,7 @@ class TrackedValue(MaybeTrackedValue):
     branches of the generated code.
 
     """
-    def __init__(self,value : object,cleanup : Callable[['Stitch',object],None],own : bool=False) -> None:
+    def __init__(self,value: ValueT,cleanup: Callable[['Stitch',ValueT],None],own: bool=False) -> None:
         self.value = value
         self.cleanup_func = cleanup
         self.initial_own = own
@@ -561,7 +341,7 @@ class TrackedValue(MaybeTrackedValue):
             self.cleanup_func(s,self.value)
             s.state.disown(self)
 
-class PyObject(TrackedValue):
+class PyObject(TrackedValue[ValueT]):
     @staticmethod
     def cleanup(s,val):
         s.decref(val)
@@ -570,9 +350,13 @@ class PyObject(TrackedValue):
     def nullable_cleanup(s,val):
         s.if_(val).decref(val).endif()
 
-    def __init__(self,value : Optional[Value]=None,own : bool=False,nullable : bool=False) -> None:
+    def __init__(self,value : Union[ValueT,str,None]=None,own : bool=False,nullable : bool=False) -> None:
+        if isinstance(value,str):
+            value = cast(ValueT,Var(value,data_type=c_types.PyObject_ptr))
+        elif value is None:
+            value = cast(ValueT,Var(data_type=c_types.PyObject_ptr))
         super().__init__(
-            Var() if value is None else value,
+            cast(ValueT,value),
             PyObject.nullable_cleanup if nullable else PyObject.cleanup,
             own)
 
@@ -584,8 +368,8 @@ class PyObject(TrackedValue):
         def origin(self):
             return getattr(self.value,'origin',None)
 
-class BorrowedValue(MaybeTrackedValue):
-    def __init__(self,value : TrackedValue) -> None:
+class BorrowedValue(MaybeTrackedValue[ValueT]):
+    def __init__(self,value : TrackedValue[ValueT]) -> None:
         self.value = value
 
     def __call__(self,s):
@@ -598,15 +382,15 @@ def borrow(x):
     if isinstance(x,BorrowedValue): return x
     return BorrowedValue(x)
 
-class StolenValue(StitchValue):
-    def __init__(self,val : MaybeTrackedValue) -> None:
+class StolenValue(StitchValue[ValueT]):
+    def __init__(self,val : MaybeTrackedValue[ValueT]) -> None:
         self.val = val
-        self.loc = None
+        self.loc = None # type: Optional[ValueT]
 
     def __call__(self,s):
         if self.loc is None:
             if isinstance(self.val,ConstValue):
-                self.loc = Var()
+                self.loc = Var(data_type=c_types.PyObject_ptr)
                 s.mov(self.val.value,self.loc)
                 s.incref(self.loc)
             else:
@@ -628,10 +412,10 @@ class StolenValue(StitchValue):
 
 steal = StolenValue
 
-class ConstValue(MaybeTrackedValue):
-    """Represents an absolute address to a Python object."""
+class ConstValue(MaybeTrackedValue[ValueT]):
+    """Represents a never-owned Python object."""
 
-    def __init__(self,value : Value) -> None:
+    def __init__(self,value: ValueT) -> None:
         self.value = value
 
     def __call__(self,s):
@@ -647,21 +431,25 @@ class TupleItem(StitchValue):
         self.n = n
 
     def __call__(self,s):
-        return (self.addr + s.cgen.abi.ptr_size * self.n)(s)
+        return (self.addr + SIZE_PTR * self.n)(s)
 
 tuple_item = TupleItem
 
 
-class ObjArrayValue(TrackedValue):
-    def __init__(self,value : Optional[Value]=None,own : bool=False) -> None:
+class ObjArrayValue(TrackedValue[ValueT]):
+    def __init__(self,value : Union[ValueT,str,None]=None,own : bool=False) -> None:
+        if value is None:
+            value = cast(ValueT,Var(data_type=c_types.TPtr(c_types.PyObject_ptr)))
+        elif isinstance(value,str):
+            value = cast(ValueT,Var(value,c_types.TPtr(c_types.PyObject_ptr)))
         super().__init__(
-            Var() if value is None else value,
+            cast(ValueT,value),
             (lambda s,val: s.call('free_pyobj_array',val)),
             own)
 
 
-class CType(StitchValue):
-    def __init__(self,t,base=None,index=None,scale=SIZE_PTR):
+class CType(StitchValue[ValueT]):
+    def __init__(self,t: str,base: Optional[ValueT]=None,index: Optional[Value]=None,scale=SIZE_PTR) -> None:
         self.offsets = pyinternals.member_offsets[t]
         self.base = Var() if base is None else base
         self.index = index
@@ -681,7 +469,7 @@ def type_of(r):
 def type_flags_of(r):
     return CType('PyTypeObject',r).tp_flags
 
-class SImmediate(StitchValue):
+class SImmediate(StitchValue[Immediate]):
     def __init__(self,val,size=SIZE_PTR):
         self.val = val
         self.size = size
@@ -689,17 +477,17 @@ class SImmediate(StitchValue):
     def __call__(self,s):
         return Immediate(make_value(s,self.val),make_value(s,self.size))
 
-class SIndirect(StitchValue):
-    def __init__(self,offset=0,base=None,index=None,scale=SIZE_PTR,size=SIZE_PTR):
+class SIndirect(StitchValue[IndirectVar]):
+    def __init__(self,offset=0,base=None,index=None,scale=SIZE_PTR,data_type=c_types.t_void_ptr):
         self.offset = offset
         self.base = base
         self.index = index
         self.scale = scale
-        self.size = size
+        self.data_type = data_type
 
     def __add__(self,b):
-        if isinstance(b,int):
-            return SIndirect(self.offset+b,self.base,self.index,self.scale,self.size)
+        if isinstance(b,(int,PtrBinomial)):
+            return SIndirect(self.offset+b,self.base,self.index,self.scale,self.data_type)
 
         return NotImplemented
 
@@ -712,7 +500,7 @@ class SIndirect(StitchValue):
             make_value(s,self.base),
             make_value(s,self.index),
             make_value(s,self.scale),
-            make_value(s,self.size))
+            make_value(s,self.data_type))
 
 
 class Scope:
@@ -902,7 +690,7 @@ else:
 class Stitch:
     """Create machine code concisely using method chaining"""
 
-    def __init__(self,cgen : IROpGen,state : Optional[State]=None,cleanup : Optional[StackCleanup]=None) -> None:
+    def __init__(self,cgen : OpGen,state : Optional[State]=None,cleanup : Optional[StackCleanup]=None) -> None:
         self.cgen = cgen
         self._scopes = [MainScope(state or State())] # type: List[Scope]
 
@@ -941,6 +729,10 @@ class Stitch:
 
     def own(self,x) -> 'Stitch':
         self.state.own(x,self.cleanup.depth)
+        return self
+
+    def disown(self,x) -> 'Stitch':
+        self.state.disown(x)
         return self
 
     def endif(self):
@@ -1015,7 +807,7 @@ class Stitch:
 
             return self
 
-        ob_type = Var()
+        ob_type = Var(data_type=c_types.PyTypeObject_ptr)
         (self
             .sub(CType('PyObject',val).ob_refcnt,amount)
             .if_(not_(CType('PyObject',val).ob_refcnt))
@@ -1027,22 +819,24 @@ class Stitch:
 
         return self.endif()
 
-    def call(self,func,*args,store_ret=None):
+    def call(self,func,*args,store_ret=None,callconv=CallConvType.default):
         self._debug_append(self.cgen.call(
             make_arg(self,func),
             [make_arg(self,a) for a in args],
-            make_arg(self,store_ret)))
+            make_arg(self,store_ret),
+            callconv))
 
         if isinstance(func,str):
             self.comment(func,inline=True)
 
         return self
 
-    def call_preloaded(self,func,arg_count,store_ret=None):
+    def call_preloaded(self,func,arg_count,store_ret=None,callconv=CallConvType.default):
         self._debug_append(self.cgen.call_preloaded(
             make_arg(self,func),
             arg_count,
-            make_arg(self,store_ret)))
+            make_arg(self,store_ret),
+            callconv))
 
         if isinstance(func,str):
             self.comment(func,inline=True)
@@ -1056,33 +850,88 @@ class Stitch:
         return self.mov(IndirectVar(pyinternals.raw_addresses['_PyThreadState_Current']),dest)
 
     def _bin_op(self,a,b,dest,optype):
-        a = make_arg(self,a)
-        b = make_arg(self,b)
+        a,b,dest = make_args(self,a,b,dest)
         return self._debug_append(
             self.cgen.bin_op(a,b,a if dest is None else dest,optype))
+
+    @overload
+    def add(self,a: StitchT[MutableValue],b: StitchT[Value],c: None) -> 'Stitch':
+        pass
+
+    @overload
+    def add(self,a: StitchT[Value],b: StitchT[Value],c: StitchT[MutableValue]) -> 'Stitch':
+        pass
 
     def add(self,a,b,dest=None):
         return self._bin_op(a,b,dest,OpType.add)
 
+    @overload
+    def sub(self,a: StitchT[MutableValue],b: StitchT[Value],c: None) -> 'Stitch':
+        pass
+
+    @overload
+    def sub(self,a: StitchT[Value],b: StitchT[Value],c: StitchT[MutableValue]) -> 'Stitch':
+        pass
+
     def sub(self,a,b,dest=None):
         return self._bin_op(a,b,dest,OpType.sub)
+
+    @overload
+    def mul(self,a: StitchT[MutableValue],b: StitchT[Value],c: None) -> 'Stitch':
+        pass
+
+    @overload
+    def mul(self,a: StitchT[Value],b: StitchT[Value],c: StitchT[MutableValue]) -> 'Stitch':
+        pass
 
     def mul(self,a,b,dest=None):
         return self._bin_op(a,b,dest,OpType.mul)
 
+    @overload
+    def and_(self,a: StitchT[MutableValue],b: StitchT[Value],c: None) -> 'Stitch':
+        pass
+
+    @overload
+    def and_(self,a: StitchT[Value],b: StitchT[Value],c: StitchT[MutableValue]) -> 'Stitch':
+        pass
+
     def and_(self,a,b,dest=None):
         return self._bin_op(a,b,dest,OpType.and_)
 
+    @overload
+    def or_(self,a: StitchT[MutableValue],b: StitchT[Value],c: None) -> 'Stitch':
+        pass
+
+    @overload
+    def or_(self,a: StitchT[Value],b: StitchT[Value],c: StitchT[MutableValue]) -> 'Stitch':
+        pass
+
     def or_(self,a,b,dest=None):
         return self._bin_op(a,b,dest,OpType.or_)
+
+    @overload
+    def xor(self,a: StitchT[MutableValue],b: StitchT[Value],c: None) -> 'Stitch':
+        pass
+
+    @overload
+    def xor(self,a: StitchT[Value],b: StitchT[Value],c: StitchT[MutableValue]) -> 'Stitch':
+        pass
 
     def xor(self,a,b,dest=None):
         return self._bin_op(a,b,dest,OpType.xor)
 
     def _unary_op(self,a,dest,optype):
-        a = make_arg(self,a)
+        a,dest = make_args(self,a,dest)
         return self._debug_append(
             self.cgen.unary_op(a,a if dest is None else dest,optype))
+
+    @overload
+    def neg(self,a: StitchT[MutableValue],dest: None):
+        pass
+
+    @overload
+    def neg(self,a: StitchT[Value],dest: StitchT[MutableValue]):
+        pass
 
     def neg(self,a,dest=None):
         return self._unary_op(a,dest,UnaryOpType.neg)
@@ -1094,16 +943,19 @@ class Stitch:
         test = make_value(self,make_cmp(test))
         return self._debug_append(self.cgen.jump_if(dest,test))
 
+    def shift(self,direction,val,amount,dest):
+        val,dest = make_args(self,val,dest)
+        return self._debug_append(self.cgen.shift(val,direction,amount,dest))
+
     def shl(self,val,amount,dest):
-        val = make_arg(self,val)
-        return self._debug_append(self.cgen.shift(val,ShiftDir.left,amount,dest))
+        return self.shift(ShiftDir.left,val,amount,dest)
 
     def shr(self,val,amount,dest):
-        val = make_arg(self,val)
-        return self._debug_append(self.cgen.shift(val,ShiftDir.right,amount,dest))
+        return self.shift(ShiftDir.right,val,amount,dest)
 
     def mov(self,src,dest):
-        return self._debug_append(self.cgen.move(make_arg(self,src),make_arg(self,dest)))
+        src,dest = make_args(self,src,dest)
+        return self._debug_append(self.cgen.move(src,dest))
 
     def lea(self,addr,dest):
         addr = make_arg(self,addr)
@@ -1127,9 +979,6 @@ class Stitch:
     def create_var(self,var,val):
         self.append(CreateVar(make_arg(self,var),make_arg(self,val)))
         return self
-
-    def return_value(self,val):
-        return self._debug_append(self.cgen.return_value(make_arg(self,val)))
 
     def jump_table(self,val,targets):
         """Generate a jump table that will jump to the corresponding target

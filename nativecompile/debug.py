@@ -18,12 +18,12 @@ from itertools import groupby
 from . import pyinternals
 from . import elf
 from . import dwarf
+from .compilation_unit import *
 from .reloc_buffer import RelocBuffer
 
 
 GDB_JIT_SUPPORT = getattr(pyinternals,'GDB_JIT_SUPPORT',False)
 
-FUNC_PARAMS = ('__f',)
 
 # we want a mutable "size"
 class Annotation:
@@ -235,90 +235,6 @@ class CallFrameEntry:
         return self.addr,tot_size,instr
 
 
-class CType:
-    def die(self,dcu,abi,st,cache=None):
-        if cache is None: cache = {}
-
-        r = cache.get(self)
-        if r is None:
-            r = self._die(dcu,abi,st,cache)
-            cache[self] = r
-            dcu.children.append(r)
-        return r
-
-    def _die(self,dcu,abi,st,cache):
-        raise NotImplementedError()
-
-    def __hash__(self):
-        return hash(str(self))
-
-class TVoid(CType):
-    def __str__(self):
-        return 'void'
-
-    def __repr__(self):
-        return 'TVoid()'
-
-    def __eq__(self,b):
-        return isinstance(b,TVoid)
-
-    __hash__ = CType.__hash__
-
-    def _die(self,dcu,abi,st,cache):
-        return dwarf.DIE('unspecified_type',name=st['void'])
-
-t_void = TVoid()
-
-class TInt(CType):
-    def __init__(self,base_name,f_size,signed):
-        self.base_name = base_name
-        self.f_size = f_size
-        self.signed = signed
-
-    def __str__(self):
-        r = self.base_name
-        if not self.signed: r = 'unsigned ' + r
-        return r
-
-    def __repr__(self):
-        return 'TInt({:r},{:r},{:r})'.format(self.base_name,self.f_size,self.signed)
-
-    def __eq__(self,b):
-        return isinstance(b,TInt) and self.base_name == b.base_name and self.signed == b.signed
-
-    __hash__ = CType.__hash__
-
-    def _die(self,dcu,abi,st,cache):
-        return dwarf.DIE('base_type',
-            name=st[self.__str__()],
-            encoding=dwarf.ATE.signed if self.signed else dwarf.ATE.unsigned,
-            byte_size=dwarf.FORM_data1(self.f_size(abi)))
-
-t_int = TInt('int',(lambda abi: abi.int_size),True)
-t_unsigned_int = TInt(t_int.base_name,t_int.f_size,False)
-t_long = TInt('long',(lambda abi: abi.long_size),True)
-t_unsigned_long = TInt(t_long.base_name,t_long.f_size,False)
-
-class TPtr(CType):
-    def __init__(self,base):
-        self.base = base
-
-    def __str__(self):
-        return str(self.base) + '*'
-
-    def __repr__(self):
-        return 'TPtr({:r})'.format(self.base)
-
-    def __eq__(self,b):
-        return isinstance(b,TPtr) and self.base == b.base
-
-    __hash__ = CType.__hash__
-
-    def _die(self,dcu,abi,st,cache):
-        return dwarf.DIE('pointer_type',
-            type=dwarf.FORM_ref_udata(self.base.die(dcu,abi,st,cache)),
-            byte_size=dwarf.FORM_data1(abi.ptr_size))
-
 def generate(abi,cu,entry_points):
     emode = abi.ptr_size * 8
     dmode = dwarf.Mode(dwarf.MODE_32,abi.ptr_size)
@@ -332,39 +248,12 @@ def generate(abi,cu,entry_points):
         low_pc=dwarf.FORM_addr(0),
         high_pc=dwarf.FORM_udata(len(cu)))
 
-    t_int = dwarf.DIE('base_type',
-        name=st['int'],
-        encoding=dwarf.ATE.signed,
-        byte_size=dwarf.FORM_data1(abi.int_size))
-    dcu.children.append(t_int)
-
-    if abi.long_size > abi.int_size:
-        t_ulong = dwarf.DIE('base_type',
-            name=st['unsigned long'],
-            encoding=dwarf.ATE.unsigned,
-            byte_size=dwarf.FORM_data1(abi.long_size))
-    else:
-        assert abi.long_size == abi.int_size
-        t_ulong = dwarf.DIE('base_type',
-            name=st['unsigned int'],
-            encoding=dwarf.ATE.unsigned,
-            byte_size=dwarf.FORM_data1(abi.int_size))
-    dcu.children.append(t_ulong)
-
-    t_void = dwarf.DIE('unspecified_type',name=st['void'])
-    dcu.children.append(t_void)
-
-    t_vptr = dwarf.DIE('pointer_type',
-        type=ref(t_void),
-        byte_size=dwarf.FORM_data1(abi.ptr_size))
-    dcu.children.append(t_vptr)
-
-    c_types = {}
+    all_types = {}
     for func in cu.functions:
         if func.returns:
-            func.returns.die(dcu,abi,st,c_types)
+            func.returns.die(dcu,abi,st,all_types)
         for a in func.params:
-            a.die(dcu,abi,st,c_types)
+            a.type.die(dcu,abi,st,all_types)
 
     for func in cu.functions:
         df = dwarf.DIE('subprogram')
@@ -372,36 +261,47 @@ def generate(abi,cu,entry_points):
         if func.name:
             df.name = st[elf.symbolify(func.name)]
         if func.returns:
-            df.type = ref(c_types[func.returns])
+            df.type = ref(all_types[func.returns])
 
         if func.annotation:
             df.frame_base = dwarf.FORM_exprloc(dwarf.OP(dmode).call_frame_cfa())
             cfs.append(CallFrameEntry(func.offset,func.annotation,abi.ptr_size))
 
-        if func.pyfunc:
-            for var,form in find_vars(func):
-                df.children.append(dwarf.DIE('formal_parameter' if var in FUNC_PARAMS else 'variable',
-                    name=st[var],
-                    type=ref(t_vptr),
-                    location=form))
-        else:
+        if func.callconv == CallConvType.utility:
             df.calling_convention = dwarf.CC.nocall
+
+        params = [None] * len(func.params)
+        #vars_ = []
+        for var,form in find_vars(func):
+            for i,a in enumerate(func.params):
+                if a.name == var:
+                    params[i] = dwarf.DIE('formal_parameter',
+                        name=st[var],
+                        type=ref(all_types[a.type]),
+                        location=form)
+                    break
+            else:
+                pass
+                #vars_.append(dwarf.DIE('variable',
+                #    name=st[var],
+                #    type=ref(t_vptr),
+                #    location=form))
+
+        df.children.extend(p for p in params if p)
+        #df.children.extend(vars_)
 
         df.low_pc = dwarf.FORM_addr(func.offset)
         df.high_pc = dwarf.FORM_udata(len(func) - func.padding)
 
         dcu.children.append(df)
 
-    # if the string table's position in the list is changed, be sure to update
-    # SymbolSection.link up above
     sym_strtab = elf.SimpleStrTable('.strtab')
     callframes = lambda op,r: (cf(op,r) for cf in cfs)
-    reg = dwarf.reg(dmode)
-    pres_regs = [getattr(reg,r.name) for r in abi.r_pres] + [reg._bp]
+
     sections = [
         elf.CodeSection(cu),
         SymbolSection(emode,sym_strtab,cu.functions),
-        sym_strtab] + dwarf.elf_sections(dmode,dcu,st,callframes,pres_regs)
+        sym_strtab] + dwarf.elf_sections(dmode,dcu,st,callframes)
 
     out = RelocBuffer(abi.ptr_size)
     c_offset = elf.write_shared_object(emode,out,sections)[0].offset

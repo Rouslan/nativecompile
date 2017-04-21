@@ -15,10 +15,10 @@
 
 import struct
 import collections
-from typing import Union
+from typing import Callable,DefaultDict,Dict,Iterable,List,Optional,Tuple,Type,Union
 
 from . import elf
-from .reloc_buffer import RelocAbsAddress
+from .reloc_buffer import RelocAbsAddress,DeferredWrite,RelocBufferLike
 
 
 MODE_32 = 32
@@ -184,7 +184,7 @@ class FORM:
     def __str__(self):
         return '{} (DW_{})'.format(self.val,self.__class__.__name__)
 
-    def encode(self,d):
+    def encode(self,d: 'DebugInfo'):
         raise NotImplementedError()
 
 
@@ -197,12 +197,31 @@ class CLASS_lineptr(FORM): pass
 class CLASS_loclistptr(FORM): pass
 class CLASS_macptr(FORM): pass
 class CLASS_rangelistptr(FORM): pass
-class CLASS_reference(FORM): pass
+
+class CLASS_reference(FORM):
+    size = None
+
+    def encode(self,d: 'DebugInfo'):
+        r = d.refmap.get(id(self.val))
+        if r is not None: return self._encode_impl(r,d)
+
+        size = self.__class__.size
+        if size is None:
+            raise ValueError(
+                'forward-references are only allowed for fixed-size data types')
+
+        by_type = d.forward_refs[id(self.val)]
+        dw = by_type.get(self.__class__)
+        if dw is None:
+            by_type[self.__class__] = dw = DeferredWrite(size)
+        return dw
+
+    @staticmethod
+    def _encode_impl(id_val: int,d: 'DebugInfo') -> bytes:
+        raise NotImplementedError()
+
 class CLASS_string(FORM): pass
 
-
-def form(name,base,index,encode):
-    return type('FORM_'+name,(base,),{'index':index,'encode':encode})
 
 def enc_block_n(size):
     def encode(self,d):
@@ -214,13 +233,6 @@ def enc_block(self,d):
     assert isinstance(self.val,(bytes,bytearray))
     return enc_uleb128(len(self.val)) + self.val
 
-def enc_ref(self,d):
-    return d.mode.enc_int(self.val,d.mode.ref_size)
-
-def get_ref(self,d):
-    r = d.refmap.get(id(self.val))
-    assert r is not None, 'Only back-references are supported' # for now
-    return r
 
 class FORM_addr(CLASS_address):
     index = 0x01
@@ -264,7 +276,7 @@ class FORM_flag(CLASS_flag):
 
 class FORM_strp(CLASS_string):
     index =  0x0e
-    encode = enc_ref
+    def encode(self,d): return d.mode.enc_int(self.val,d.mode.ref_size)
 
 class FORM_sdata(CLASS_constant):
     index = 0x0d
@@ -276,23 +288,42 @@ class FORM_udata(CLASS_constant):
 
 class FORM_ref1(CLASS_reference):
     index = 0x11
-    def encode(self,d): return d.mode.enc_int(get_ref(self,d),1)
+    size = 1
+
+    @staticmethod
+    def _encode_impl(id_val: int,d: 'DebugInfo'):
+        return d.mode.enc_int(id_val,1)
 
 class FORM_ref2(CLASS_reference):
     index = 0x12
-    def encode(self,d): return d.mode.enc_int(get_ref(self,d),2)
+    size = 2
+
+    @staticmethod
+    def _encode_impl(id_val: int,d: 'DebugInfo'):
+        return d.mode.enc_int(id_val,2)
 
 class FORM_ref4(CLASS_reference):
     index = 0x13
-    def encode(self,d): return d.mode.enc_int(get_ref(self,d),4)
+    size = 4
+
+    @staticmethod
+    def _encode_impl(id_val: int,d: 'DebugInfo'):
+        return d.mode.enc_int(id_val,4)
 
 class FORM_ref8(CLASS_reference):
     index = 0x14
-    def encode(self,d): return d.mode.enc_int(get_ref(self,d),8)
+    size = 8
+
+    @staticmethod
+    def _encode_impl(id_val: int,d: 'DebugInfo'):
+        return d.mode.enc_int(id_val,8)
 
 class FORM_ref_udata(CLASS_reference):
     index = 0x15
-    def encode(self,d): return enc_uleb128(get_ref(self,d))
+
+    @staticmethod
+    def _encode_impl(id_val: int,d: 'DebugInfo'):
+        return enc_uleb128(id_val)
 
 
 SEC_OFFSET_CLASSES = CLASS_lineptr,CLASS_loclistptr,CLASS_macptr,CLASS_rangelistptr
@@ -348,6 +379,14 @@ def smallest_block_form(val):
     if len(val) == 2: return FORM_block2(val)
     if len(val) == 4: return FORM_block4(val)
     return FORM_block(val)
+
+def smallest_data_form(val):
+    if val < 0: return FORM_sdata(val)
+    if val <= 0xff: return FORM_data1(val)
+    if val <= 0xffff: return FORM_data2(val)
+    if val <= 0xffffffff: return FORM_data4(val)
+    if val <= 0xffffffffffffffff: return FORM_data8(val)
+    return FORM_udata(val)
 
 
 class ATE(Enum,FORM_data1):
@@ -909,16 +948,21 @@ class TypeData:
         self.has_child = has_child
         self.index = index
 
+CallFramesT = Callable[[CFA,Type[Register]],Iterable[Tuple[int,int,bytes]]]
+
 class DebugInfo:
-    def __init__(self,mode,data,call_frames=None,pres_regs=None):
+    # Currently, 'data' is supposed to be a single DIE. If this is changed to
+    # allow multiple top-level DIEs, the exception message at the end of
+    # _write_debug_info() should be updated
+    def __init__(self,mode : Mode,data : DIE,call_frames: Optional[CallFramesT]=None) -> None:
         self.mode = mode
         self.data = data
         self.call_frames = call_frames
-        self.pres_regs = pres_regs or []
         self.types = {}
         self.type_list = []
-        self.refmap = {}
-        self.sec_offset_maps = [{} for x in SEC_OFFSET_CLASSES]
+        self.refmap = {} # type: Dict[int,int]
+        self.forward_refs = collections.defaultdict(dict) # type: DefaultDict[int,Dict[Type[CLASS_reference],DeferredWrite]]
+        self.sec_offset_maps = [{} for _ in SEC_OFFSET_CLASSES]
 
         def get_types(die):
             s = die.signature()
@@ -953,7 +997,14 @@ class DebugInfo:
         out.write(unit_header.pack(DWARF_VERSION,0,self.mode.ptr_size))
 
         def write_die(die):
-            self.refmap[id(die)] = out.tell() - start
+            pos = out.tell() - start
+            self.refmap[id(die)] = pos
+
+            fwd_refs = self.forward_refs.get(id(die))
+            if fwd_refs is not None:
+                for type_,dw in fwd_refs.items():
+                    dw(type_(pos).encode(self))
+                del self.forward_refs[id(die)]
 
             ti = self.types.get(die.signature())
             assert ti is not None
@@ -967,10 +1018,13 @@ class DebugInfo:
 
         write_die(self.data)
 
-    def write_debug_info(self,out):
+        if any(self.forward_refs.values()):
+            raise ValueError('one or more attributes reference a DIE that is not a descendant of the root DIE')
+
+    def write_debug_info(self,out: RelocBufferLike):
         self._write_debug_info(out,out.tell())
 
-    def write_debug_abbrev(self,out):
+    def write_debug_abbrev(self,out: RelocBufferLike):
         for ti in self.type_list:
             out.write(enc_uleb128(ti.index))
             out.write(enc_uleb128(int(ti.tag)))
@@ -992,7 +1046,7 @@ class DebugInfo:
     #    out.write(head.pack(ARANGES_VERSION,0,self.mode.ptr_size,0))
     #    elf.align_fo(out,self.mode.ptr_size * 2)
 
-    def write_debug_ranges(self,out):
+    def write_debug_ranges(self,out: RelocBufferLike):
         baseloc = out.tell()
         mapping = self.rangelist
 
@@ -1004,7 +1058,7 @@ class DebugInfo:
                 out.write(RelocAbsAddress(size))
             out.write(b'\0' * (self.mode.ptr_size * 2))
 
-    def write_debug_loclist(self,out):
+    def write_debug_loclist(self,out: RelocBufferLike):
         baseloc = out.tell()
         mapping = self.loclist
         op = OP(self.mode)
@@ -1029,40 +1083,40 @@ class DebugInfo:
 
     def _cf_pad(self,out,body_size):
         pad = (body_size + (12 if self.mode.mode == MODE_64 else 4)) % self.mode.ptr_size
-        if pad != self.mode.ptr_size:
+        if pad:
             out.write(b'\0' * pad)
 
     @sized_section
-    def cie(self,out):
+    def cie(self,out: RelocBufferLike):
         cfa = CFA(self.mode)
         r = reg(self.mode)
-        body = (b'\xff' * self.mode.ref_size
+        body = (b'\xff' * self.mode.ref_size # CIE_id
             + bytes((CI_VERSION,0,self.mode.ptr_size,self.mode.seg_size))
             + enc_uleb128(1)
             + enc_sleb128(-self.mode.ptr_size)
             + enc_uleb128(int(r.RA))
             + cfa.def_cfa(r._sp,self.mode.ptr_size)
             + cfa.offset(r.RA,1))
-        for pr in self.pres_regs:
-            body += cfa.same_value(pr)
+        #for pr in pres_regs:
+        #    body += cfa.same_value(pr)
 
         out.write(body)
         self._cf_pad(out,len(body))
 
     @sized_section
-    def fde(self,out,addr,range,instr):
+    def fde(self,out: RelocBufferLike,cie_offset: int,addr: int,range_: int,instr):
         start = out.tell()
-        out.write(b'\0' * self.mode.ref_size)
+        out.write(self.mode.enc_int(cie_offset,size=self.mode.ref_size))
         out.write(RelocAbsAddress(addr))
-        out.write(self.mode.enc_int(range))
+        out.write(self.mode.enc_int(range_))
         out.write(instr)
         self._cf_pad(out,out.tell() - start)
 
-    def write_debug_frame(self,out):
+    def write_debug_frame(self,out: RelocBufferLike):
         self.cie(out)
         assert self.call_frames is not None
         for cf in self.call_frames(CFA(self.mode),reg(self.mode)):
-            self.fde(out,*cf)
+            self.fde(out,0,*cf)
 
 
 class DebugSection(elf.Section):
@@ -1077,8 +1131,8 @@ class DebugSection(elf.Section):
         self.callback(out)
 
 
-def elf_sections(mode,data,strings=None,callframes=None,pres_regs=None):
-    info = DebugInfo(mode,data,callframes,pres_regs)
+def elf_sections(mode: Mode,data: DIE,strings: Optional[StringTable]=None,callframes: Optional[CallFramesT]=None) -> List[DebugSection]:
+    info = DebugInfo(mode,data,callframes)
     r = [DebugSection(b'info',info.write_debug_info),
         DebugSection(b'abbrev',info.write_debug_abbrev)]
 

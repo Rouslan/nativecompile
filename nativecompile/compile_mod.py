@@ -13,24 +13,24 @@
 #  limitations under the License.
 
 
+import sys
 import ast
 import symtable
 import os
 import importlib
-from collections import OrderedDict, namedtuple
+from collections import namedtuple
 from itertools import chain
-from functools import partial
-from typing import Callable,Dict,List,Optional
+from typing import Callable,Dict,List,Optional,Tuple,Union
 
 from .code_gen import *
 from .intermediate import *
 from . import astloader
-from . import abi
 from . import pyinternals
 from . import debug
+from . import c_types
 
 
-DUMP_OBJ_FILE = bool(int(os.environ.get('DUMP_OBJ_FILE','0')))
+DUMP_OBJ_FILE = 1 if int(os.environ.get('DUMP_OBJ_FILE','0')) else 0
 NODE_COMMENTS = True
 DISABLE_DEBUG = False
 
@@ -79,10 +79,6 @@ def ast_and_symtable_map(code,filename,compile_type):
     return ast,{id_ : symtable._newSymbolTable(tab,filename) for id_,tab in tables.items()}
 
 
-def create_uninitialized(t):
-    return t.__new__(t)
-
-
 StitchCallback = Callable[[Stitch],None]
 
 class ScopeContext:
@@ -116,7 +112,7 @@ class FinallyContext(ScopeContext):
 
         # A list of targets that the code jumps to, after the end of the
         # finally block. This is needed for variable lifetime determination
-        self.next_targets = []
+        self.next_targets = [] # type: List[Target]
 
 
 def maybe_unicode(node : ast.AST) -> bool:
@@ -166,7 +162,7 @@ else:
 
 # noinspection PyPep8Naming
 class ExprCompiler:
-    def __init__(self,cgen,s_table=None,s_map=None,u_funcs=None,global_scope=False,entry_points=None):
+    def __init__(self,cgen,var_frame,s_table=None,s_map=None,u_funcs=None,global_scope=False,entry_points=None):
         self.code = Stitch(cgen)
         self.stable = s_table
         self.sym_map = s_map
@@ -174,18 +170,18 @@ class ExprCompiler:
         self.global_scope = global_scope
         self.entry_points = entry_points
         self.consts = {}
-        self.names = OrderedDict()
+        self.names = {}
         self.name_overrides = {}
         self.local_addrs = None
         self.local_addr_block = None
         self.visit_depth = 0
         self.target_contexts = []
         self.func_end = Target()
-        self.var_frame = Var('var_frame',dbg_symbol='__f')
-        self.var_globals = Var('var_globals')
-        self.var_locals = Var('var_locals')
-        self.var_free = Var('var_free')
-        self.var_return = Var('var_return')
+        self.var_frame = var_frame
+        self.var_globals = Var('var_globals',data_type=c_types.PyObject_ptr)
+        self.var_locals = Var('var_locals',data_type=c_types.PyObject_ptr)
+        self.var_free = Var('var_free',data_type=c_types.PyObject_ptr)
+        self.var_return = Var('var_return',data_type=c_types.PyObject_ptr)
 
         self._del_name_cleanups = {}
 
@@ -206,14 +202,17 @@ class ExprCompiler:
 
     def is_local(self,x):
         if not isinstance(x,symtable.Symbol): x = self.stable.lookup(x)
-        return (not self.global_scope) and x.is_local()
+
+        # "not x.is_global()" should be used instead of "x.is_local()" because
+        # both can return True for the same symbol
+        return not (self.global_scope or x.is_global())
 
     def is_cell(self,x):
         if not isinstance(x,symtable.Symbol): x = self.stable.lookup(x)
         return x.get_name() in self.cell_vars or (x.is_free() and x.is_local())
 
     def swap(self,a,b):
-        tmp = Var()
+        tmp = Var(data_type=a.data_type)
         (self.code
             .mov(a,tmp)
             .mov(b,a)
@@ -244,11 +243,11 @@ class ExprCompiler:
 
             if locals_:
                 for n in locals_:
-                    self.names[n] = address_of(n)
+                    self.names[n] = (address_of(n),len(self.names))
 
                 zero = 0
                 if len(locals_) > 1:
-                    zero = Var()
+                    zero = Var(data_type=c_types.PyObject_ptr)
                     self.code.mov(0,zero)
 
                 self.local_addr_block = Block(len(locals_))
@@ -256,7 +255,7 @@ class ExprCompiler:
                 for i,loc in enumerate(locals_):
                     addr = self.local_addr_block[i]
                     if self.is_cell(loc):
-                        tmp = Var()
+                        tmp = Var(data_type=c_types.PyObject_ptr)
                         self.code.call('PyCell_New',zero,store_ret=tmp)
                         self.code.mov(tmp,addr)
                     else:
@@ -270,7 +269,7 @@ class ExprCompiler:
         if s is None: s = self.code
 
         for name,loc in self.local_addrs.items():
-            tmp = Var()
+            tmp = Var(data_type=c_types.PyObject_ptr)
             s.mov(loc,tmp)
             if self.is_cell(name):
                 s.decref(tmp)
@@ -283,19 +282,19 @@ class ExprCompiler:
     def do_kw_args(self,args,func_self,func_kwds,with_dict,without_dict):
         assert args.kwonlyargs or with_dict
 
-        miss_flag = Var()
+        miss_flag = Var(data_type=c_types.t_int)
 
         def mark_miss(s):
             s.add(miss_flag,1)
 
-        hit_count = Var()
+        hit_count = Var(data_type=c_types.t_int)
 
-        r_kwds = Var()
+        r_kwds = Var(data_type=c_types.PyObject_ptr)
 
         def mark_hit(name):
             def inner(s):
                 if args.kwarg:
-                    r = Var()
+                    r = Var(data_type=c_types.t_int)
                     (s
                         .call('PyDict_DelItem',r_kwds,name,store_ret=r)
                         (self.check_err(r,True)))
@@ -313,7 +312,7 @@ class ExprCompiler:
                 .comment('with keyword dict'))
 
         if args.kwarg:
-            tmp = Var()
+            tmp = Var(data_type=c_types.PyObject_ptr)
             (self.code
                 .call('PyDict_Copy',r_kwds,store_ret=tmp)
                 (self.check_err(tmp))
@@ -323,7 +322,7 @@ class ExprCompiler:
         if with_dict: with_dict(self.code,mark_miss,mark_hit,r_kwds)
 
         if args.kwonlyargs:
-            kwdefaults = Var()
+            kwdefaults = Var(data_type=c_types.PyObject_ptr)
             (self.code
                 .mov(func_self,kwdefaults)
                 .mov(CType('Function',kwdefaults).kwdefaults,kwdefaults))
@@ -331,8 +330,8 @@ class ExprCompiler:
             for i,a in enumerate(args.kwonlyargs):
                 name = self.get_name(a.arg)
                 no_def = Target()
-                item = Var()
-                kwdef = Var()
+                item = Var(data_type=c_types.PyObject_ptr)
+                kwdef = Var(data_type=c_types.PyObject_ptr)
 
                 (self.code
                     .call('PyDict_GetItem',r_kwds,name,store_ret=item)
@@ -350,7 +349,7 @@ class ExprCompiler:
                     .endif())
 
         if not args.kwarg:
-            size = Var()
+            size = Var(data_type=c_types.t_long)
             (self.code
                 .call('PyDict_Size',r_kwds,store_ret=size)
                 .if_(signed(size) > hit_count)
@@ -361,7 +360,7 @@ class ExprCompiler:
         self.code.else_().comment('without keyword dict')
 
         if args.kwarg:
-            tmp = Var()
+            tmp = Var(data_type=c_types.PyObject_ptr)
             (self.code
                 .call('PyDict_New',store_ret=tmp)
                 (self.check_err(tmp))
@@ -370,7 +369,7 @@ class ExprCompiler:
         if without_dict: without_dict(self.code,mark_miss)
 
         if args.kwonlyargs:
-            kwdefaults = Var()
+            kwdefaults = Var(data_type=c_types.PyObject_ptr)
             (self.code
                 .mov(func_self,kwdefaults)
                 .mov(CType('Function',kwdefaults).kwdefaults,kwdefaults)
@@ -379,7 +378,7 @@ class ExprCompiler:
             no_def = Target()
 
             for i,a in enumerate(args.kwonlyargs):
-                kwdef = Var()
+                kwdef = Var(data_type=c_types.PyObject_ptr)
                 (self.code
                     .mov(SIndirect(i*SIZE_PTR,kwdefaults),kwdef)
                     .jump_if(not_(kwdef),no_def)
@@ -391,7 +390,7 @@ class ExprCompiler:
                     (mark_miss)
                 .endif())
 
-        r_arg = Var()
+        r_arg = Var(data_type=c_types.TPtr(c_types.PyObject_ptr))
         (self.code
             .endif()
             .lea(self.local_addr_block,r_arg)
@@ -407,9 +406,9 @@ class ExprCompiler:
             # a short-cut to the part where positional arguments are moved
             arg_target1 = Target()
 
-            missing_args = Var('missing_args')
-            defaults = Var('defaults')
-            r_args = Var('r_args')
+            missing_args = Var('missing_args',c_types.t_long)
+            defaults = Var('defaults',c_types.PyObject_ptr)
+            r_args = Var('r_args',c_types.PyObject_ptr)
 
             (self.code
                 .mov(func_args,r_args)
@@ -421,8 +420,8 @@ class ExprCompiler:
                     .neg(missing_args))
 
             if args.vararg:
-                va_tup = Var('va_tup')
-                tmp = Var('tmp')
+                va_tup = Var('va_tup',c_types.PyObject_ptr)
+                tmp = Var('tmp',c_types.PyObject_ptr)
 
                 dest_item = tuple_item(va_tup,0)
                 dest_item.index = missing_args
@@ -462,7 +461,7 @@ class ExprCompiler:
 
             for i in range(len(args.args)-1,-1,-1):
                 a = args.args[i]
-                tmp = Var()
+                tmp = Var(data_type=c_types.PyObject_ptr)
 
                 (self.code
                     (next(t_itr))
@@ -473,16 +472,16 @@ class ExprCompiler:
             self.code(next(t_itr))
 
             def with_dict(s,mark_miss,mark_hit,r_kwds):
-                d_index = Var()
+                d_index = Var(data_type=c_types.t_long)
                 default_item = tuple_item(defaults,0)
                 default_item.index = d_index
                 default_item.scale = self.abi.ptr_size
 
                 c_func_self = CType('Function',r_kwds)
 
-                def_len = Var()
-                item = Var()
-                item_b = Var()
+                def_len = Var(data_type=c_types.t_long)
+                item = Var(data_type=c_types.PyObject_ptr)
+                item_b = Var(data_type=c_types.PyObject_ptr)
                 s.mov(CType('PyVarObject',defaults).ob_size,def_len)
 
                 for i,a in enumerate(args.args):
@@ -516,8 +515,8 @@ class ExprCompiler:
             def without_dict(s,mark_miss):
                 # just set the defaults.
 
-                def_len = Var('def_len')
-                first_def = Var('first_def')
+                def_len = Var('def_len',c_types.t_long)
+                first_def = Var('first_def',c_types.t_long)
 
                 targets = [Target() for _ in range(len(args.args)+1)]
 
@@ -536,7 +535,7 @@ class ExprCompiler:
                     .jump_table(first_def,targets))
 
                 for i,a in enumerate(args.args):
-                    tmp = Var('tmp')
+                    tmp = Var('tmp',c_types.PyObject_ptr)
 
                     (s
                         (targets[i])
@@ -572,7 +571,7 @@ class ExprCompiler:
                     (self.check_err(tmp))
                     .mov(tmp,self.local_addrs[args.kwarg.arg]))
             else:
-                size = Var()
+                size = Var(data_type=c_types.t_long)
                 (self.code
                     .if_(func_kwds)
                         .call('PyDict_Size',func_kwds,store_ret=size)
@@ -596,22 +595,22 @@ class ExprCompiler:
 
                 if s.is_free():
                     assert self.is_cell(s)
-                    if tmp1 is None: tmp1 = Var()
+                    if tmp1 is None: tmp1 = Var(data_type=c_types.PyObject_ptr)
                     self.code.mov(self.var_free,tmp1)
                     item = SIndirect(SIZE_PTR*self.free_var_indexes[name],tmp1)
                 else:
                     item = self.local_addrs[name]
 
                 if check_dest:
-                    if tmp1 is None: tmp1 = Var()
+                    if tmp1 is None: tmp1 = Var(data_type=c_types.PyObject_ptr)
                     self.code.mov(item,tmp1)
 
                 if self.is_cell(s):
                     if check_dest:
                         tmp2 = tmp1
-                        tmp1 = Var()
+                        tmp1 = Var(data_type=c_types.PyObject_ptr)
                     else:
-                        tmp2 = Var()
+                        tmp2 = Var(data_type=c_types.PyObject_ptr)
                     item = CType('PyCellObject',tmp2).ob_ref
 
                     if check_dest: self.code.mov(item,tmp1)
@@ -622,8 +621,8 @@ class ExprCompiler:
                     assert tmp1 is not None
                     self.code.if_(tmp1).decref(tmp1).endif()
             else:
-                setitem = Var('setitem')
-                ret = Var('ret')
+                setitem = Var('setitem',c_types.TPtr(c_types.TFunc([c_types.PyObject_ptr]*3,c_types.PyObject_ptr)))
+                ret = Var('ret',c_types.t_int)
 
                 (self.code
                     .if_(not_(self.var_locals))
@@ -638,7 +637,7 @@ class ExprCompiler:
                     (self.check_err(ret,True)))
         else:
             assert not (s.is_free() or self.is_cell(s))
-            ret = Var('ret')
+            ret = Var('ret',c_types.t_int)
             (self.code
                 .call('PyDict_SetItem',self.var_globals,self.get_name(name),steal(expr),store_ret=ret)
                 (self.check_err(ret,True)))
@@ -674,7 +673,7 @@ class ExprCompiler:
             raise SyntaxTreeError('invalid expression in assignment')
 
     def delete_name_check(self,ret,name,must_exist,exc,msg):
-        ret2 = Var('ret2')
+        ret2 = Var('ret2',c_types.t_int)
         (self.code
             .if_(ret)
                 .call('PyErr_ExceptionMatches','PyExc_KeyError',store_ret=ret2))
@@ -710,7 +709,7 @@ class ExprCompiler:
                 # whether the local is assigned-to depended on a branch, and
                 # inside exception handlers).
 
-                tmp1 = Var()
+                tmp1 = Var(data_type=c_types.PyObject_ptr)
 
                 if symbol.is_free():
                     assert self.is_cell(symbol)
@@ -723,7 +722,7 @@ class ExprCompiler:
 
                 if self.is_cell(symbol):
                     tmp2 = tmp1
-                    tmp1 = Var()
+                    tmp1 = Var(data_type=c_types.PyObject_ptr)
 
                     item = CType('PyCellObject',tmp2).ob_ref
                     s.mov(item,tmp1)
@@ -744,9 +743,9 @@ class ExprCompiler:
                             .call('format_exc_check_arg',exc,msg,self.get_name(name)))
                 s.endif()
             else:
-                locals_ = Var('locals_')
-                delitem = Var('delitem')
-                ret = Var('ret')
+                locals_ = Var('locals_',c_types.PyObject_ptr)
+                delitem = Var('delitem',c_types.TPtr(c_types.TFunc([c_types.PyObject_ptr]*2,c_types.PyObject_ptr)))
+                ret = Var('ret',c_types.t_int)
 
                 (s
                     .mov(s.special_addrs['locals'],locals_)
@@ -768,7 +767,7 @@ class ExprCompiler:
         else:
             assert not (symbol.is_free() or self.is_cell(symbol))
 
-            ret = Var()
+            ret = Var(c_types.t_int)
             s.call('PyDict_DelItem',self.var_globals,self.get_name(name),store_ret=ret)
             self.delete_name_check(ret,name,must_exist,'PyExc_NameError','GLOBAL_NAME_ERROR_MSG')
 
@@ -787,7 +786,7 @@ class ExprCompiler:
             assert isinstance(arg2,PyObject)
             ttest = and_(ttest,type_of(arg2) == 'PyUnicode_Type')
 
-        tmp = Var('tmp')
+        tmp = Var('tmp',c_types.TPtr(c_types.PyObject_ptr))
         r = PyObject()
 
         (self.code
@@ -807,7 +806,7 @@ class ExprCompiler:
         return r
 
     def make_function(self,node : Union[ast.FunctionDef,ast.ClassDef],args : Optional[ast.arguments]=None,returns : Optional[ast.expr]=None):
-        body = create_uninitialized(pyinternals.FunctionBody)
+        body = self.code.cgen.new_func_body()
 
         func = compile_eval(node,self.sym_map,self.abi,self.u_funcs,self.entry_points,False,node.name,body,args)
 
@@ -824,7 +823,7 @@ class ExprCompiler:
 
         kwdefaults = None # type: Optional[ObjArrayValue]
         if args and args.kw_defaults:
-            kwdefaults = ObjArrayValue(Var('kwdefaults'))
+            kwdefaults = ObjArrayValue('kwdefaults')
 
             (self.code
                 .call('PyMem_Malloc',len(args.kwonlyargs)*self.abi.ptr_size,store_ret=kwdefaults)
@@ -842,7 +841,7 @@ class ExprCompiler:
 
         free_items = None # type: Optional[ObjArrayValue]
         if func.free_names:
-            free_items = ObjArrayValue(Var('free_items'))
+            free_items = ObjArrayValue('free_items')
 
             (self.code
                 .call('PyMem_Malloc',len(func.free_names)*self.abi.ptr_size,store_ret=free_items)
@@ -857,7 +856,7 @@ class ExprCompiler:
                 else:
                     src = self.local_addrs[n]
 
-                tmp = Var()
+                tmp = Var(data_type=c_types.PyObject_ptr)
                 (self.code
                     .mov(src,tmp)
                     .mov(tmp,SIndirect(i*SIZE_PTR,free_items.value)))
@@ -919,20 +918,20 @@ class ExprCompiler:
     def get_const(self,val,node_var=None):
         c = self.consts.get(val)
         if c is None:
-            self.consts[val] = c = address_of(val)
+            self.consts[val] = c = (address_of(val),len(self.consts))
 
+        r = PyConst('consts',c[1],c[0])
         if node_var:
-            self.code.mov(c,node_var)
+            self.code.mov(r,node_var)
             return node_var
 
-        return ConstValue(c)
+        return ConstValue(r)
 
     def get_name(self,n):
         c = self.names.get(n)
         if c is None:
-            c = address_of(n)
-            self.names[n] = c
-        return ConstValue(c)
+            self.names[n] = c = (address_of(n),len(self.names))
+        return ConstValue(PyConst('names',c[1],c[0]))
 
     def top_context(self,c_type):
         for c in reversed(self.target_contexts):
@@ -1023,7 +1022,7 @@ class ExprCompiler:
 
     def test_condition(self,node):
         test = self.visit(node)
-        istrue = signed(Var('istrue'))
+        istrue = signed(Var('istrue',data_type=c_types.t_int))
 
         (self.code
             .call('PyObject_IsTrue',test,store_ret=istrue)
@@ -1118,7 +1117,7 @@ class ExprCompiler:
         fobj.discard(self.code)
 
     def visit_ClassDef(self,node):
-        #build_class = PyObject(Var('build_class'))
+        #build_class = PyObject('build_class')
         #frame = CType('PyFrameObject',self.var_frame)
 
         #(self.code
@@ -1165,7 +1164,7 @@ class ExprCompiler:
             if isinstance(target,ast.Name):
                 self.delete_name(target.id)
             elif isinstance(target,ast.Attribute):
-                tmp = Var('tmp')
+                tmp = Var('tmp',data_type=c_types.t_int)
                 obj = self.visit(target.value)
 
                 (self.code
@@ -1174,7 +1173,7 @@ class ExprCompiler:
 
                 obj.discard(self.code)
             elif isinstance(target,ast.Subscript):
-                tmp = Var('tmp')
+                tmp = Var('tmp',data_type=c_types.t_int)
                 obj = self.visit(target.value)
                 slice_ = self._visit_slice(target.slice)
 
@@ -1258,8 +1257,8 @@ class ExprCompiler:
     def visit_For(self,node):
         context = self.new_context(LoopContext)
         exhaust = Target()
-        i_type = CType('PyTypeObject',Var('i_type'))
-        itr = PyObject(Var('itr'))
+        i_type = CType('PyTypeObject',Var('i_type',data_type=c_types.PyTypeObject_ptr))
+        itr = PyObject('itr')
 
         itr_val = self.visit(node.iter)
 
@@ -1269,9 +1268,9 @@ class ExprCompiler:
             (self.check_err(itr))
             .own(itr))
 
-        next_val = PyObject(Var('next_val'))
-        occurred = Var('occurred')
-        matches = Var('matches')
+        next_val = PyObject('next_val')
+        occurred = Var('occurred',data_type=c_types.PyObject_ptr)
+        matches = Var('matches',data_type=c_types.t_int)
 
         (self.code
             (context.begin)
@@ -1356,9 +1355,9 @@ class ExprCompiler:
         items_head,*items_tail = node.items
 
         val = self.visit(items_head.context_expr)
-        exit_ = PyObject(Var('exit'))
-        enter = PyObject(Var('enter'))
-        as_obj = PyObject(Var('as_obj'))
+        exit_ = PyObject('exit')
+        enter = PyObject('enter')
+        as_obj = PyObject('as_obj')
 
         (self.code
             .call('special_lookup',val,self.get_name('__exit__'),store_ret=exit_)
@@ -1393,11 +1392,12 @@ class ExprCompiler:
         # the "finally" body is implemented as a local function that uses the
         # same stack
         ret_addr = Var()
-        exit_r = PyObject(Var('exit_r'))
+        exit_r = PyObject('exit_r')
         self.code.get_return_address(ret_addr)
 
-        exc_vals = [PyObject(nullable=True),PyObject(nullable=True),PyObject(nullable=True)]
-        exc_addrs = [Var(),Var(),Var()]
+        exc_vals = [PyObject(nullable=True) for _ in range(3)]
+        addr_type = c_types.TPtr(c_types.PyObject_ptr)
+        exc_addrs = [Var(data_type=addr_type) for _ in range(3)]
 
         for val,addr in zip(exc_vals,exc_addrs):
             self.code.lea(val,addr)
@@ -1419,7 +1419,7 @@ class ExprCompiler:
                 .mov(val,tuple_item(args_tup,i))
                 .incref(val))
 
-        tmp = Var()
+        tmp = Var(data_type=c_types.PyObject_ptr)
         (self.code
             .else_()
                 .mov('Py_None',tmp))
@@ -1471,11 +1471,11 @@ class ExprCompiler:
             self.unwind_to(t_context.target,t_context)
 
         if node.handlers:
-            exc_val_block = Block(6)
-            exc_vals = [PyObject(v) for v in exc_val_block]
-            exc_tb,exc_val,exc_type = exc_vals[0:3]
+            exc_val_block = Block(6,base_type=c_types.PyObject_ptr)
+            exc_vals = [PyObject(v,nullable=i>1) for i,v in enumerate(exc_val_block)]
+            exc_type,exc_val,exc_tb = exc_vals[0:3]
 
-            tmp = Var()
+            tmp = Var(data_type=c_types.TPtr(c_types.PyObject_ptr))
             (self.code
                 (e_context.target)
                 .lea(exc_val_block,tmp)
@@ -1490,7 +1490,7 @@ class ExprCompiler:
 
                 if exc.type:
                     e_type = self.visit(exc.type)
-                    is_sub = Var()
+                    is_sub = Var(data_type=c_types.t_int)
                     self.code.call('PyObject_IsSubclass',exc_type,e_type,store_ret=is_sub)
                     e_type.discard(self.code)
                     self.code.if_(is_sub)
@@ -1526,12 +1526,12 @@ class ExprCompiler:
 
             do_handler(node.handlers[:])
 
-            tmp = Var()
+            tmp = Var(data_type=c_types.TPtr(c_types.PyObject_ptr))
             (self.code
                 .lea(exc_vals[3],tmp)
                 .call('end_exc_handler',tmp))
 
-            for val in exc_vals[3:]: val.discard(self.code)
+            for val in exc_vals[3:]: self.code.disown(val)
 
             self.unwind_to(t_context.target,t_context)
 
@@ -1545,7 +1545,8 @@ class ExprCompiler:
             self.code.get_return_address(ret_addr)
 
             exc_vals = [PyObject(),PyObject(),PyObject()]
-            exc_addrs = [Var(),Var(),Var()]
+            addr_type = c_types.TPtr(c_types.PyObject_ptr)
+            exc_addrs = [Var(data_type=addr_type) for _ in range(3)]
 
             for val,addr in zip(exc_vals,exc_addrs):
                 self.code.lea(val,addr)
@@ -1603,7 +1604,7 @@ class ExprCompiler:
     def  _boolop_iteration(self,op,values,r):
         if len(values) > 1:
             val = self.visit(values[0])
-            istrue = Var()
+            istrue = Var(data_type=c_types.t_int)
 
             (self.code
                 .call('PyObject_IsTrue',val,store_ret=istrue)
@@ -1642,7 +1643,7 @@ class ExprCompiler:
         r = PyObject(node_var)
 
         if op is ast.Add and maybe_unicode(node.left) and maybe_unicode(node.right):
-            str_type = pyinternals.raw_addresses['PyUnicode_Type']
+            str_type = Symbol('PyUnicode_Type')
 
             if isinstance(node.left,ast.Str):
                 ttest = type_of(arg2) == str_type
@@ -1651,7 +1652,7 @@ class ExprCompiler:
                 if not isinstance(node.right,ast.Str):
                     ttest = and_(ttest,type_of(arg2) == str_type)
 
-            f = Var()
+            f = Var(data_type=c_types.TPtr(c_types.TFunc([c_types.PyObject_ptr,c_types.PyObject_ptr],c_types.PyObject_ptr)))
             (self.code
                 .mov('PyNumber_Add',f)
                 .if_(ttest)
@@ -1660,9 +1661,9 @@ class ExprCompiler:
                 .call(f,arg1,arg2,store_ret=r)
                 (self.check_err(r)))
         elif op is ast.Mod:
-            func = Var()
+            func = Var(data_type=c_types.TPtr(c_types.TFunc([c_types.PyObject_ptr,c_types.PyObject_ptr],c_types.PyObject_ptr)))
 
-            uaddr = pyinternals.raw_addresses['PyUnicode_Type']
+            uaddr = Symbol('PyUnicode_Type')
 
             (self.code
                 .mov('PyUnicode_Format',func)
@@ -1693,7 +1694,7 @@ class ExprCompiler:
 
         op = type(node.op)
         if op is ast.Not:
-            istrue = signed(Var())
+            istrue = signed(Var(data_type=c_types.t_int))
             (self.code
                 .call('PyObject_IsTrue',arg,store_ret=istrue)
                 .mov('Py_True',r)
@@ -1755,7 +1756,7 @@ class ExprCompiler:
         for k,v in zip(node.keys,node.values):
             kobj = self.visit(k)
             vobj = self.visit(v)
-            err = Var()
+            err = Var(data_type=c_types.t_int)
 
             (self.code
                 .call('PyDict_SetItem',r,kobj,vobj,store_ret=err)
@@ -1803,7 +1804,7 @@ class ExprCompiler:
         assert len(ops) == len(comparators)
 
         b = self.visit(comparators[0])
-        istrue = signed(Var('istrue'))
+        istrue = signed(Var('istrue',data_type=c_types.t_int))
 
         op_t = ops[0].__class__
         if op_t in (ast.In,ast.NotIn):
@@ -1867,7 +1868,7 @@ class ExprCompiler:
 
         args_obj = 0
         if node.args:
-            args_obj = PyObject(Var('args_obj'))
+            args_obj = PyObject('args_obj')
 
             (self.code
                 .call('PyTuple_New',len(node.args),store_ret=args_obj)
@@ -1897,7 +1898,7 @@ class ExprCompiler:
 
         args_kwds = 0
         if node.keywords:
-            args_kwds = PyObject(Var('args_kwds'))
+            args_kwds = PyObject('args_kwds')
             (self.code
                 .call('_PyDict_NewPresized',len(node.keywords),store_ret=args_kwds)
                 (self.check_err(args_kwds))
@@ -1905,7 +1906,7 @@ class ExprCompiler:
 
             for kwds in node.keywords:
                 obj = self.visit(kwds.value)
-                err = Var()
+                err = Var(data_type=c_types.t_int)
 
                 (self.code
                     .call('PyDict_SetItem',args_kwds,self.get_name(kwds.arg),obj,store_ret=err)
@@ -1956,7 +1957,7 @@ class ExprCompiler:
         return self.get_const(node.s,node_var)
 
     def visit_NameConstant(self,node,node_var=None):
-        c = ConstValue(address_of(node.value))
+        c = ConstValue(Immediate(address_of(node.value),c_types.PyObject_ptr))
         if node_var:
             self.code.mov(c,node_var)
             return node_var
@@ -2003,7 +2004,7 @@ class ExprCompiler:
         dbg_name = 'py:'+node.id
 
         if ovr is not None or s.is_free() or (self.is_local(s) and self.stable.is_optimized()) or self.is_cell(s):
-            r = PyObject(Var(dbg_name)) if node_var is None else node_var
+            r = PyObject(dbg_name) if node_var is None else node_var
 
             if ovr is not None:
                 self.code.mov(ovr,r)
@@ -2030,14 +2031,14 @@ class ExprCompiler:
 
             return r
 
-        r = PyObject(Var(dbg_name)) if node_var is None else node_var
+        r = PyObject(dbg_name) if node_var is None else node_var
 
         (self.code
-            .append(LockRegs([0,1]))
-            .mov(self.get_name(node.id),FixedRegister(0))
-            .mov(self.var_frame,FixedRegister(1))
-            .call(self.u_funcs['local_name' if self.is_local(s) else 'global_name'].addr,store_ret=r)
-            .append(UnlockRegs([0,1]))
+            .call(self.u_funcs['local_name' if self.is_local(s) else 'global_name'].addr,
+                self.get_name(node.id),
+                self.var_frame,
+                store_ret=r,
+                callconv=CallConvType.utility)
             (self.check_err(r))
             .own(r))
         return r
@@ -2046,7 +2047,7 @@ class ExprCompiler:
         item_offset = pyinternals.member_offsets['PyListObject']['ob_item']
 
         r = PyObject() if node_var is None else node_var
-        tmp = Var()
+        tmp = Var(data_type=c_types.TPtr(c_types.PyObject_ptr))
         (self.code
             .call('PyList_New',len(node.elts),store_ret=r)
             (self.check_err(r))
@@ -2072,37 +2073,20 @@ class ExprCompiler:
 
         return r
 
-def simple_frame(func_name):
-    def decorator(func_name,f):
-        def inner(abi):
-            s = Stitch(abi.code_gen(abi))
-            f(s)
-            r = resolve_jumps(s.cgen,abi.gen_regs,destitch(s),assembly=abi.assembly)
-            r.name = func_name
-            return r
-
-        return inner
-
-    return partial(decorator,func_name) if isinstance(func_name,str) else decorator(None,func_name)
-
-@simple_frame('local_name')
-def local_name_func(s : Stitch):
-    # FixedRegister(0) is expected to have the address of the name to load
-    # FixedRegister(1) is expected to have the address of the frame object
-
+def local_name_func(abi : Abi):
     ret = Target()
     inc_ret = Target()
     format_exc = Target()
 
-    name = Var()
-    frame = CType('PyFrameObject')
-    locals_ = Var()
-    builtins = Var()
-    r = Var()
+    name = Var(data_type=c_types.PyObject_ptr)
+    frame = CType('PyFrameObject',Var(data_type=c_types.PyFrameObject_ptr))
+    locals_ = Var(data_type=c_types.PyObject_ptr)
+    builtins = Var(data_type=c_types.PyObject_ptr)
+    r = Var(data_type=c_types.PyObject_ptr)
 
-    return (s
-        .create_var(name,FixedRegister(0))
-        .create_var(frame,FixedRegister(1))
+    s = Stitch(abi.code_gen(abi,[name,frame.base],CallConvType.utility))
+
+    (s
         .mov(frame.f_locals,locals_)
         .if_(not_(locals_))
             .call('PyErr_Format','PyExc_SystemError','NO_LOCALS_LOAD_MSG',name,store_ret=r)
@@ -2148,59 +2132,56 @@ def local_name_func(s : Stitch):
         .incref(r)
         (ret))
 
-@simple_frame('global_name')
-def global_name_func(s : Stitch):
-    # FixedRegister(0) is expected to have the address of the name to load
-    # FixedRegister(1) is expected to have the address of the frame object
+    return s.cgen.compile('local_name',destitch(s),r)
 
+def global_name_func(abi : Abi):
     ret = Target()
     name_err = Target()
 
-    name = Var('name')
-    frame = CType('PyFrameObject')
+    name = Var('name',data_type=c_types.PyObject_ptr)
+    frame = CType('PyFrameObject',Var(data_type=c_types.PyFrameObject_ptr))
     globals_ = Var('globals')
     builtins = Var('builtins_')
-    tmp = Var('tmp')
 
-    return (s
-        .create_var(name,FixedRegister(0))
-        .create_var(frame,FixedRegister(1))
+    s = Stitch(abi.code_gen(abi,[name,frame.base],CallConvType.utility))
+    r = Var('r',data_type=c_types.PyObject_ptr)
+
+    (s
         .mov(frame.f_globals,globals_)
         .mov(frame.f_builtins,builtins)
         .if_(and_('PyDict_Type' == type_of(globals_),'PyDict_Type' == type_of(builtins)))
-            .call('_PyDict_LoadGlobal',globals_,builtins,name,store_ret=tmp)
-            .if_(not_(tmp))
-                .call('PyErr_Occurred',store_ret=tmp)
-                .jump_if(not_(tmp),name_err)
-                .return_value(0)
+            .call('_PyDict_LoadGlobal',globals_,builtins,name,store_ret=r)
+            .if_(not_(r))
+                .call('PyErr_Occurred',store_ret=r)
+                .jump_if(not_(r),name_err)
+                .mov(0,r)
                 .jmp(ret)
             .endif()
-            .incref(tmp)
+            .incref(r)
         .else_()
-            .call('PyObject_GetItem',globals_,name,store_ret=tmp)
-            .if_(not_(tmp))
-                .call('PyObject_GetItem',builtins,name,store_ret=tmp)
-                .if_(not_(tmp))
-                    .call('PyErr_ExceptionMatches','PyExc_KeyError',store_ret=tmp)
-                    .if_(not_(tmp))
+            .call('PyObject_GetItem',globals_,name,store_ret=r)
+            .if_(not_(r))
+                .call('PyObject_GetItem',builtins,name,store_ret=r)
+                .if_(not_(r))
+                    .call('PyErr_ExceptionMatches','PyExc_KeyError',store_ret=r)
+                    .if_(not_(r))
                         (name_err)
                         .call('format_exc_check_arg',
                             'PyExc_NameError',
                             'GLOBAL_NAME_ERROR_MSG',
                             name)
                     .endif()
-                    .return_value(0)
+                    .mov(0,r)
                     .jmp(ret)
                 .endif()
             .endif()
         .endif()
-        .return_value(tmp)
         (ret))
 
-def resume_generator_func(abi):
-    # the parameter is expected to be an address to a Generator instance
+    return s.cgen.compile('global_name',destitch(s),r)
 
-    s = Stitch(abi.code_gen(abi))
+def resume_generator_func(abi : Abi):
+    # the parameter is expected to be an address to a Generator instance
 
     generator = CType('Generator')
     body = CType('FunctionBody')
@@ -2208,16 +2189,16 @@ def resume_generator_func(abi):
     entry = Var('entry')
     stack_b_size = Var('stack_b_size')
     i = Var('i')
+
+    s = Stitch(abi.code_gen(abi,[generator.base]))
+
     (s
-        .create_var(generator,s.cgen.get_func_arg(0,True))
         .mov(generator.stack_size,i)
         .mov(generator.body,body)
         .mov(generator.stack,stack)
         .mul(i,8,stack_b_size)
-        .mov(body.code,entry)
+        .mov(body.entry,entry)
         #.sub(R_SP,stack_b_size)
-        .mov(CType('CompiledCode',entry).data,entry)
-        .add(entry,body.offset)
         .add(entry,generator.offset)
         .do()
             .sub(i,1)
@@ -2225,18 +2206,17 @@ def resume_generator_func(abi):
         .while_(signed(i) != 0)
         .jmp(entry))
 
-    r = resolve_jumps(s.cgen,abi.gen_regs,destitch(s),assembly=abi.assembly)
-    r.name = 'resume_generator'
-    return r
+    return s.cgen.compile('resume_generator',destitch(s))
 
 
 ProtoFunction = namedtuple('ProtoFunction',['name','code'])
 
 class PyFunction:
-    def __init__(self,fb_obj,func,cgen,names,args,free_names,cells,consts):
-        self.fb_obj = fb_obj or create_uninitialized(pyinternals.FunctionBody)
+    def __init__(self,fb_obj,func,cgen,ret_var,names,args,free_names,cells,consts):
+        self.fb_obj = cgen.new_func_body() if fb_obj is None else fb_obj
         self.func = func
         self.cgen = cgen
+        self.ret_var = ret_var
 
         self.names = names
         self.args = args
@@ -2280,13 +2260,24 @@ class UtilityFunction:
 
     @property
     def addr(self):
-        return self.code.start_addr + self.offset
+        return Symbol(self.name,address=self.code.start_addr + self.offset)
 
+
+def ordered_consts(consts):
+    empty = object()
+
+    r = [empty] * len(consts)
+    for n,c in consts.items():
+        assert r[c[1]] is empty
+        r[c[1]] = n
+
+    assert empty not in r
+    return tuple(r)
 
 def compile_eval(
         scope_ast : Union[ast.Module,ast.FunctionDef,ast.ClassDef],
         sym_map : Dict[int,symtable.SymbolTable],
-        abi_ : abi.Abi,
+        abi_ : Abi,
         u_funcs : Dict[str,UtilityFunction],
         entry_points : List,
         global_scope : bool,
@@ -2298,50 +2289,16 @@ def compile_eval(
     #move_throw_flag = (code.co_flags & CO_GENERATOR and len(abi.r_arg) >= 2)
     #mov_throw_flag = False
 
-    cgen = abi_.code_gen(abi_)
+    f_obj = CType('PyFrameObject',Var('var_frame',c_types.PyFrameObject_ptr,dbg_symbol='__frame'))
+    func_self = CType('Function',Var('fun_self',c_types.Function_ptr,dbg_symbol='__func'))
+    func_args = Var('func_args',c_types.PyObject_ptr,dbg_symbol='__args')
+    func_kwds = Var('func_kwds',c_types.PyObject_ptr,dbg_symbol='__kwds')
+
+    param_vars = [f_obj.base,func_self.base,func_args,func_kwds]
+    cgen = abi_.code_gen(abi_,param_vars,pyinfo=PyFuncInfo(*param_vars))
 
     # noinspection PyUnresolvedReferences
-    ec = ExprCompiler(cgen,sym_map[scope_ast._raw_id],sym_map,u_funcs,global_scope,entry_points)
-
-    #state.throw_flag_store = ec.func_arg(1)
-
-    #if move_throw_flag:
-        # we use temp_store to use the throw flag and temporarily use another
-        # address (the address where the first Python stack value will go) as
-        # our temporary store
-        #state.throw_flag_store = state.temp_store
-        #state.temp_store = state.pstack_addr(-stack_first-1)
-
-    #fast_end = Target()
-
-    f_obj = CType('PyFrameObject',ec.var_frame)
-    #tstate = CType('PyThreadState',Var('tstate'))
-    func_self = CType('Function',Var('fun_self'))
-    func_args = None
-    func_kwds = None
-
-    #if move_throw_flag:
-    #    ec.code.mov(dword(ec.func_arg(1)),STATE.throw_flag_store)
-
-    if args:
-        func_args = Var('func_args')
-        func_kwds = Var('func_kwds')
-        ec.code.create_var(func_args,ec.code.cgen.get_func_arg(2,True))
-        ec.code.create_var(func_kwds,ec.code.cgen.get_func_arg(3,True))
-
-    ec.code.create_var(f_obj,ec.code.cgen.get_func_arg(0,True))
-    ec.code.create_var(func_self,ec.code.cgen.get_func_arg(1,True))
-
-    # tmp = Var('tmp')
-    # (ec.code
-    #     .call('_EnterRecursiveCall',store_ret=tmp)
-    #     .if_(tmp)
-    #         .mov(0,ec.var_return)
-    #         .jmp(fast_end)
-    #     .endif()
-    #
-    #     .get_threadstate(tstate)
-    #     .mov(f_obj,tstate.frame))
+    ec = ExprCompiler(cgen,f_obj.base,sym_map[scope_ast._raw_id],sym_map,u_funcs,global_scope,entry_points)
 
     #if ec.stable.get_globals():
     if True:
@@ -2424,22 +2381,23 @@ def compile_eval(
 
         (ec.func_end)
         .comment('epilogue')
-        (ec.deallocate_locals)
-        #(fast_end)
-        #.call('_LeaveRecursiveCall')
-        #.get_threadstate(tstate)
-        #.mov(f_obj.f_back,tstate.frame)
-        .return_value(ec.var_return))
+        (ec.deallocate_locals))
+
+    names = [None] * len(ec.names)
+    for n,c in ec.names.items():
+        assert names[c[1]] is None
+        names[c[1]] = n
 
     r = PyFunction(
         fb_obj,
         ProtoFunction(name,DelayedCompile.process(cgen,ec.code.code)),
         cgen,
-        tuple(ec.names.keys()),
+        ec.var_return,
+        ordered_consts(ec.names),
         args,
         tuple(ec.free_var_indexes.keys()),
         0,
-        tuple(ec.consts.keys()))
+        ordered_consts(ec.consts))
 
     entry_points.append(r)
     return r
@@ -2459,10 +2417,8 @@ def compile_utility_funcs_raw(abi):
     return CompilationUnit(functions)
 
 
-def compile_raw(code,abi,u_funcs):
-    assert len(abi.r_scratch) >= 2 and len(abi.r_pres) >= 2
-
-    entry_points = []
+def compile_raw(code,abi,u_funcs) -> Tuple[CompilationUnit,List[PyFunction]]:
+    entry_points = [] # type: List[PyFunction]
     mod_ast,sym_map = ast_and_symtable_map(code,'<string>','exec')
     compile_eval(mod_ast,sym_map,abi,u_funcs,entry_points,True)
 
@@ -2470,10 +2426,7 @@ def compile_raw(code,abi,u_funcs):
 
     for pyfunc in entry_points:
         name,fcode = pyfunc.func
-        pyfunc.func = resolve_jumps(pyfunc.cgen,abi.gen_regs,fcode,assembly=abi.assembly)
-        pyfunc.func.name = name
-        pyfunc.func.pyfunc = True
-        pyfunc.func.returns = debug.TPtr(debug.t_void)
+        pyfunc.func = pyfunc.cgen.compile(name,fcode,pyfunc.ret_var)
         functions.insert(0,pyfunc.func)
 
     offset = 0

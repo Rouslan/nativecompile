@@ -30,31 +30,38 @@ executed conditionally.
 """
 
 __all__ = ['SIZE_B','SIZE_W','SIZE_D','SIZE_Q','StackSection','LocationType',
-    'Target','Value','MutableValue','Var','Block','VarPart','IndirectVar',
-    'Immediate','FixedRegister','ArgStackItem','ensure_same_size','Instr',
-    'AddressType','ParamDir','Overload','RegAllocatorOverloads',
-    'OpDescription','CommentDesc','comment_desc','inline_comment_desc',
-    'InvalidateRegs','CreateVar','IRJump','IndirectMod','LockRegs',
-    'UnlockRegs','IRAnnotation','annotate','IRSymbolLocDescr','Instr2',
-    'CmpType','Cmp','BinCmp','AndCmp','OrCmp','OpType','commutative_ops',
-    'UnaryOpType','ShiftDir','IROp','IRCode','IROp2','IRCode2','ExtraState',
-    'OpGen','IROpGen','JumpCondOpGen','IRCompiler','reg_allocate']
+    'PtrBinomial','SIZE_PTR','Target','Value','MutableValue','Var','Block',
+    'VarPart','IndirectVar','Immediate','FixedRegister','ArgStackItem',
+    'Symbol','PyConst','ensure_same_size','Instr','AddressType','ParamDir',
+    'Overload','RegAllocatorOverloads','OpDescription','CommentDesc',
+    'comment_desc','inline_comment_desc','InvalidateRegs','CreateVar','IRJump',
+    'IndirectMod','LockRegs','UnlockRegs','IRAnnotation','annotate',
+    'IRSymbolLocDescr','Instr2','CmpType','Cmp','BinCmp','AndCmp','OrCmp',
+    'OpType','commutative_ops','UnaryOpType','ShiftDir','IROp','IRCode',
+    'IROp2','IRCode2','ExtraState','CallConvType','PyFuncInfo','OpGen',
+    'IROpGen','JumpCondOpGen','IRCompiler','reg_allocate','Param','Function',
+    'CompilationUnit','address_of','Tuning','CallingConvention','AbiRegister',
+    'Abi','BinaryAbi']
 
 import enum
 import collections
 import weakref
 import binascii
+import operator
+from functools import reduce
 from typing import (Any,Callable,cast,Container,DefaultDict,Dict,Generic,
     Iterable,List,Optional,NamedTuple,NewType,Sequence,Sized,Set,Tuple,
-    TypeVar,Union)
+    TYPE_CHECKING,Type,TypeVar,Union)
 
 if __debug__:
     import sys
 
-from . import abi
 from . import debug
+from . import c_types
+from . import pyinternals
 from .sorted_list import SortedList
 from .dinterval import *
+from .compilation_unit import *
 
 
 SIZE_DEFAULT = 0
@@ -66,6 +73,16 @@ SIZE_Q = 8
 
 T = TypeVar('T')
 U = TypeVar('U')
+
+
+CALL_ALIGN_MASK = 0xf
+
+
+def aligned_for_call(x):
+    return (x + CALL_ALIGN_MASK) & ~CALL_ALIGN_MASK
+
+address_of = id
+
 
 class StackSection(enum.Enum):
     local = 0 # local stack space
@@ -167,8 +184,11 @@ class AddressType:
         return AddressType
 
 class _ImmediateMetaType(type):
-    def __new__(mcs,name,bases,namespace,*,allowed_range=None):
+    def __new__(mcs,name,bases,namespace,*,abi=None,allowed_range=None):
+        assert (abi is None) == (allowed_range is None)
+
         cls = super().__new__(mcs,name,bases,namespace)
+        cls.abi = abi
         cls.allowed = allowed_range
         return cls
 
@@ -176,12 +196,12 @@ class _ImmediateMetaType(type):
     def __init__(cls,name,bases,namespace,**kwds):
         super().__init__(name,bases,namespace)
 
-    def __getitem__(cls,allowed_range):
-        return _ImmediateMetaType('DependentImmediate',(Immediate,),{},allowed_range=allowed_range)
+    def __getitem__(cls,args):
+        return _ImmediateMetaType('DependentImmediate',(Immediate,),{},abi=args[0],allowed_range=args[1:])
 
     def __instancecheck__(cls,inst):
-        return issubclass(inst.__class__,Immediate) and (cls.allowed is None
-            or cls.allowed[0] <= inst.val <= cls.allowed[1])
+        return issubclass(inst.__class__,Immediate) and (cls.abi is None
+            or cls.allowed[0] <= inst.val.realize(cls.abi) <= cls.allowed[1])
 
     @staticmethod
     def generic_type():
@@ -197,6 +217,86 @@ def generic_type(x : object) -> type:
     return x
 
 
+class PtrBinomial:
+    """A numeric value dependent on the size of a pointer.
+
+    This is a binomial equal to "ptr_factor * ptr_size + val" where ptr_size is
+    the size of a pointer on the host machine.
+
+    """
+    __slots__ = 'val','ptr_factor'
+
+    @staticmethod
+    def __new__(cls,val: Union['PtrBinomial',int],ptr_factor: int = 0) -> 'PtrBinomial':
+        if isinstance(val,PtrBinomial):
+            if ptr_factor != 0:
+                raise TypeError(
+                    'ptr_factor cannot be non-zero if val is already an instance of PtrBinomial')
+            return val
+
+        r = super().__new__(cls)
+        r.val = val
+        r.ptr_factor = ptr_factor
+        return r
+
+    if TYPE_CHECKING:
+        # noinspection PyUnusedLocal
+        def __init__(self,val: Union['PtrBinomial',int],ptr_factor: int = 0) -> None:
+            self.val = 0
+            self.ptr_factor = ptr_factor
+
+    def realize(self,abi) -> int:
+        return self.ptr_factor * abi.ptr_size + self.val
+
+    def __add__(self,b):
+        if isinstance(b,PtrBinomial):
+            return PtrBinomial(self.val + b.val,self.ptr_factor + b.ptr_factor)
+
+        if isinstance(b,int):
+            return PtrBinomial(self.val + b,self.ptr_factor)
+
+        return NotImplemented
+
+    __radd__ = __add__
+
+    def __neg__(self):
+        return PtrBinomial(-self.val,-self.ptr_factor)
+
+    def __sub__(self,b):
+        if isinstance(b,PtrBinomial):
+            return PtrBinomial(self.val - b.val,self.ptr_factor - b.ptr_factor)
+
+        if isinstance(b,int):
+            return PtrBinomial(self.val - b,self.ptr_factor)
+
+        return NotImplemented
+
+    def __rsub__(self,b):
+        if isinstance(b,int):
+            return PtrBinomial(b - self.val,-self.ptr_factor)
+
+        return NotImplemented
+
+    def __mul__(self,b):
+        if isinstance(b,int):
+            return PtrBinomial(self.val * b,self.ptr_factor * b)
+
+        return NotImplemented
+
+    __rmul__ = __mul__
+
+    def __floordiv__(self,b):
+        if isinstance(b,int):
+            return PtrBinomial(self.val // b,self.ptr_factor // b)
+
+    def __repr__(self):
+        return 'PtrBinomial({},{})'.format(self.val,self.ptr_factor)
+
+    def __str__(self):
+        return str(self.val) if self.ptr_factor==0 else self.__repr__()
+
+SIZE_PTR = PtrBinomial(0,1)
+
 class Target:
     if not __debug__:
         __slots__ = 'displacement',
@@ -210,9 +310,12 @@ class Target:
         return '<Target {:#x}>'.format(id(self))
 
 class Value:
-    __slots__ = 'size',
-    def __init__(self,size : int=SIZE_DEFAULT) -> None:
-        self.size = size
+    __slots__ = 'data_type',
+    def __init__(self,data_type : c_types.CType=c_types.t_void_ptr) -> None:
+        self.data_type = data_type
+
+    def size(self,abi):
+        return self.data_type.size(abi)
 
 class MutableValue(Value):
     __slots__ = ()
@@ -238,8 +341,8 @@ class Var(MutableValue):
     if not __debug__:
         __slots__ = 'lifetime','dbg_symbol'
 
-    def __init__(self,name : Optional[str]=None,size : int = SIZE_DEFAULT,lifetime : Optional[Lifetime]=None,dbg_symbol : Optional[str]=None) -> None:
-        super().__init__(size)
+    def __init__(self,name : Optional[str]=None,data_type : c_types.CType=c_types.t_void_ptr,lifetime : Optional[Lifetime]=None,dbg_symbol : Optional[str]=None) -> None:
+        super().__init__(data_type)
         if __debug__:
             self.name = name
             self.origin = _get_origin()
@@ -258,10 +361,10 @@ class Block(MutableValue):
 
     dbg_symbol = None
 
-    def __init__(self,parts : int,*,lifetime : Optional[VarLifetime]=None) -> None:
+    def __init__(self,parts : int,base_type : c_types.CType=c_types.t_void_ptr,*,lifetime : Optional[VarLifetime]=None) -> None:
         assert parts > 0
-        super().__init__(0)
-        self.parts = [VarPart(self,i) for i in range(parts)]
+        super().__init__(c_types.TArray(base_type,parts))
+        self.parts = [VarPart(self,i,base_type) for i in range(parts)]
         self.lifetime = lifetime
 
     def __getitem__(self,i):
@@ -273,8 +376,8 @@ class Block(MutableValue):
 class VarPart(Var):
     __slots__ = 'block','offset'
 
-    def __init__(self,block : Block,offset : int,size : int=SIZE_DEFAULT,*,lifetime : Optional[AliasLifetime]=None) -> None:
-        super().__init__(None,size,lifetime)
+    def __init__(self,block : Block,offset : int,data_type : c_types.CType=c_types.t_void_ptr,*,lifetime : Optional[AliasLifetime]=None) -> None:
+        super().__init__(None,data_type,lifetime)
         #self._block = weakref.ref(block)
         self.block = block
         self.offset = offset
@@ -286,34 +389,37 @@ class VarPart(Var):
     #    return r
 
 class Immediate(Value,metaclass=_ImmediateMetaType):
-    __slots__ = 'val','size'
+    __slots__ = 'val',
 
-    def __init__(self,val : int,size : int=SIZE_DEFAULT) -> None:
-        super().__init__(size)
-        self.val = val
+    def __init__(self,val : Union[int,PtrBinomial],data_type : c_types.CType=c_types.t_void_ptr) -> None:
+        super().__init__(data_type)
+        self.val = PtrBinomial(val)
 
     def __eq__(self,b):
         if isinstance(b,Immediate):
-            return self.val == b.val and self.size == b.size
-        if isinstance(b,int):
-            return self.size == SIZE_DEFAULT and self.val == b
+            return self.val == b.val
+        if isinstance(b,(int,PtrBinomial)):
+            return self.val == b
         return False
 
     def __ne__(self,b):
         return not self.__eq__(b)
 
     def __repr__(self):
-        return 'Immediate({},{})'.format(self.val,self.size)
+        type_str = ''
+        if self.data_type != c_types.t_void_ptr:
+            type_str = ',' + repr(self.data_type)
+        return 'Immediate({}{})'.format(self.val,type_str)
 
 class IndirectVar(MutableValue,AddressType):
     __slots__ = 'offset','base','index','scale'
 
-    def __init__(self,offset : int=0,base : Optional[Var]=None,index : Optional[Var]=None,scale : int=1,size : int=SIZE_DEFAULT) -> None:
-        super().__init__(size)
-        self.offset = offset
+    def __init__(self,offset : Union[int,PtrBinomial]=0,base : Optional[Var]=None,index : Optional[Var]=None,scale : Union[int,PtrBinomial]=1,data_type : c_types.CType=c_types.t_void_ptr) -> None:
+        super().__init__(data_type)
+        self.offset = PtrBinomial(offset)
         self.base = base
         self.index = index
-        self.scale = scale
+        self.scale = PtrBinomial(scale)
 
     def __eq__(self,b):
         if isinstance(b,IndirectVar):
@@ -321,51 +427,57 @@ class IndirectVar(MutableValue,AddressType):
                 and self.base == b.base
                 and self.index == b.index
                 and self.scale == b.scale
-                and self.size == b.size)
+                and self.data_type == b.data_type)
         return False
 
     def __ne__(self,b):
         return not self.__eq__(b)
 
     def __repr__(self):
-        return 'IndirectVar({},{!r},{!r},{},{})'.format(self.offset,self.base,self.index,self.scale,self.size)
+        type_str = ''
+        if self.data_type != c_types.t_void_ptr:
+            type_str = ',' + repr(self.data_type)
+        return 'IndirectVar({},{!r},{!r},{}{})'.format(self.offset,self.base,self.index,self.scale,type_str)
 
 class FixedRegister(MutableValue,metaclass=_RegisterMetaType):
     __slots__ = 'reg_index',
 
-    def __init__(self,reg_index : int,size : int=SIZE_DEFAULT) -> None:
-        super().__init__(size)
+    def __init__(self,reg_index : int,data_type : c_types.CType=c_types.t_void_ptr) -> None:
+        super().__init__(data_type)
         self.reg_index = reg_index
 
     def __repr__(self):
-        return 'FixedRegister({},{})'.format(self.reg_index,self.size)
+        type_str = ''
+        if self.data_type != c_types.t_void_ptr:
+            type_str = ',' + repr(self.data_type)
+        return 'FixedRegister({}{})'.format(self.reg_index,type_str)
 
 class StackItem(MutableValue,AddressType):
     __slots__ = 'index',
 
-    def __init__(self,index : int,size : int=SIZE_DEFAULT) -> None:
-        super().__init__(size)
+    def __init__(self,index : int,data_type : c_types.CType=c_types.t_void_ptr) -> None:
+        super().__init__(data_type)
         self.index = index
 
     def __repr__(self):
-        size_str = ''
-        if self.size != SIZE_DEFAULT:
-            size_str = ','+str(self.size)
-        return 'StackItem({}{})'.format(self.index,size_str)
+        type_str = ''
+        if self.data_type != c_types.t_void_ptr:
+            type_str = ','+repr(self.data_type)
+        return 'StackItem({}{})'.format(self.index,type_str)
 
 class StackItemPart(MutableValue,AddressType):
     __slots__ = 'block','offset'
 
-    def __init__(self,block : StackItem,offset : int,size : int=SIZE_DEFAULT) -> None:
-        super().__init__(size)
+    def __init__(self,block : StackItem,offset : int,data_type : c_types.CType=c_types.t_void_ptr) -> None:
+        super().__init__(data_type)
         self.block = block
         self.offset = offset
 
     def __repr__(self):
-        size_str = ''
-        if self.size != SIZE_DEFAULT:
-            size_str = ',' + str(self.size)
-        return 'StackItemPart({!r},{}{})'.format(self.block,self.offset,size_str)
+        type_str = ''
+        if self.data_type != c_types.t_void_ptr:
+            type_str = ',' + repr(self.data_type)
+        return 'StackItemPart({!r},{}{})'.format(self.block,self.offset,type_str)
 
 class ArgStackItem(MutableValue,AddressType):
     """A function argument passed via the stack.
@@ -380,38 +492,81 @@ class ArgStackItem(MutableValue,AddressType):
     """
     __slots__ = 'index','prev_frame'
 
-    def __init__(self,index : int,prev_frame : bool=False,size : int=SIZE_DEFAULT) -> None:
-        super().__init__(size)
+    def __init__(self,index : int,prev_frame : bool=False,data_type : c_types.CType=c_types.t_void_ptr) -> None:
+        super().__init__(data_type)
         self.index = index
         self.prev_frame = prev_frame
 
     def __eq__(self,b):
         if isinstance(b,ArgStackItem):
-            return self.index == b.index and self.prev_frame == b.prev_frame and self.size == b.size
+            return self.index == b.index and self.prev_frame == b.prev_frame and self.data_type == b.data_type
         return False
 
     def __ne__(self,b):
         return not self.__eq__(b)
 
     def __repr__(self):
-        size_str = ''
-        if self.size != SIZE_DEFAULT:
-            size_str = ',' + str(self.size)
-        return 'ArgStackItem({},{!r}{})'.format(self.index,self.prev_frame,size_str)
+        type_str = ''
+        if self.data_type != c_types.t_void_ptr:
+            type_str = ',' + repr(self.data_type)
+        return 'ArgStackItem({},{!r}{})'.format(self.index,self.prev_frame,type_str)
 
-def to_stack_item(location : StackLocation,size=SIZE_DEFAULT) -> Union[StackItem,ArgStackItem]:
+class Symbol(Value):
+    """A named entity to be linked."""
+
+    __slots__ = 'name','address'
+
+    def __init__(self,name : str,data_type : c_types.CType=c_types.t_void_ptr,address : Optional[int]=None) -> None:
+        super().__init__(data_type)
+        self.name = name
+        self.address = address
+
+    def __eq__(self,b):
+        return isinstance(b,Symbol) and b.name == self.name
+
+    def __ne__(self,b):
+        return not self.__eq__(b)
+
+    def __repr__(self):
+        type_str = ''
+        if self.data_type != c_types.t_void_ptr:
+            type_str = ',' + repr(self.data_type)
+        return 'Symbol({!r}{})'.format(self.name,type_str)
+
+class PyConst(Value):
+    """Represents a name or constant stored in one of the tuples in the
+    function body object"""
+
+    __slots__ = 'tuple_name','index','address'
+
+    def __init__(self,tuple_name : str,index : int,address : int) -> None:
+        super().__init__(c_types.PyObject_ptr)
+        self.tuple_name = tuple_name
+        self.index = index
+        self.address = address
+
+    def __eq__(self,b):
+        return isinstance(b,PyConst) and b.address == self.address
+
+    def __ne__(self,b):
+        return not self.__eq__(b)
+
+    def __repr__(self):
+        return 'PyConst({!r},{},{})'.format(self.tuple_name,self.index,self.address)
+
+def to_stack_item(location : StackLocation,data_type : c_types.CType=c_types.t_void_ptr) -> Union[StackItem,ArgStackItem]:
     if location.sect == StackSection.local:
-        return StackItem(location.index,size=size)
+        return StackItem(location.index,data_type=data_type)
     if location.sect == StackSection.args:
-        return ArgStackItem(location.index,size=size)
+        return ArgStackItem(location.index,data_type=data_type)
 
     assert location.sect == StackSection.previous
-    return ArgStackItem(location.index,True,size=size)
+    return ArgStackItem(location.index,True,data_type=data_type)
 
-def ensure_same_size(ptr_size,a,*args):
-    sa = a.size
+def ensure_same_size(abi,a,*args):
+    sa = a.size(abi)
     for b in args:
-        if (b.size or ptr_size) != (sa or ptr_size):
+        if b.size(abi) != sa:
             raise ValueError('arguments must have the same data size')
 
 class Instr:
@@ -841,6 +996,9 @@ class DelayedCompileLate:
         return self.overload.max_len
 
 class IRCompiler:
+    def __init__(self,abi):
+        self.abi = abi
+
     def prolog(self) -> IRCode2:
         raise NotImplementedError()
 
@@ -861,23 +1019,25 @@ class IRCompiler:
 
     def get_machine_arg(self,arg,displacement):
         if isinstance(arg,FixedRegister):
-            return self.get_reg(arg.reg_index,arg.size)
+            return self.get_reg(arg.reg_index,arg.size(self.abi))
         if isinstance(arg,StackItem):
-            return self.get_stack_addr(arg.index,0,arg.size,arg.size,StackSection.local)
+            size = arg.size(self.abi)
+            return self.get_stack_addr(arg.index,0,size,size,StackSection.local)
         if isinstance(arg,StackItemPart):
-            return self.get_stack_addr(arg.block.index,arg.offset,arg.size,arg.block.size,StackSection.local)
+            return self.get_stack_addr(arg.block.index,arg.offset,arg.size(self.abi),arg.block.size(self.abi),StackSection.local)
         if isinstance(arg,ArgStackItem):
+            size = arg.size(self.abi)
             return self.get_stack_addr(
                 arg.index,
                 0,
-                arg.size,
-                arg.size,
+                size,
+                size,
                 StackSection.previous if arg.prev_frame else StackSection.args)
         if isinstance(arg,Target):
             assert arg.displacement is not None
             return self.get_displacement(arg.displacement - displacement,False)
         if isinstance(arg,Immediate):
-            return self.get_immediate(arg.val,arg.size)
+            return self.get_immediate(arg.val.realize(self.abi),arg.size(self.abi))
 
         return arg
 
@@ -940,50 +1100,65 @@ class NullState(ExtraState):
     def conform_to(self,other):
         pass
 
-class OpGen:
-    def bin_op(self,a : Value,b : Value,dest : MutableValue,op_type : OpType) -> IRCode:
+class PyFuncInfo:
+    def __init__(self,frame_var,func_var,args_var,kwds_var):
+        self.frame_var = frame_var
+        self.func_var = func_var
+        self.args_var = args_var
+        self.kwds_var = kwds_var
+
+class OpGen(Generic[T]):
+    def __init__(self,abi: 'Abi',func_args: Iterable[Var]=(),callconv: CallConvType=CallConvType.default,pyinfo: Optional[PyFuncInfo]=None) -> None:
+        self.abi = abi
+        self.func_arg_vars = list(func_args)
+        self.callconv = callconv
+        self.pyinfo = pyinfo
+
+    def callconv_for(self,callconv: Optional[CallConvType],prev_frame: bool) -> CallConvType:
+        if callconv is not None: return callconv
+        if prev_frame: return self.callconv
+        return CallConvType.default
+
+    def bin_op(self,a : Value,b : Value,dest : MutableValue,op_type : OpType) -> T:
         raise NotImplementedError()
 
-    def unary_op(self,a : Value,dest : MutableValue,op_type : UnaryOpType) -> IRCode:
+    def unary_op(self,a : Value,dest : MutableValue,op_type : UnaryOpType) -> T:
         raise NotImplementedError()
 
-    def load_addr(self,addr : IndirectVar,dest : MutableValue) -> IRCode:
+    def load_addr(self,addr : MutableValue,dest : MutableValue) -> T:
         raise NotImplementedError()
 
-    def call(self,func,args : Sequence[Value]=(),store_ret : Optional[Var]=None) -> IRCode:
+    def call(self,func,args : Sequence[Value]=(),store_ret : Optional[Var]=None,callconv: CallConvType=CallConvType.default) -> T:
         raise NotImplementedError()
 
-    def call_preloaded(self,func,args : int,store_ret : Optional[Var]=None) -> IRCode:
+    def call_preloaded(self,func,args : int,store_ret : Optional[Var]=None,callconv: CallConvType=CallConvType.default) -> T:
         raise NotImplementedError()
 
-    def get_func_arg(self,i : int,prev_frame : bool=False) -> MutableValue:
+    def get_func_arg(self,i : int,prev_frame : bool=False,callconv : Optional[CallConvType]=None) -> MutableValue:
         raise NotImplementedError()
 
-    def jump(self,dest : Union[Target,Value],targets : Union[Iterable[Target],Target,None]=None) -> IRCode:
+    def jump(self,dest : Union[Target,Value],targets : Union[Iterable[Target],Target,None]=None) -> T:
         raise NotImplementedError()
 
-    def jump_if(self,dest : Target,cond : Cmp) -> IRCode:
+    def jump_if(self,dest : Target,cond : Cmp) -> T:
         raise NotImplementedError()
 
-    def if_(self,cond : Cmp,on_true : IRCode,on_false : Optional[IRCode]) -> IRCode:
+    def if_(self,cond : Cmp,on_true : T,on_false : Optional[T]) -> T:
         raise NotImplementedError()
 
-    def do_while(self,action : IRCode,cond : Cmp) -> IRCode:
+    def do_while(self,action : T,cond : Cmp) -> T:
         raise NotImplementedError()
 
-    def jump_table(self,val : Value,targets : Sequence[Target]) -> IRCode:
+    def jump_table(self,val : Value,targets : Sequence[Target]) -> T:
         raise NotImplementedError()
 
-    def move(self,src : Value,dest : MutableValue) -> IRCode:
+    def move(self,src : Value,dest : MutableValue) -> T:
         raise NotImplementedError()
 
-    def shift(self,src : Value,shift_dir : ShiftDir,amount : Value,dest : MutableValue) -> IRCode:
+    def shift(self,src : Value,shift_dir : ShiftDir,amount : Value,dest : MutableValue) -> T:
         raise NotImplementedError()
 
-    def return_value(self,v : Value) -> IRCode:
-        raise NotImplementedError()
-
-    def get_return_address(self,v : Value) -> IRCode:
+    def get_return_address(self,v : MutableValue) -> T:
         """Store the address of the next instruction to be called after the
         current function returns, into 'v'.
 
@@ -995,23 +1170,39 @@ class OpGen:
         """
         raise NotImplementedError()
 
+    def compile(self,func_name : str,code: T,ret_var: Optional[Var]=None,end_targets=()) -> Function:
+        raise NotImplementedError()
+
+    def new_func_body(self):
+        raise NotImplementedError()
+
 # noinspection PyAbstractClass
-class IROpGen(OpGen):
+class IROpGen(OpGen[IRCode]):
     max_args_used = 0
 
-    def __init__(self,abi: abi.Abi) -> None:
-        self.abi = abi
+    if TYPE_CHECKING:
+        def __init__(self,abi: 'BinaryAbi',func_args: Iterable[Var]=(),callconv: CallConvType=CallConvType.default,pyinfo: Optional[PyFuncInfo]=None) -> None:
+            super().__init__(abi,func_args,callconv,pyinfo)
+        abi = cast(BinaryAbi,object()) # type: BinaryAbi
 
-    def call(self,func,args : Sequence[Value]=(),store_ret : Optional[Var]=None) -> IRCode:
+    def get_func_arg(self,i : int,prev_frame : bool=False,callconv : Optional[CallConvType]=None) -> MutableValue:
+        return self.abi.callconvs[
+            self.callconv_for(callconv,prev_frame).value].get_arg(self.abi,i,prev_frame)
+
+    def get_return(self,prev_frame : bool=False,callconv : Optional[CallConvType]=None) -> MutableValue:
+        return self.abi.callconvs[
+            self.callconv_for(callconv,prev_frame).value].get_return(self.abi,prev_frame)
+
+    def call(self,func,args : Sequence[Value]=(),store_ret : Optional[Var]=None,callconv : CallConvType=CallConvType.default) -> IRCode:
         self.max_args_used = max(self.max_args_used,len(args))
-        return self._call_impl(func,args,store_ret)
+        return self._call_impl(func,args,store_ret,callconv)
 
-    def call_preloaded(self,func,args : int,store_ret : Optional[Var]=None) -> IRCode:
+    def call_preloaded(self,func,args : int,store_ret : Optional[Var]=None,callconv : CallConvType=CallConvType.default) -> IRCode:
         self.max_args_used = max(self.max_args_used,args)
-        return self._call_preloaded_impl(func,args,store_ret)
+        return self._call_preloaded_impl(func,args,store_ret,callconv)
 
-    def _call_impl(self,func,args : Sequence[Value],store_ret : Optional[Var]) -> IRCode:
-        arg_dests = [self.get_func_arg(i) for i in range(len(args))]
+    def _call_impl(self,func,args : Sequence[Value],store_ret : Optional[Var],callconv : CallConvType) -> IRCode:
+        arg_dests = [self.get_func_arg(i,callconv=callconv) for i in range(len(args))]
         arg_r_indices = [arg.reg_index for arg in arg_dests if isinstance(arg,FixedRegister)]
 
         r = []  # type: IRCode
@@ -1020,17 +1211,16 @@ class IROpGen(OpGen):
         for arg,dest in zip(args,arg_dests):
             r += self.move(arg,dest)
 
-        r += self._call_preloaded_impl(func,len(args),store_ret)
+        r += self._call_preloaded_impl(func,len(args),store_ret,callconv)
 
         if arg_r_indices: r.append(UnlockRegs(arg_r_indices))
 
         return r
 
-    def _call_preloaded_impl(self,func,args : int,store_ret : Optional[Var]) -> IRCode:
+    def _call_preloaded_impl(self,func,args : int,store_ret : Optional[Var],callconv : CallConvType) -> IRCode:
         raise NotImplementedError()
 
-    def get_compiler(self,regs_used: int,stack_used: int,
-        args_used: int) -> IRCompiler:
+    def get_compiler(self,regs_used: Set[int],stack_used: int,args_used: int) -> IRCompiler:
         raise NotImplementedError()
 
     def allocater_extra_state(self) -> ExtraState:
@@ -1046,8 +1236,7 @@ class IROpGen(OpGen):
         """
         return NullState()
 
-    def process_indirection(self,instr: Instr,ov: Overload,
-        inds: Sequence[int]) -> Tuple[Instr,Overload]:
+    def process_indirection(self,instr: Instr,ov: Overload,inds: Sequence[int]) -> Tuple[Instr,Overload]:
         """Remove instances of IndirectVar.
 
         The return value is equivalent to the input parameters, except each
@@ -1060,6 +1249,91 @@ class IROpGen(OpGen):
 
         """
         raise NotImplementedError()
+
+    def compile(self,func_name : str,code1: IRCode,ret_var: Optional[Var]=None,end_targets=()) -> Function:
+        code2 = [] # type: IRCode
+        for i,av in enumerate(self.func_arg_vars):
+            loc = self.get_func_arg(i,True)
+            if isinstance(loc,(FixedRegister,ArgStackItem)):
+                code2.append(CreateVar(av,loc))
+            else:
+                # this case probably won't even come up
+                code2.extend(self.move(loc,av))
+        code2.extend(code1)
+        if ret_var is not None:
+            code2.extend(self.move(ret_var,self.get_return(True)))
+
+        code,r_used,s_used = reg_allocate(self,code2,self.abi.gen_regs)
+        irc = self.get_compiler(r_used,s_used,self.max_args_used)
+
+        displacement = 0
+        pad_size = 0
+        annot_size = 0
+        annots = []  # type: List[debug.Annotation]
+
+        # this item will be replaced with padding if needed
+        late_chunks = [None]  # type: List[Optional[Sized]]
+
+        code = irc.prolog() + code + irc.epilog()
+
+        for instr in reversed(code):
+            if isinstance(instr,IRAnnotation):
+                descr = instr.descr
+                if isinstance(descr,IRSymbolLocDescr):
+                    descr = debug.VariableLoc(
+                        descr.symbol,
+                        irc.get_machine_arg(descr.loc.to_ir(),displacement) if descr.loc else None)
+
+                annot = debug.Annotation(descr,annot_size)
+
+                if self.abi.assembly:
+                    late_chunks.append(AsmSequence([AsmOp(comment_desc,
+                        ('annotation: {!r}'.format(annot.descr),),b'')]))
+
+                # since appending to a list is O(1) while prepending is O(n), we
+                # add the items backwards and reverse the list afterwards
+                annots.append(annot)
+
+                annot_size = 0
+            elif isinstance(instr,Target):
+                instr.displacement = displacement
+            else:
+                assert isinstance(instr,Instr2)
+                chunk = irc.compile_early(make_asm_if_needed(instr,self.abi.assembly),displacement)
+
+                # items are added backwards for the same reason as above
+                late_chunks.append(chunk)
+                displacement -= len(chunk)
+                annot_size += len(chunk)
+
+        assert annot_size == 0 or not annots,"if there are any annotations, there should be one at the start"
+
+        annots.reverse()
+
+        # add padding for alignment
+        if CALL_ALIGN_MASK:
+            unpadded = displacement
+            displacement = aligned_for_call(displacement)
+            pad_size = displacement - unpadded
+            if pad_size:
+                late_chunks[0] = code_join(
+                    [irc.compile_early(make_asm_if_needed(c,self.abi.assembly),0) for c
+                        in irc.nops(pad_size)])
+
+        for et in end_targets:
+            et.displacement -= displacement
+
+        return Function(
+            code_join([irc.compile_late(c) for c in reversed(late_chunks) if c is not None]),
+            pad_size,
+            name=func_name,
+            annotation=annots,
+            returns=c_types.t_void if ret_var is None else ret_var.data_type,
+            params=[Param(av.dbg_symbol or '__a'+str(i),av.data_type) for i,av in enumerate(self.func_arg_vars)],
+            callconv=self.callconv)
+
+    def new_func_body(self):
+        return pyinternals.FunctionBody.__new__(pyinternals.FunctionBody)
 
 # noinspection PyAbstractClass
 class JumpCondOpGen(IROpGen):
@@ -1461,7 +1735,7 @@ def calc_var_intervals(code : IRCode) -> None:
         cb.run(code,len(code))
 
 
-class Filter(Container[T],Generic[T]):
+class Filter(Container[T]):
     def __init__(self,include : Optional[Container[T]]=None,exclude : Container[T]=()) -> None:
         self.include = include
         self.exclude = exclude
@@ -1493,7 +1767,7 @@ class ItvLocation:
         r = self.__eq__(b)
         return r if r is NotImplemented else not r
 
-    def to_opt_ir(self,size=SIZE_DEFAULT) -> Union[FixedRegister,StackItem,ArgStackItem,None]:
+    def to_opt_ir(self,data_type : c_types.CType=c_types.t_void_ptr) -> Union[FixedRegister,StackItem,ArgStackItem,None]:
         """Return an IR value representing a value in this location.
 
         If this location is both a register and stack item, the return value
@@ -1502,14 +1776,14 @@ class ItvLocation:
 
         """
         if self.reg is not None:
-            return FixedRegister(self.reg,size=size)
+            return FixedRegister(self.reg,data_type)
 
         if self.stack_loc is not None:
-            return to_stack_item(self.stack_loc,size)
+            return to_stack_item(self.stack_loc,data_type)
 
         return None
 
-    def to_ir(self,size=SIZE_DEFAULT) -> Union[FixedRegister,StackItem,ArgStackItem]:
+    def to_ir(self,data_type : c_types.CType=c_types.t_void_ptr) -> Union[FixedRegister,StackItem,ArgStackItem]:
         """Return an IR value representing a value in this location.
 
         If this location is both a register and stack item, the return value
@@ -1517,7 +1791,7 @@ class ItvLocation:
         will be raised.
 
         """
-        r = self.to_opt_ir(size)
+        r = self.to_opt_ir(data_type)
         if r is None:
             raise ValueError('this location is blank')
         return r
@@ -1637,48 +1911,75 @@ class LocationScan:
     def is_reg_free(self,r):
         return self.reg_pool[r] is None
 
-    @consistency_check
-    def advance(self,pos : int,on_loc_expire : Optional[Callable[[VarLifetime],None]]) -> None:
-        self.cur_pos = pos
-
-        while self.active_r:
-            itv,life = self.active_r[0]
+    def _update_r(self,life,on_loc_expire):
+        try:
+            new_itv = life.itv_at(self.cur_pos)
+        except ValueError:
             loc = self.itv_locs[life]
             assert loc.reg is not None
-            if itv.end > pos: break
-            del self.active_r[0]
-            try:
-                new_itv = life.itv_at(pos)
-            except ValueError:
-                self.reg_pool[loc.reg] = None
-                loc.reg = None
+            self.reg_pool[loc.reg] = None
+            loc.reg = None
 
-                # if loc.stack_loc is not None, the next loop will call
-                # on_loc_expire for this instance of VarLifetime
-                if on_loc_expire and loc.stack_loc is None: on_loc_expire(life)
-            else:
-                self.active_r.add_item((new_itv,life))
+            # if loc.stack_loc is not None, the next loop will call
+            # on_loc_expire for this instance of VarLifetime
+            if on_loc_expire and loc.stack_loc is None: on_loc_expire(life)
+        else:
+            self.active_r.add_item((new_itv,life))
 
-
-        while self.active_s:
-            itv,life = self.active_s[0]
+    def _update_s(self,life,on_loc_expire):
+        try:
+            new_itv = life.itv_at(self.cur_pos)
+        except ValueError:
             loc = self.itv_locs[life]
             assert loc is not None
             assert loc.stack_loc is not None
             assert loc.stack_loc.sect == StackSection.local
+
+            loc.stack_loc = None
+            if on_loc_expire: on_loc_expire(life)
+        else:
+            self.active_s.add_item((new_itv,life))
+
+    def _advance(self,pos,on_loc_expire):
+        while self.active_r:
+            itv,life = self.active_r[0]
+            if itv.end > pos: break
+            del self.active_r[0]
+            self._update_r(life,on_loc_expire)
+
+
+        while self.active_s:
+            itv,life = self.active_s[0]
             if itv.end > pos: break
             del self.active_s[0]
-            try:
-                new_itv = life.itv_at(pos)
-            except ValueError:
-                loc.stack_loc = None
-                if on_loc_expire: on_loc_expire(life)
-            else:
-                self.active_s.add_item((new_itv,life))
+            self._update_s(life,on_loc_expire)
 
         for i,life in enumerate(self.stack_pool):
             if life is not None and pos >= life.intervals.global_end:
                 self.stack_pool[i] = None
+
+    def _reverse(self,pos,on_loc_expire):
+        self.cur_pos = pos
+
+        old_a = list(self.active_r)
+        del self.active_r[:]
+        for itv,life in old_a:
+            self._update_r(life,on_loc_expire)
+
+        old_a = list(self.active_s)
+        del self.active_s[:]
+        for itv,life in old_a:
+            self._update_s(life,on_loc_expire)
+
+    @consistency_check
+    def advance(self,pos: int,on_loc_expire: Optional[Callable[[VarLifetime],None]]) -> None:
+        old_pos = self.cur_pos
+        self.cur_pos = pos
+
+        if pos > old_pos:
+            self._advance(pos,on_loc_expire)
+        elif pos < old_pos:
+            self._reverse(pos,on_loc_expire)
 
     @staticmethod
     def _remove_active(life,active):
@@ -1870,8 +2171,8 @@ class LocationScan:
         assert isinstance(itv,VarLifetime)
         return self.itv_locs[itv]
 
-    def to_ir(self,itv : Lifetime,size : int=SIZE_DEFAULT) -> Union[FixedRegister,StackItem,ArgStackItem]:
-        return self.interval_loc(itv).to_ir(size)
+    def to_ir(self,itv : Lifetime,data_type : c_types.CType=c_types.t_void_ptr) -> Union[FixedRegister,StackItem,ArgStackItem]:
+        return self.interval_loc(itv).to_ir(data_type)
 
 def load_to_reg(alloc : LocationScan,itv : VarLifetime,allowed_reg : Container[int],cgen : IROpGen,code : IRCode2,val : Optional[Value]=None) -> FixedRegister:
     displaced = alloc.load_reg(itv,Filter(allowed_reg))
@@ -1976,7 +2277,7 @@ def ir_preallocated_to_ir2(code):
 
     return r
 
-class ListChainLink(Generic[T],List[T]):
+class ListChainLink(List[T]):
     """A basic singly-linked list of arrays"""
     def __init__(self):
         super().__init__()
@@ -2008,7 +2309,7 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
         assert self.state is not None
         assert block.lifetime is not None
         self.state.alloc_block(block.lifetime,len(block))
-        return self.state.to_ir(block.lifetime,len(block)*self._ptr_size)
+        return self.state.to_ir(block.lifetime,block.data_type)
 
     def _copy_val_to_stack(self,state,val,itv,code):
         moved = state.to_stack(itv)
@@ -2053,7 +2354,7 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
                     assert not reads
                     dest = self._load_to_block(arg.block)
                     assert isinstance(dest,StackItem)
-                    dest = StackItemPart(dest,arg.offset * self._ptr_size,self._ptr_size)
+                    dest = StackItemPart(dest,arg.offset * self._ptr_size,arg.data_type)
                 else:
                     assert isinstance(itv,VarLifetime)
                     dest = self._copy_val_to_stack(self.state,arg,itv,self.new_code_head if reads else None)
@@ -2063,9 +2364,6 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
                     raise ValueError('cannot write to a read-only value')
                 non_var_moves.append((arg,dest))
             new_args[i] = dest
-
-    def _block_to_stackitem(self,b,itvl):
-        return StackItem(itvl.stack_loc.index,len(b) * self._ptr_size)
 
     def get_var_loc(self,var):
         assert var.lifetime is not None
@@ -2077,9 +2375,9 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
         assert itvl.stack_loc is not None
         if isinstance(var,VarPart):
             assert itvl.stack_loc.sect == StackSection.local
-            return StackItemPart(self._block_to_stackitem(var.block,itvl),var.offset*self._ptr_size,self._ptr_size)
+            return StackItemPart(StackItem(itvl.stack_loc.index,var.block.data_type),var.offset*self._ptr_size,var.data_type)
         if isinstance(var,Block):
-            return self._block_to_stackitem(var,itvl)
+            return StackItem(itvl.stack_loc.index,var.data_type)
 
         return to_stack_item(itvl.stack_loc)
 
@@ -2110,14 +2408,6 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
         tmp = self.state.extra.process_instr(op_i,op)
         if tmp is None: return
         op = tmp
-
-        if self.backtracking(op_i) and any(isinstance(a,(Var,Block)) for a in op.args):
-            # The LocationScan class only works if instructions are processed
-            # in order. Since back-tracking is only needed when returning from
-            # "finally" statement bodies, and calls to "finally" statement
-            # bodies are always followed by jumps past the body, this is good
-            # enough.
-            raise ValueError('cannot use variables while back-tracking')
 
         new_args = []  # type: List[Any]
 
@@ -2170,9 +2460,8 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
 
             self.move_for_param(i,overload.params[i],new_args,True,non_var_moves if pd.writes else None)
 
-        # writes always apply after the instruction
-        if not self.backtracking(op_i):
-            self.state.advance(op_i + 1,self._on_loc_expire)
+
+        self.state.advance(op_i + 1,self._on_loc_expire)
 
         # Third pass: for the rest of the arguments, create a physical location
         for i,p in enumerate(overload.params):
@@ -2263,7 +2552,7 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
         assert self.state is not None
         self.state.locked_regs.difference_update(op.regs)
 
-    def conform_states_to(self,op_i : int,states : List[JumpState]):
+    def conform_states_to(self,op_i : int,states : Sequence[JumpState]):
         assert self.state is not None and len(states)
 
         cond_states = [s for s in states if s.branches]
@@ -2288,13 +2577,12 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
 
             for state in cond_states:
                 for life in bad_vars:
-                    self._copy_val_to_stack(state.alloc,state.alloc.itv_locs[life],life,state.code)
+                    self._copy_val_to_stack(state.alloc,state.alloc.to_ir(life),life,state.code)
 
         # unconditional jumps are safe to modify
         for state in states:
             if not state.branches:
-                if state.alloc.cur_pos != self.state.cur_pos:
-                    state.alloc.advance(self.state.cur_pos,self._on_loc_expire)
+                state.alloc.advance(self.state.cur_pos,self._on_loc_expire)
                 state.conform_to(self.cgen,self.state)
 
     def conform_prior_states(self,op_i : int,jump_ops : int,states : Sequence[LocationScan]):
@@ -2335,7 +2623,7 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
                     self.new_code_head.extend(annotate_symbol_loc(itv,loc))
 
     def handle_op(self,op_i : int,code : IRCode):
-        if self.state is not None and self.state.cur_pos < op_i:
+        if self.state is not None:
             self.state.advance(op_i,self._on_loc_expire)
 
         return super().handle_op(op_i,code)
@@ -2347,7 +2635,7 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
         super().run(code,start)
         self.new_code_head = prev_head
 
-def reg_allocate(cgen : IROpGen,code : IRCode,regs : int) -> Tuple[IRCode2,int,int]:
+def reg_allocate(cgen : IROpGen,code : IRCode,regs : int) -> Tuple[IRCode2,Set[int],int]:
     """Convert IRCode into IRCode2.
 
     This converts all instances of Var into FixedRegister or StackItem, and
@@ -2369,7 +2657,168 @@ def reg_allocate(cgen : IROpGen,code : IRCode,regs : int) -> Tuple[IRCode2,int,i
     while nc is not None:
         code2.extend(nc)
         nc = nc.next
-    return code2,regs,len(stack_pool)
+    return code2,set(range(regs)),len(stack_pool)
+
+
+def code_join(x):
+    if isinstance(x[0],bytes):
+        return b''.join(x)
+    return reduce(operator.add,x)
+
+class AsmOp:
+    __slots__ = 'op','args','binary','annot'
+
+    def __init__(self,op,args,binary,annot=''):
+        self.op = op
+        self.args = args
+        self.binary = binary
+        self.annot = annot
+
+    def __len__(self):
+        return len(self.binary)
+
+    def emit(self,addr):
+        return self.op.assembly(self.args,addr,self.binary,self.annot)
+
+    @property
+    def inline_comment(self):
+        return isinstance(self.op,CommentDesc) and self.op.inline
+
+class AsmSequence(Sized):
+    def __init__(self,ops=None):
+        self.ops = ops or []
+
+    def __len__(self):
+        return sum((len(op.binary) for op in self.ops),0)
+
+    def __add__(self,b):
+        if isinstance(b,AsmSequence):
+            return AsmSequence(self.ops+b.ops)
+
+        return NotImplemented
+
+    def __iadd__(self,b):
+        if isinstance(b,AsmSequence):
+            self.ops += b.ops
+            return self
+
+        return NotImplemented
+
+    def __mul__(self,b):
+        if isinstance(b,int):
+            return AsmSequence(self.ops*b)
+
+        return NotImplemented
+
+    def __imul__(self,b):
+        if isinstance(b,int):
+            self.ops *= b
+            return self
+
+        return NotImplemented
+
+    def emit(self,base=0):
+        lines = []
+        addr = base
+        for op in self.ops:
+            line = op.emit(addr)
+            if op.inline_comment:
+                assert lines
+                lines[-1] = ' '.join((lines[-1],line))
+            else:
+                lines.append(line)
+            addr += len(op)
+
+        return '\n'.join(lines)
+
+def asm_converter(op,f):
+    return lambda *args: AsmSequence([AsmOp(op,args,f(*args))])
+
+def make_asm_if_needed(instr,assembly):
+    if assembly:
+        return Instr2(instr.op,instr.overload.variant(
+            instr.overload.params,
+            asm_converter(instr.op,instr.overload.func)),instr.args)
+
+    return instr
+
+
+class Tuning:
+    prefer_addsub_over_incdec = True
+    build_seq_loop_threshhold = 5
+    unpack_seq_loop_threshhold = 5
+    build_set_loop_threshhold = 5
+    mem_copy_loop_threshhold = 9
+
+
+class AbiRegister:
+    pass
+
+cc_T = TypeVar('cc_T',bound=AbiRegister)
+class CallingConvention(Generic[cc_T]):
+    def __init__(self,r_ret: cc_T,r_pres: List[cc_T],r_scratch: List[cc_T],r_arg: List[cc_T],shadow: bool=False) -> None:
+        self.r_ret = r_ret
+        self.r_pres = r_pres
+        self.r_scratch = r_scratch
+        self.r_arg = r_arg
+
+        # If True, stack space is reserved for function calls for all
+        # arguments, even those that are passed in registers, such that the
+        # called function could move those arguments to where they would be if
+        # all arguments were passed by stack in the first place.
+        self.shadow = shadow
+
+    def get_arg(self,abi : 'BinaryAbi',i : int,prev_frame=False) -> MutableValue:
+        if i < len(self.r_arg):
+            return abi.reg_to_ir(self.r_arg[i])
+
+        if not self.shadow:
+            i -= len(self.r_arg)
+        return ArgStackItem(i,prev_frame)
+
+    def get_return(self,abi : 'BinaryAbi',prev_frame=False) -> MutableValue:
+        return abi.reg_to_ir(self.r_ret)
+
+class Abi:
+    code_gen = None # type: Type[OpGen]
+
+    def __init__(self,*,assembly=False):
+        self.assembly = assembly
+        self.tuning = Tuning()
+
+class BinAbiMeta(type):
+    def __new__(mcs,name,bases,namespace):
+        r = type.__new__(mcs,name,bases,namespace) # type: Type[BinaryAbi]
+
+        r.reg_indices = {r:i for i,r in enumerate(r.all_regs)}
+
+        return r
+
+class BinaryAbi(Abi,metaclass=BinAbiMeta):
+    code_gen = None # type: Type[IROpGen]
+    has_cmovecc = False
+
+    callconvs = None # type: Tuple[CallingConvention,CallingConvention]
+
+    # registers should be ordered by preferred usage, in decreasing order
+    all_regs = [] # type: List[AbiRegister]
+
+    # The number of general-purpose registers. These must be located at the
+    # front of "all_regs".
+    gen_regs = 0
+
+    # this is filled automatically by the metaclass
+    reg_indices = {} # type: Dict[AbiRegister,int]
+
+    ptr_size = 0
+    char_size = 0
+    short_size = 0
+    int_size = 0
+    long_size = 0
+
+    @classmethod
+    def reg_to_ir(cls,reg):
+        return FixedRegister(cls.reg_indices[reg])
 
 
 def debug_gen_code(code):
@@ -2423,8 +2872,10 @@ def debug_gen_code(code):
                         op = 'readwrite_op'
                     else:
                         op = 'write_op'
-                else:
+                elif pd.writes:
                     op = 'read_op'
+                else:
+                    op = 'lea_op'
 
                 line = 'ir.Instr({},{})'.format(op,arg)
                 if line != code_str[-1]:
