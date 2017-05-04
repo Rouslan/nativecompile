@@ -38,10 +38,10 @@ __all__ = ['SIZE_B','SIZE_W','SIZE_D','SIZE_Q','StackSection','LocationType',
     'IndirectMod','LockRegs','UnlockRegs','IRAnnotation','annotate',
     'IRSymbolLocDescr','Instr2','CmpType','Cmp','BinCmp','AndCmp','OrCmp',
     'OpType','commutative_ops','UnaryOpType','ShiftDir','IROp','IRCode',
-    'IROp2','IRCode2','ExtraState','CallConvType','PyFuncInfo','OpGen',
-    'IROpGen','JumpCondOpGen','IRCompiler','reg_allocate','Param','Function',
-    'CompilationUnit','address_of','Tuning','CallingConvention','AbiRegister',
-    'Abi','BinaryAbi']
+    'IROp2','IRCode2','ExtraState','CallConvType','PyFuncInfo','FinallyTarget',
+    'OpGen','IROpGen','JumpCondOpGen','IRCompiler','reg_allocate','Param',
+    'Function','CompilationUnit','address_of','Tuning','CallingConvention',
+    'AbiRegister','Abi','BinaryAbi']
 
 import enum
 import collections
@@ -64,7 +64,8 @@ from .dinterval import *
 from .compilation_unit import *
 
 
-SIZE_DEFAULT = 0
+EMIT_IR_TEST_CODE = False
+
 SIZE_B = 1
 SIZE_W = 2
 SIZE_D = 4
@@ -156,10 +157,19 @@ class AliasLifetime(Lifetime):
         itv.aliases.add(self)
 
 
+class Filter(Container[T]):
+    def __init__(self,include : Optional[Container[T]]=None,exclude : Container[T]=()) -> None:
+        self.include = include
+        self.exclude = exclude
+
+    def __contains__(self,item):
+        return (self.include is None or item in self.include) and item not in self.exclude
+
+
 class _RegisterMetaType(type):
     def __new__(mcs,name,bases,namespace,*,allowed=None):
         cls = super().__new__(mcs,name,bases,namespace)
-        cls.allowed = frozenset(allowed) if allowed is not None else None
+        cls.allowed = allowed if isinstance(allowed,Filter) else Filter(allowed)
         return cls
 
     # noinspection PyUnusedLocal
@@ -171,8 +181,7 @@ class _RegisterMetaType(type):
         return _RegisterMetaType('DependentFixedRegister',(FixedRegister,),{},allowed=allowed)
 
     def __instancecheck__(cls,inst):
-        return issubclass(inst.__class__,FixedRegister) and (
-            cls.allowed is None or inst.reg_index in cls.allowed)
+        return issubclass(inst.__class__,FixedRegister) and inst.reg_index in cls.allowed
 
     @staticmethod
     def generic_type():
@@ -644,7 +653,9 @@ def type_match_score(params,args):
                 return 0
         elif hassubclass(p,(FixedRegister,AddressType)):
             score += isinstance(a,p)
-        elif not isinstance(a,p):
+        elif isinstance(a,p):
+            score += 1
+        else:
             # only registers and addresses can be moved between each other
             return 0
 
@@ -835,20 +846,22 @@ class IRJump:
         return 'IRJump({!r},{!r},{})'.format(self.dests,self.conditional,self.jump_ops)
 
 class IndirectMod:
-    """Indicates that a variable was updated externally, somehow.
+    """Indicates that a variable was read or updated externally, somehow.
 
-    If the value exists in both a register and the stack, one is made invalid
-    depending on which was updated.
+    When written, if the value exists in both a register and the stack, one is
+    made invalid depending on which was updated.
 
     """
-    __slots__ = 'var','loc_type'
+    __slots__ = 'var','read','write','loc_type'
 
-    def __init__(self,var : Var,loc_type : LocationType) -> None:
+    def __init__(self,var: Var,read: object,write: object,loc_type: LocationType) -> None:
         self.var = var
+        self.read = bool(read)
+        self.write = bool(write)
         self.loc_type = loc_type
 
     def __repr__(self):
-        return 'IndirectMod({!r},{!r})'.format(self.var,self.loc_type)
+        return 'IndirectMod({!r},{!r},{!r},{!r})'.format(self.var,self.read,self.write,self.loc_type)
 
 class LockRegs:
     """"Lock" one or more registers.
@@ -1107,6 +1120,22 @@ class PyFuncInfo:
         self.args_var = args_var
         self.kwds_var = kwds_var
 
+class FinallyTarget:
+    def __init__(self) -> None:
+        self.start = Target()
+        self.next_var = Var()
+
+        # A list of targets that the code jumps to, after the end of the
+        # finally block. This is needed for variable lifetime determination
+        self.next_targets = []  # type: List[Target]
+
+        if __debug__:
+            self._used = False
+
+    def add_next_target(self,t: Target):
+        assert not self._used
+        self.next_targets.append(t)
+
 class OpGen(Generic[T]):
     def __init__(self,abi: 'Abi',func_args: Iterable[Var]=(),callconv: CallConvType=CallConvType.default,pyinfo: Optional[PyFuncInfo]=None) -> None:
         self.abi = abi
@@ -1158,15 +1187,18 @@ class OpGen(Generic[T]):
     def shift(self,src : Value,shift_dir : ShiftDir,amount : Value,dest : MutableValue) -> T:
         raise NotImplementedError()
 
-    def get_return_address(self,v : MutableValue) -> T:
-        """Store the address of the next instruction to be called after the
-        current function returns, into 'v'.
+    def enter_finally(self,f: FinallyTarget,next_t: Optional[Target]=None) -> T:
+        raise NotImplementedError()
 
-        If the address was pushed to the stack, this will pop it and restore
-        the stack pointer to what it was before the current function was
-        called, as long as the stack isn't altered between the function call
-        and the current point of execution.
-
+    def finally_body(self,f: FinallyTarget,body: T) -> T:
+        """Create code for a "finally" body.
+        
+        This works like a local function, except it can only be called from the
+        immediate outer scope, and can be jumped out of, to anywhere in the
+        outer scope.
+        
+        Finally body code can only be entered via "enter_finally".
+        
         """
         raise NotImplementedError()
 
@@ -1250,7 +1282,12 @@ class IROpGen(OpGen[IRCode]):
         """
         raise NotImplementedError()
 
-    def compile(self,func_name : str,code1: IRCode,ret_var: Optional[Var]=None,end_targets=()) -> Function:
+    def compile(self,func_name: str,code1: IRCode,ret_var: Optional[Var]=None,end_targets=()) -> Function:
+        if EMIT_IR_TEST_CODE:
+            print(func_name+':')
+            print(debug_gen_code(code1))
+            print()
+
         code2 = [] # type: IRCode
         for i,av in enumerate(self.func_arg_vars):
             loc = self.get_func_arg(i,True)
@@ -1388,16 +1425,22 @@ class FollowNonlinear(Generic[T,U]):
     def handle_create_var(self,op_i : int,op : CreateVar) -> None:
         pass
 
-    def handle_indirect_mod(self,op_i : int,op : IndirectMod) -> None:
+    def handle_indirect_mod(self,op_i: int,op: IndirectMod) -> None:
         pass
 
-    def handle_target(self,op_i : int,op : Target) -> None:
+    def handle_target(self,op_i: int,op: Target) -> None:
         pass
 
-    def handle_elided_target(self,op_i : int,op : Target) -> None:
+    def handle_elided_target(self,op_i: int,op: Target) -> None:
         pass
 
-    def handle_irjump(self,op_i : int,op : IRJump,code : IRCode) -> None:
+    def _redo_section(self,prev_i: int,code: IRCode):
+        old_s = self.state
+        self.state = self.make_prior_state(prev_i)
+        self.run(code,prev_i - 1)
+        self.state = old_s
+
+    def handle_irjump(self,op_i: int,op: IRJump,code: IRCode) -> None:
         assert self.state is not None and op.dests
         assert all((d in self.prior_states) == (op.dests[0] in self.prior_states) for d in op.dests[1:]),(
             'a jump is not allowed to have both forward and backward targets')
@@ -1406,10 +1449,15 @@ class FollowNonlinear(Generic[T,U]):
         for d in op.dests:
             prev_i = self.elided_targets.get(d)
             if prev_i is not None:
-                old_s = self.state
-                self.state = self.make_prior_state(prev_i)
-                self.run(code,prev_i)
-                self.state = old_s
+                # if there is a jump backwards, to a part that had a None
+                # state, go back and handle it again
+                self._redo_section(prev_i,code)
+
+                # _redo_section terminates as soon as it encounters an already
+                # handled Target, but there could have been a jump forward to
+                # another elided Target between prev_i and here
+                for t in self.elided_targets.keys() & self.pending_states.keys():
+                    self._redo_section(self.elided_targets[t],code)
             else:
                 unhandled_dests.append(d)
 
@@ -1579,7 +1627,7 @@ class _CalcVarIntervalsCommon(FollowNonlinear[VarState,Tuple[VarState,int]]):
         self.create_var_life(op.var,op_i,False,True)
 
     def handle_indirect_mod(self,op_i : int,op : IndirectMod) -> None:
-        self.create_var_life(op.var,op_i,False,True)
+        self.create_var_life(op.var,op_i,op.read,op.write)
 
     def handle_irjump(self,op_i : int,op : IRJump,code : IRCode) -> None:
         assert self.state is not None
@@ -1735,14 +1783,6 @@ def calc_var_intervals(code : IRCode) -> None:
         cb.run(code,len(code))
 
 
-class Filter(Container[T]):
-    def __init__(self,include : Optional[Container[T]]=None,exclude : Container[T]=()) -> None:
-        self.include = include
-        self.exclude = exclude
-
-    def __contains__(self,item):
-        return (self.include is None or item in self.include) and item not in self.exclude
-
 class ItvLocation:
     def __init__(self,reg : Optional[int]=None,stack_loc : Optional[StackLocation]=None) -> None:
         self.reg = reg
@@ -1885,26 +1925,31 @@ class LocationScan:
                 return True
         return False
 
-    def _alloc_s(self,life : VarLifetime,itv : Optional[Interval[int]]=None) -> bool:
+    def _alloc_s(self,life : VarLifetime,itv : Optional[Interval[int]]=None,reserve_only=False) -> bool:
         itvl = self.itv_locs[life]
         if itvl.stack_loc is not None: return False
 
         if life.preferred_stack_i is not None:
             assert self.stack_pool[life.preferred_stack_i] is life
-            itvl.stack_loc = StackLocation(StackSection.local,life.preferred_stack_i)
+            if not reserve_only:
+                itvl.stack_loc = StackLocation(StackSection.local,life.preferred_stack_i)
         else:
             for i in range(len(self.stack_pool)):
                 if self.stack_pool[i] is None:
                     self.stack_pool[i] = life
-                    itvl.stack_loc = StackLocation(StackSection.local,i)
+                    life.preferred_stack_i = i
+                    if not reserve_only:
+                        itvl.stack_loc = StackLocation(StackSection.local,i)
                     break
             else:
-                itvl.stack_loc = StackLocation(StackSection.local,len(self.stack_pool))
+                life.preferred_stack_i = len(self.stack_pool)
+                if not reserve_only:
+                    itvl.stack_loc = StackLocation(StackSection.local,len(self.stack_pool))
                 self.stack_pool.append(life)
 
-            life.preferred_stack_i = itvl.stack_loc.index
-        if itv is None: itv = life.itv_at(self.cur_pos)
-        self.active_s.add_item((cast(Interval[int],itv),life))
+        if not reserve_only:
+            if itv is None: itv = life.itv_at(self.cur_pos)
+            self.active_s.add_item((cast(Interval[int],itv),life))
 
         return True
 
@@ -2071,7 +2116,7 @@ class LocationScan:
         self.itv_locs[life].stack_loc = loc
 
     @consistency_check
-    def to_stack(self,life : VarLifetime) -> bool:
+    def to_stack(self,life: VarLifetime,reserve_only: bool=False) -> bool:
         """Copy the value to the stack.
 
         This will place a value onto the stack, if it's not already there. This
@@ -2079,7 +2124,7 @@ class LocationScan:
 
         """
         if self.itv_locs[life].stack_loc is not None: return False
-        self._alloc_s(life)
+        self._alloc_s(life,reserve_only=reserve_only)
         return True
 
     # @consistency_check
@@ -2136,13 +2181,14 @@ class LocationScan:
                 itvl.reg = None
 
     @consistency_check
-    def alloc_block(self,life : VarLifetime,size : int) -> None:
+    def alloc_block(self,life: VarLifetime,size: int,reserve_only: bool=False) -> bool:
         itvl = self.itv_locs[life]
-        if itvl.stack_loc is not None: return
+        if itvl.stack_loc is not None: return False
 
         if life.preferred_stack_i is not None:
             assert all(self.stack_pool[life.preferred_stack_i + i] is life for i in range(size))
-            itvl.stack_loc = StackLocation(StackSection.local,life.preferred_stack_i)
+            if not reserve_only:
+                itvl.stack_loc = StackLocation(StackSection.local,life.preferred_stack_i)
         else:
             i = 0
             n = len(self.stack_pool)
@@ -2160,9 +2206,14 @@ class LocationScan:
                 else:
                     self.stack_pool[j] = life
 
-            itvl.stack_loc = StackLocation(StackSection.local,i)
+            if not reserve_only:
+                itvl.stack_loc = StackLocation(StackSection.local,i)
             life.preferred_stack_i = i
-        self.active_s.add_item((life.itv_at(self.cur_pos),life))
+
+        if not reserve_only:
+            self.active_s.add_item((life.itv_at(self.cur_pos),life))
+
+        return True
 
     def interval_loc(self,itv : Lifetime):
         if isinstance(itv,AliasLifetime):
@@ -2188,13 +2239,13 @@ def load_to_reg(alloc : LocationScan,itv : VarLifetime,allowed_reg : Container[i
 
     return ir_dest
 
-def alloc_stack(alloc,var):
+def alloc_stack(alloc,var,reserve_only=False):
     if isinstance(var,Block):
-        alloc.alloc_block(var.lifetime,len(var))
+        alloc.alloc_block(var.lifetime,len(var),reserve_only)
     elif isinstance(var,VarPart):
-        alloc.alloc_block(var.block.lifetime,len(var.block))
+        alloc.alloc_block(var.block.lifetime,len(var.block),reserve_only)
     else:
-        alloc.to_stack(var.lifetime)
+        alloc.to_stack(var.lifetime,reserve_only=reserve_only)
 
 class JumpState:
     def __init__(self,alloc : LocationScan,code : IRCode2,jump_ops : int,branches : bool=False) -> None:
@@ -2316,11 +2367,39 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
         d_loc = state.interval_loc(itv)
         dest = to_stack_item(d_loc.stack_loc)
         if moved and code is not None:
-            code.extend(
-                ir_preallocated_to_ir2(self.cgen.move(val,dest)))
+            if isinstance(val,Var):
+                assert d_loc.reg is not None
+                val = FixedRegister(d_loc.reg)
+            code.extend(ir_preallocated_to_ir2(self.cgen.move(val,dest)))
             code.extend(annotate_symbol_loc(itv,d_loc))
 
         return dest
+
+    def to_addr(self,val,life,reads):
+        if isinstance(val,Block):
+            assert not reads
+            return self._load_to_block(val)
+
+        if isinstance(val,VarPart):
+            assert not reads
+            dest = self._load_to_block(val.block)
+            assert isinstance(dest,StackItem)
+            return StackItemPart(dest,val.offset * self._ptr_size,val.data_type)
+
+        assert isinstance(life,VarLifetime)
+        return self._copy_val_to_stack(self.state,val,life,self.new_code_head if reads else None)
+
+    def to_reg(self,val,life,reads,allowed_regs=Filter()):
+        assert not isinstance(val,(Block,VarPart)),(
+            "'Block' and 'VarPart' instances cannot be put in registers")
+        assert isinstance(life,VarLifetime)
+        return load_to_reg(
+            self.state,
+            life,
+            allowed_regs,
+            self.cgen,
+            self.new_code_head,
+            val if reads else None)
 
     # if non_var_moves is not None, the value is to be written-to
     def move_for_param(self,i,p,new_args,reads,non_var_moves=None):
@@ -2340,24 +2419,10 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
 
             fr_type = hassubclass(p,FixedRegister)
             if fr_type:
-                assert not isinstance(arg,(Block,VarPart)),(
-                    "'Block' and 'VarPart' instances cannot be put in registers")
-                assert isinstance(itv,VarLifetime)
-                dest = load_to_reg(self.state,itv,
-                    cast(_RegisterMetaType,fr_type).allowed,self.cgen,self.new_code_head,arg if reads else None)
+                dest = self.to_reg(arg,itv,reads,cast(_RegisterMetaType,fr_type).allowed)
             else:
                 assert hassubclass(p,AddressType)
-                if isinstance(arg,Block):
-                    assert not reads
-                    dest = self._load_to_block(arg)
-                elif isinstance(arg,VarPart):
-                    assert not reads
-                    dest = self._load_to_block(arg.block)
-                    assert isinstance(dest,StackItem)
-                    dest = StackItemPart(dest,arg.offset * self._ptr_size,arg.data_type)
-                else:
-                    assert isinstance(itv,VarLifetime)
-                    dest = self._copy_val_to_stack(self.state,arg,itv,self.new_code_head if reads else None)
+                dest = self.to_addr(arg,itv,reads)
 
             if non_var_moves is not None and not isinstance(arg,Var):
                 if not isinstance(arg,MutableValue):
@@ -2450,7 +2515,24 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
                 continue
             if not pd.reads:
                 if not pd.writes:
-                    self.move_for_param(i,overload.params[i],new_args,False)
+                    assert hassubclass(overload.params[i],(AddressType,Target)),(
+                        'only addresses can be reserved')
+
+                    if isinstance(a,Block):
+                        self.state.alloc_block(a.lifetime,len(a),True)
+                        new_args[i] = StackItem(a.lifetime.preferred_stack_i,a.data_type)
+                    elif isinstance(a,VarPart):
+                        self.state.alloc_block(a.block.lifetime,len(a.block),True)
+                        new_args[i] = StackItemPart(
+                            StackItem(a.block.lifetime.preferred_stack_i,a.block.data_type),
+                            a.offset * self._ptr_size,
+                            a.data_type)
+                    elif isinstance(a,Var):
+                        assert isinstance(a.lifetime,VarLifetime)
+                        self.state.to_stack(a.lifetime,True)
+                        new_args[i] = StackItem(a.lifetime.preferred_stack_i,a.data_type)
+                    elif not isinstance(a,(AddressType,Target)):
+                        raise TypeError('can only reserve address for variables and address values')
                 continue
 
             if isinstance(a,Block):
@@ -2527,22 +2609,39 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
             do_consistency_check(self.state)
 
     def handle_indirect_mod(self,op_i : int,op : IndirectMod):
-        assert self.state is not None
+        assert self.state is not None and (op.read or op.write)
         assert isinstance(op.var.lifetime,VarLifetime)
 
-        # variables' lifetimes always start after the instruction
-        self.state.advance(op_i + 1,self._on_loc_expire)
+        if op.write:
+            # variables' lifetimes always start after the instruction
+            self.state.advance(op_i + 1,self._on_loc_expire)
 
+        loc = self.state.interval_loc(op.var.lifetime)
         if op.loc_type == LocationType.stack:
-            alloc_stack(self.state,op.var)
-        self.state.value_updated(op.var.lifetime,op.loc_type)
+            assert loc.reg is not None or not op.read
+            if loc.stack_loc is None:
+                self.to_addr(op.var,op.var.lifetime,op.read)
+        else:
+            assert op.loc_type == LocationType.register
+            assert loc.stack_loc is not None or not op.read
+            if loc.reg is None:
+                self.to_reg(op.var,op.var.lifetime,op.read)
+
+        if op.write:
+            self.state.value_updated(op.var.lifetime,op.loc_type)
 
     def handle_target(self,op_i : int,op : Target):
+        prev = self.elided_links.get(op_i)
+        if prev is not None:
+            assert self.backtracking(op_i)
+            self.new_code_head = prev
+
         self.new_code_head.append(op)
 
     def handle_elided_target(self,op_i : int,op : Target):
-        self.elided_links[op_i] = self.new_code_head
-        self.new_code_head = self.new_code_head.new_link()
+        if not self.backtracking(op_i):
+            self.elided_links[op_i] = self.new_code_head
+            self.new_code_head = self.new_code_head.new_link()
 
     def handle_lock_regs(self,op_i : int,op : LockRegs):
         assert self.state is not None
@@ -2630,10 +2729,10 @@ class _RegAllocate(FollowNonlinear[LocationScan,JumpState]):
 
     def run(self,code : IRCode,start : int=-1):
         prev_head = self.new_code_head
-        link = self.elided_links.get(start)
-        if link is not None: self.new_code_head = link
-        super().run(code,start)
-        self.new_code_head = prev_head
+        try:
+            super().run(code,start)
+        finally:
+            self.new_code_head = prev_head
 
 def reg_allocate(cgen : IROpGen,code : IRCode,regs : int) -> Tuple[IRCode2,Set[int],int]:
     """Convert IRCode into IRCode2.
@@ -2878,15 +2977,17 @@ def debug_gen_code(code):
                     op = 'lea_op'
 
                 line = 'ir.Instr({},{})'.format(op,arg)
-                if line != code_str[-1]:
+                if code_str and line != code_str[-1]:
                     code_str.append(line)
         elif isinstance(instr,Target):
             code_str.append(targets[instr])
         elif isinstance(instr,IRJump):
             code_str.append('ir.IRJump([{}],{!r},0)'.format(','.join(targets[d] for d in instr.dests),instr.conditional))
         elif isinstance(instr,IndirectMod):
-            code_str.append('ir.IndirectMod({},ir.LocationType.{})'.format(
+            code_str.append('ir.IndirectMod({},{!r},{!r},ir.LocationType.{})'.format(
                 convert_val(instr.var),
+                instr.read,
+                instr.write,
                 'register' if instr.loc_type == LocationType.register else 'stack'))
         elif isinstance(instr,CreateVar):
             code_str.append('ir.CreateVar({},ir.{!r})'.format(convert_val(instr.var),instr.val))

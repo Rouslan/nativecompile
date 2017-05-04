@@ -19,7 +19,7 @@ __all__ = ['string_addr','DelayedCompile','CleanupItem','StackCleanupSection',
     'SNotCmp','and_','or_','not_','MaybeTrackedValue','TrackedValue',
     'PyObject','BorrowedValue','borrow','StolenValue','steal','ConstValue',
     'TupleItem','tuple_item','ObjArrayValue','CType','type_of','type_flags_of',
-    'SImmediate','SIndirect','State','Stitch','destitch']
+    'SImmediate','SIndirect','SFinallyTarget','State','Stitch','destitch']
 
 import sys
 import weakref
@@ -136,7 +136,7 @@ class StackCleanupSection(DelayedCompile):
             else:
                 s.jmp(self.dest)
 
-        return s.comment('cleanup end').code
+        return DelayedCompile.process(cgen,s.comment('cleanup end').code)
 
 class StackCleanup:
     def __init__(self):
@@ -353,15 +353,16 @@ class PyObject(TrackedValue[ValueT]):
     def __init__(self,value : Union[ValueT,str,None]=None,own : bool=False,nullable : bool=False) -> None:
         if isinstance(value,str):
             value = cast(ValueT,Var(value,data_type=c_types.PyObject_ptr))
+            if __debug__:
+                value.origin = _get_origin()
         elif value is None:
             value = cast(ValueT,Var(data_type=c_types.PyObject_ptr))
+            if __debug__:
+                value.origin = _get_origin()
         super().__init__(
             cast(ValueT,value),
             PyObject.nullable_cleanup if nullable else PyObject.cleanup,
             own)
-
-        if __debug__ and value is None:
-            self.value.origin = _get_origin()
 
     if __debug__:
         @property
@@ -535,13 +536,35 @@ class IfElseScope(Scope):
     def add_else(self,state):
         self.branch_f = Branch(state)
 
-class MainScope(Scope,Branch):
+class SimpleScope(Scope,Branch):
     def cur_single_scope(self) -> 'Branch':
         return self
 
-class DoWhileScope(Scope,Branch):
-    def cur_single_scope(self) -> 'Branch':
-        return self
+class MainScope(SimpleScope): pass
+class DoWhileScope(SimpleScope): pass
+
+class SFinallyTarget(FinallyTarget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.no_return = False
+
+class FinallyEntry(DelayedCompile):
+    def __init__(self,ftarget: SFinallyTarget,next_t: Target) -> None:
+        self.ftarget = ftarget
+        self.next_t = next_t
+
+    def compile(self,cgen):
+        assert self.next_t in self.ftarget.next_targets
+
+        if self.ftarget.no_return:
+            return cgen.jump(self.ftarget.start)
+
+        return cgen.enter_finally(self.ftarget,self.next_t)
+
+class FinallyScope(SimpleScope):
+    def __init__(self,state: 'State',ftarget: SFinallyTarget) -> None:
+        super().__init__(state)
+        self.ftarget = ftarget
 
 if __debug__:
     class CompareByID(weakref.ref):
@@ -765,8 +788,7 @@ class Stitch:
         return self._debug_append(self.cgen.jump_if(dest,make_value(self,make_cmp(test))))
 
     def do(self):
-        new = DoWhileScope(self.state)
-        self._scopes.append(new)
+        self._scopes.append(DoWhileScope(self.state))
         return self
 
     def while_(self,test):
@@ -774,6 +796,30 @@ class Stitch:
         assert isinstance(top,DoWhileScope)
         assert top.state == self._scopes[-1].cur_single_scope().state
         return self.extend(self.cgen.do_while(top.code,make_value(self,make_cmp(test))))
+
+    def enter_finally(self,ftarget: SFinallyTarget,next_t: Target):
+        return self.append(FinallyEntry(ftarget,next_t))
+
+    def begin_finally(self,ftarget: SFinallyTarget):
+        self._scopes.append(FinallyScope(self.state,ftarget))
+        return self
+
+    def end_finally(self,no_return=False):
+        """Mark the end of the body of a "finally" construct.
+        
+        If the end of the body is never reached (because e.g. there is an
+        unconditional break statement in the body), "no_return" must be True.
+        
+        """
+        top = self._scopes.pop()
+        assert isinstance(top,FinallyScope)
+
+        if no_return:
+            top.ftarget.no_return = True
+            self.append(top.ftarget.start)
+            return self.extend(top.code)
+
+        return self.extend(self.cgen.finally_body(top.ftarget,top.code))
 
     def comment(self,c,*args,inline=False):
         if self.cgen.abi.assembly:
@@ -926,11 +972,11 @@ class Stitch:
             self.cgen.unary_op(a,a if dest is None else dest,optype))
 
     @overload
-    def neg(self,a: StitchT[MutableValue],dest: None):
+    def neg(self,a: StitchT[MutableValue],dest: None) -> 'Stitch':
         pass
 
     @overload
-    def neg(self,a: StitchT[Value],dest: StitchT[MutableValue]):
+    def neg(self,a: StitchT[Value],dest: StitchT[MutableValue]) -> 'Stitch':
         pass
 
     def neg(self,a,dest=None):
@@ -961,19 +1007,10 @@ class Stitch:
         addr = make_arg(self,addr)
         return self._debug_append(self.cgen.load_addr(addr,dest))
 
-    def get_return_address(self,dest):
-        dest = make_arg(self,dest)
-        return self._debug_append(self.cgen.get_return_address(dest))
-
-    def touched_indirectly(self,val,loc_type=LocationType.stack):
-        """Indicate that 'val' may have been updated by something other than
-        the code produced by 'self'.
-
-        This simply makes a value stored in both a register and the stack, be
-        stored in only one, depending on which copy was updated.
-
-        """
-        self.append(IndirectMod(make_arg(self,val),loc_type))
+    def touched_indirectly(self,val,read,write,loc_type=LocationType.stack):
+        """Indicate that 'val' may have been read or updated by something other
+        than the code produced by 'self'."""
+        self.append(IndirectMod(make_arg(self,val),read,write,loc_type))
         return self
 
     def create_var(self,var,val):

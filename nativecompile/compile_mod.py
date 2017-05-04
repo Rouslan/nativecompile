@@ -108,11 +108,8 @@ class FinallyContext(ScopeContext):
     def __init__(self,depth : int) -> None:
         super().__init__(depth)
         self.depth = depth
-        self.target = Target()
-
-        # A list of targets that the code jumps to, after the end of the
-        # finally block. This is needed for variable lifetime determination
-        self.next_targets = [] # type: List[Target]
+        self.ftarget = SFinallyTarget()
+        self.may_return = False
 
 
 def maybe_unicode(node : ast.AST) -> bool:
@@ -132,18 +129,18 @@ class _ParsedValue(ast.AST):
         self.value = value
 
 class CallTargetAction:
-    def __init__(self,target):
-        self.target = target
+    def __init__(self,ftarget):
+        self.ftarget = ftarget
         self.ret_target = Target()
 
     def __call__(self,s):
-        s.call(self.target)(self.ret_target)
+        s.enter_finally(self.ftarget,self.ret_target)(self.ret_target)
 
     def __hash__(self):
-        return hash(self.target)
+        return hash(self.ftarget)
 
     def __eq__(self,b):
-        return isinstance(b,CallTargetAction) and self.target == b.target
+        return isinstance(b,CallTargetAction) and self.ftarget == b.target
 
 if NODE_COMMENTS:
     def visit_extra(f):
@@ -159,6 +156,25 @@ if NODE_COMMENTS:
 else:
     def visit_extra(f):
         return f
+
+class FinallyBody:
+    def __init__(self,ec: 'ExprCompiler',f_context: FinallyContext) -> None:
+        self.ec = ec
+        self.f_context = f_context
+        self.no_return = False
+
+    def __enter__(self):
+        if self.f_context.may_return:
+            self.ec.check_var_return += 1
+        self.ec.code.begin_finally(self.f_context.ftarget)
+
+        return self
+
+    def __exit__(self,exc_type,exc_val,exc_tb):
+        if exc_type is None:
+            self.ec.code.end_finally(self.no_return)
+        if self.f_context.may_return:
+            self.ec.check_var_return -= 1
 
 # noinspection PyPep8Naming
 class ExprCompiler:
@@ -181,7 +197,10 @@ class ExprCompiler:
         self.var_globals = Var('var_globals',data_type=c_types.PyObject_ptr)
         self.var_locals = Var('var_locals',data_type=c_types.PyObject_ptr)
         self.var_free = Var('var_free',data_type=c_types.PyObject_ptr)
-        self.var_return = Var('var_return',data_type=c_types.PyObject_ptr)
+        self.var_return = Var('var_return',dbg_symbol='var_return',data_type=c_types.PyObject_ptr)
+
+        # if this is greater than 0, var_return may have a value
+        self.check_var_return = 0
 
         self._del_name_cleanups = {}
 
@@ -792,8 +811,9 @@ class ExprCompiler:
         (self.code
             .if_(ttest)
                 .lea(arg1,tmp)
+                .touched_indirectly(arg1,True,False)
                 .call('PyUnicode_Append',tmp,arg2)
-                .touched_indirectly(arg1)
+                .touched_indirectly(arg1,False,True)
                 .mov(steal(arg1),r)
             .else_()
                 .call(fallback,arg1,arg2,store_ret=r)
@@ -949,7 +969,7 @@ class ExprCompiler:
         last = self.target_contexts.pop()
         assert c is last
 
-    def unwind_to(self,target,until=None,s=None,last_action=None):
+    def unwind_to(self,target: Target,until: Optional[ScopeContext]=None,s: Optional[Stitch]=None,last_action: Optional[Callable[[Stitch],None]]=None):
         assert not isinstance(until,FinallyContext)
 
         if s is None: s = self.code
@@ -959,7 +979,7 @@ class ExprCompiler:
         max_depth = None
 
         def clean_context(depth):
-            nonlocal  max_depth
+            nonlocal max_depth
 
             items = []
             for item,item_depth in s.state.owned_items():
@@ -974,9 +994,9 @@ class ExprCompiler:
             for ec in c.extra_callbacks: callbacks.append(ec)
 
             if isinstance(c,FinallyContext):
-                action = CallTargetAction(c.target)
+                action = CallTargetAction(c.ftarget)
                 item_groups.append((clean_context(c.depth),action))
-                c.next_targets.append(action.ret_target)
+                c.ftarget.add_next_target(action.ret_target)
                 callbacks.clear()
             if c is until:
                 item_groups.append((clean_context(c.depth),None))
@@ -991,8 +1011,18 @@ class ExprCompiler:
         s(target)
         s.last_op_is_uncond_jmp = True
 
-    def _clear_return(self,s):
-        s.mov(0,self.var_return)
+    def set_return_value(self,val):
+        # bind the current value
+        check_var_return = self.check_var_return
+
+        # this just avoids a reference cycle
+        var_return = self.var_return
+
+        def inner(s):
+            if check_var_return:
+                s.if_(var_return).decref(var_return).endif()
+            s.mov(val,var_return)
+        return inner
 
     def exc_cleanup(self):
         """Free the stack items created at the current exception handler depth.
@@ -1001,7 +1031,7 @@ class ExprCompiler:
             dest = self.func_end
             top = self.top_context(ExceptContext)
             if top: dest = top.target
-            self.unwind_to(dest,top,s,self._clear_return)
+            self.unwind_to(dest,top,s,self.set_return_value(0))
         return inner
 
     def check_err(self,v,inverted=False):
@@ -1144,18 +1174,32 @@ class ExprCompiler:
         new_class.discard(self.code)
 
     def visit_Return(self,node):
+        if self.check_var_return:
+            (self.code
+                .if_(self.var_return)
+                    .decref(self.var_return)
+                .endif()
+                .mov(0,self.var_return))
+
+        for c in self.target_contexts:
+            if isinstance(c,FinallyContext):
+                c.may_return = True
+
+        var_r = PyObject(self.var_return)
         if node.value:
-            val = self.visit(node.value,self.var_return)
+            val = self.visit(node.value,var_r)
         else:
-            val = self.get_const(None,self.var_return)
+            val = self.get_const(None,var_r)
 
-        for oval,depth in self.code.state.owned_items():
-            if oval is not val:
-                oval.discard(self.code)
         if isinstance(val,TrackedValue):
-            self.code.state.disown(val)
+            steal(val)(self.code)
 
-        self.code.jmp(self.func_end)
+        self.unwind_to(self.func_end)
+        #for oval,depth in self.code.state.owned_items():
+        #    if oval is not val:
+        #        oval.discard(self.code)
+        #if isinstance(val,TrackedValue):
+        #    self.code.state.disown(val)
 
         return True
 
@@ -1255,7 +1299,6 @@ class ExprCompiler:
         self.assign_expr(node.target,expr,check_dest=check_dest)
 
     def visit_For(self,node):
-        context = self.new_context(LoopContext)
         exhaust = Target()
         i_type = CType('PyTypeObject',Var('i_type',data_type=c_types.PyTypeObject_ptr))
         itr = PyObject('itr')
@@ -1271,6 +1314,8 @@ class ExprCompiler:
         next_val = PyObject('next_val')
         occurred = Var('occurred',data_type=c_types.PyObject_ptr)
         matches = Var('matches',data_type=c_types.t_int)
+
+        context = self.new_context(LoopContext)
 
         (self.code
             (context.begin)
@@ -1387,61 +1432,55 @@ class ExprCompiler:
         self.unwind_to(t_context.target,t_context)
 
         self.end_context(f_context)
-        self.code(f_context.target)
+        with FinallyBody(self,f_context):
+            exit_r = PyObject('exit_r')
 
-        # the "finally" body is implemented as a local function that uses the
-        # same stack
-        ret_addr = Var()
-        exit_r = PyObject('exit_r')
-        self.code.get_return_address(ret_addr)
+            exc_vals = [PyObject(nullable=True) for _ in range(3)]
+            addr_type = c_types.TPtr(c_types.PyObject_ptr)
+            exc_addrs = [Var(data_type=addr_type) for _ in range(3)]
 
-        exc_vals = [PyObject(nullable=True) for _ in range(3)]
-        addr_type = c_types.TPtr(c_types.PyObject_ptr)
-        exc_addrs = [Var(data_type=addr_type) for _ in range(3)]
+            for val,addr in zip(exc_vals,exc_addrs):
+                self.code.lea(val,addr)
 
-        for val,addr in zip(exc_vals,exc_addrs):
-            self.code.lea(val,addr)
+            self.code.call('PyErr_Fetch',*exc_addrs)
 
-        self.code.call('PyErr_Fetch',*exc_addrs)
+            for val in exc_vals:
+                self.code.touched_indirectly(val,False,True).own(val)
 
-        for val in exc_vals:
-            self.code.touched_indirectly(val).own(val)
-
-        args_tup = PyObject()
-        (self.code
-            .call('PyTuple_New',3,store_ret=args_tup)
-            (self.check_err(args_tup))
-            .own(args_tup)
-            .if_(exc_vals[0]))
-
-        for i,val in enumerate(exc_vals):
+            args_tup = PyObject()
             (self.code
-                .mov(val,tuple_item(args_tup,i))
-                .incref(val))
+                .call('PyTuple_New',3,store_ret=args_tup)
+                (self.check_err(args_tup))
+                .own(args_tup)
+                .if_(exc_vals[0]))
 
-        tmp = Var(data_type=c_types.PyObject_ptr)
-        (self.code
-            .else_()
-                .mov('Py_None',tmp))
-        for i in range(len(exc_vals)): self.code.mov(tmp,tuple_item(args_tup,i))
-        (self.code
-                .incref(tmp,3)
-            .endif())
+            for i,val in enumerate(exc_vals):
+                (self.code
+                    .mov(val,tuple_item(args_tup,i))
+                    .incref(val))
 
-        (self.code
-            .call('PyObject_CallObject',exit_,args_tup,store_ret=exit_r)
-            (args_tup.discard)
-            (exit_.discard)
-            (self.check_err(exit_r))
-            .own(exit_r)
-            .if_(exc_vals[0])
-                .call('PyObject_IsTrue',exit_r,store_ret=tmp)
-                .if_(tmp)
-                    .call('PyErr_Restore',*[steal(v) for v in exc_vals])
+            tmp = Var(data_type=c_types.PyObject_ptr)
+            (self.code
+                .else_()
+                    .mov('Py_None',tmp))
+            for i in range(len(exc_vals)): self.code.mov(tmp,tuple_item(args_tup,i))
+            (self.code
+                    .incref(tmp,3)
+                .endif())
+
+            (self.code
+                .call('PyObject_CallObject',exit_,args_tup,store_ret=exit_r)
+                (args_tup.discard)
+                (exit_.discard)
+                (self.check_err(exit_r))
+                .own(exit_r)
+                .if_(exc_vals[0])
+                    .call('PyObject_IsTrue',exit_r,store_ret=tmp)
+                    .if_(tmp)
+                        .call('PyErr_Restore',*[steal(v) for v in exc_vals])
+                    .endif()
                 .endif()
-            .endif()
-            (exit_r.discard)
-            .jmp(ret_addr,f_context.next_targets))
+                (exit_r.discard))
 
         self.end_context(t_context)
         self.code(t_context.target)
@@ -1480,7 +1519,7 @@ class ExprCompiler:
                 (e_context.target)
                 .lea(exc_val_block,tmp)
                 .call('prepare_exc_handler',tmp)
-                .touched_indirectly(exc_val_block))
+                .touched_indirectly(exc_val_block,False,True))
 
             for v in exc_vals: self.code.own(v)
 
@@ -1537,36 +1576,29 @@ class ExprCompiler:
 
         if node.finalbody:
             self.end_context(f_context)
-            self.code(f_context.target)
+            with FinallyBody(self,f_context) as fb:
+                exc_vals = [PyObject(),PyObject(),PyObject()]
+                addr_type = c_types.TPtr(c_types.PyObject_ptr)
+                exc_addrs = [Var(data_type=addr_type) for _ in range(3)]
 
-            # the "finally" body is implemented as a local function that uses
-            # the same stack
-            ret_addr = Var()
-            self.code.get_return_address(ret_addr)
+                for val,addr in zip(exc_vals,exc_addrs):
+                    self.code.lea(val,addr)
 
-            exc_vals = [PyObject(),PyObject(),PyObject()]
-            addr_type = c_types.TPtr(c_types.PyObject_ptr)
-            exc_addrs = [Var(data_type=addr_type) for _ in range(3)]
+                self.code.call('PyErr_Fetch',*exc_addrs)
 
-            for val,addr in zip(exc_vals,exc_addrs):
-                self.code.lea(val,addr)
+                for val in exc_vals:
+                    self.code.touched_indirectly(val,False,True).own(val)
 
-            self.code.call('PyErr_Fetch',*exc_addrs)
-
-            for val in exc_vals:
-                self.code.touched_indirectly(val).own(val)
-
-            for stmt in node.finalbody:
-                if self.visit(stmt):
-                    for v in exc_vals: v.discard(self.code)
-                    break
-            else:
-                (self.code
-                    .if_(exc_vals[0])
-                        .call('PyErr_Restore',*[steal(v) for v in exc_vals])
-                    .endif())
-
-                self.code.jmp(ret_addr,f_context.next_targets)
+                for stmt in node.finalbody:
+                    if self.visit(stmt):
+                        for v in exc_vals: v.discard(self.code)
+                        fb.no_return = True
+                        break
+                else:
+                    (self.code
+                        .if_(exc_vals[0])
+                            .call('PyErr_Restore',*[steal(v) for v in exc_vals])
+                        .endif())
 
         self.end_context(t_context)
         self.code(t_context.target)
@@ -1593,12 +1625,12 @@ class ExprCompiler:
 
     def visit_Break(self,node):
         context = self.top_context(LoopContext)
-        self.code.jmp(context.break_)
+        self.unwind_to(context.break_,context)
         return True
 
     def visit_Continue(self,node):
         context = self.top_context(LoopContext)
-        self.code.jmp(context.begin)
+        self.unwind_to(context.begin,context)
         return True
 
     def  _boolop_iteration(self,op,values,r):
@@ -2310,6 +2342,11 @@ def compile_eval(
     has_free = isinstance(ec.stable,symtable.Function) and ec.stable.get_frees()
     if has_free:
         ec.code.mov(func_self.closure,ec.var_free)
+
+    # we set this here so that ec.var_return is never only conditionally set,
+    # which would otherwise be the case if e.g. a return statement appears
+    # inside a try-finally statement
+    ec.code.mov(0,ec.var_return)
 
     #naddr = steal(ec.code.fit_addr('Py_None',R_RET))
 

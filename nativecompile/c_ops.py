@@ -16,7 +16,6 @@
 import collections
 from typing import DefaultDict,Dict,Iterable,List,NamedTuple,Optional,Sequence,Set,Union
 
-from . import abi
 from . import compile_mod
 from . import c_types
 from .intermediate import *
@@ -54,6 +53,29 @@ INTERNAL_FUNCS = [
     '_load_build_class',
     'c_global_name',
     'c_local_name']
+
+STR_CONSTS = [
+    'NAME_ERROR_MSG',
+    'GLOBAL_NAME_ERROR_MSG',
+    'UNBOUNDLOCAL_ERROR_MSG',
+    'UNBOUNDFREE_ERROR_MSG',
+    'NO_LOCALS_LOAD_MSG',
+    'NO_LOCALS_STORE_MSG',
+    'NO_LOCALS_DELETE_MSG',
+    'BUILD_CLASS_ERROR_MSG',
+    'CANNOT_IMPORT_MSG',
+    'IMPORT_NOT_FOUND_MSG',
+    'BAD_EXCEPTION_MSG',
+    'UNEXPECTED_KW_ARG_MSG',
+    'DUPLICATE_VAL_MSG']
+
+BY_VALUE = {
+    'PyDict_Type',
+    'PyList_Type',
+    'PyTuple_Type',
+    'PyUnicode_Type',
+    'PyMethod_Type',
+    'PyGen_Type'}
 
 def ptr_expr(x):
     if x.ptr_factor:
@@ -164,6 +186,8 @@ class COpGen(OpGen[IRCCode]):
             return self._indrect_var(a)
 
         if isinstance(a,Symbol):
+            if a.name in BY_VALUE:
+                return '&'+a.name
             return a.name
 
         if isinstance(a,PyConst):
@@ -223,7 +247,9 @@ class COpGen(OpGen[IRCCode]):
         return self.next_func_args[i]
 
     def jump(self,dest: Union[Target,Value],targets: Union[Iterable[Target],Target,None]=None) -> IRCCode:
-        return ['goto {};'.format(self.arg(dest))]
+        return ['goto {}{};'.format(
+            '*' if isinstance(dest,Value) else '',
+            self.arg(dest))]
 
     def _cond(self,cond: Cmp) -> str:
         if isinstance(cond,AndCmp):
@@ -259,7 +285,7 @@ class COpGen(OpGen[IRCCode]):
         return r
 
     def do_while(self,action: IRCCode,cond: Cmp) -> IRCCode:
-        return ['do {'] + action + ['}} while({})'.format(self._cond(cond))]
+        return ['do {',indent] + action + [dedent,'}} while({})'.format(self._cond(cond))]
 
     def jump_table(self,val: Value,targets: Sequence[Target]) -> IRCCode:
         raise NotImplementedError()
@@ -276,6 +302,17 @@ class COpGen(OpGen[IRCCode]):
 
     def get_return_address(self,v: Value) -> IRCCode:
         raise NotImplementedError()
+
+    def enter_finally(self,f: FinallyTarget,next_t: Optional[Target] = None) -> IRCCode:
+        t = Target() if next_t is None else next_t
+        r = ['{} = &&{};'.format(self.arg(f.next_var),self.arg(t))] + self.jump(f.start) # type: IRCCode
+        if next_t is None:
+            r.append(t)
+            f.add_next_target(t)
+        return r
+
+    def finally_body(self,f: FinallyTarget,body: IRCCode) -> IRCCode:
+        return [f.start] + body + self.jump(f.next_var,f.next_targets)
 
     def compile(self,func_name: str,code: IRCCode,ret_var: Optional[Var]=None,end_targets=()):
         lines = ['{} {}({}){{'.format(
@@ -318,7 +355,7 @@ class COpGen(OpGen[IRCCode]):
         return CFunctionBody()
 
 
-class CAbi(abi.Abi):
+class CAbi(Abi):
     code_gen = COpGen
     name_gen = UniqueNameGen()
 
@@ -336,8 +373,19 @@ class UtilityPseudoFunc:
     def addr(self):
         return Symbol(self.name)
 
-def wrapper_funcs():
-    funcs = []
+def init_external_ref(init_lines,name,ptr_name,ptr_type):
+    init_lines.append(
+        'if(!(tmp = PyDict_GetItemString(addrs,"{}"))) {{'.format(name))
+    init_lines.append(
+        '    PyErr_SetString(PyExc_KeyError,"{}");'.format(name))
+    init_lines.append('    goto init_end;')
+    init_lines.append('}')
+    init_lines.append('tmp_l = PyLong_AsUnsignedLong(tmp);')
+    init_lines.append('if(PyErr_Occurred()) goto init_end;')
+    init_lines.append('{} = ({})tmp_l;'.format(ptr_name,ptr_type))
+
+def external_refs():
+    refs = []
     init_lines = []
     for intern_f in INTERNAL_FUNCS:
         sig = c_types.func_signatures[intern_f]
@@ -350,7 +398,7 @@ def wrapper_funcs():
         if sig.returns != c_types.t_void:
             call = 'return' + call
 
-        funcs.append('static {};\nstatic {} {}({}) {{ {}({}); }}'.format(
+        refs.append('static {};\nstatic {} {}({}) {{ {}({}); }}'.format(
             ptr_type.typestr(ptr_name),
             sig.returns,
             intern_f,
@@ -359,15 +407,13 @@ def wrapper_funcs():
             ','.join(param_names)
         ))
 
-        init_lines.append('if(!(tmp = PyDict_GetItemString(addrs,"{}"))) {{'.format(intern_f))
-        init_lines.append('    PyErr_SetString(PyExc_KeyError,"{}");'.format(intern_f))
-        init_lines.append('    goto init_end;')
-        init_lines.append('}')
-        init_lines.append('tmp_l = PyLong_AsUnsignedLong(tmp);')
-        init_lines.append('if(PyErr_Occurred()) goto init_end;')
-        init_lines.append('{} = ({})tmp_l;'.format(ptr_name,ptr_type))
+        init_external_ref(init_lines,intern_f,ptr_name,ptr_type)
 
-    return funcs,init_lines
+    for const in STR_CONSTS:
+        refs.append('static const char *{};'.format(const))
+        init_external_ref(init_lines,const,const,c_types.const_char_ptr)
+
+    return refs,init_lines
 
 def format_and_literal(val):
     if isinstance(val,str):
@@ -395,25 +441,21 @@ def format_and_literal(val):
 
     raise TypeError('unexpected constant type: '+val.__class__.__name__)
 
-def format_and_literal_list(vals):
-    items = [format_and_literal(v) for v in vals]
-    return ''.join(item[0] for item in items),','.join(item[1] for item in items)
-
 def compound_format_and_literal(*values):
     format = []
     args = []
-    for v in values:
-        if type(v) in (list,tuple):
-            format.append('(')
-            for item in v:
-                f,a = format_and_literal(item)
+
+    def handle_tuple(values):
+        for v in values:
+            if type(v) in (list,tuple):
+                format.append('(')
+                handle_tuple(v)
+                format.append(')')
+            else:
+                f,a = format_and_literal(v)
                 format.append(f)
                 args.append(a)
-            format.append(')')
-        else:
-            f,a = format_and_literal(v)
-            format.append(f)
-            args.append(a)
+    handle_tuple(values)
 
     return ''.join(format),','.join(args)
 
@@ -457,7 +499,7 @@ def compile(code: str,modname: str='module') -> str:
     for i,e in enumerate(entry_points):
         e.fb_obj.name = 'bodies[{}]'.format(i)
 
-    w_funcs,init_lines = wrapper_funcs()
+    w_funcs,init_lines = external_refs()
 
     r = [
         '#include <Python.h>\n' +

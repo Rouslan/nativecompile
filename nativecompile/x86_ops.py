@@ -313,6 +313,9 @@ class Displacement:
     def __hash__(self):
         return self.val ^ self.force_full_size
 
+    def __int__(self):
+        return self.val
+
 
 def fits_in_sbyte(x):
     if isinstance(x,Displacement):
@@ -512,11 +515,6 @@ def _op_imm_addr(byte1,mid,a,b):
 #
 # def cpuid():
 #     return b'\x0F\xA2'
-#
-#
-#
-# def leave():
-#     return b'\xC9'
 #
 #
 #
@@ -722,6 +720,9 @@ class BasicOps:
             Overload([test,m,reg],cmovcc_m_reg)
         ],[R,R,RW])
 
+        def add_imm_reg(a: int,b: Register):
+            return _op_imm_reg(0b10000000,0b111,0b00111100,a,b)
+
         self.cmp = X86OpDescription('cmp',[
             Overload([reg,reg],
                 (lambda a,b: _op_reg_reg(0b00111000,a,b))),
@@ -729,8 +730,7 @@ class BasicOps:
                 (lambda a,b: _op_addr_reg(0b00111000,a,b,True))),
             Overload([reg,m],
                 (lambda a,b: _op_addr_reg(0b00111000,b,a,False))),
-            Overload([imm,reg],
-                (lambda a,b: _op_imm_reg(0b10000000,0b111,0b00111100,a,b))),
+            Overload([imm,reg],add_imm_reg),
             Overload([imm,m],
                 (lambda a,b: _op_imm_addr(0b10000000,0b111,a,b)))
         ],[R,R])
@@ -1089,7 +1089,7 @@ class BasicOps:
             self.mov.overloads[0:3] + [
                 Overload(self.mov.overloads[3].params,macro_mov_imm_reg),
                 Overload([mov_imm,m],macro_mov_imm_m)
-        ],[R,W])
+            ],[R,W])
 
         # this "op" does way too much, but our intermediate compile process is
         # not sophisticated enough to handle a case where simultaneously the
@@ -1168,6 +1168,28 @@ class BasicOps:
         self.jump_table = X86OpDescription('macro_jump_table',[
             Overload([JumpTable,reg,reg,reg],macro_jump_table)
         ],[R,R,W,W])
+
+        if abi.ptr_size == 8:
+            def _get_rel_addr(d: Displacement,tmp: Register):
+                return lea(Address64(d.val,rip),tmp)
+        else:
+            def _get_rel_addr(d: Displacement,tmp: Register):
+                r = b''
+
+                # the value of the ADD instruction needs to take into account
+                # its own size
+                proto_add = add_imm_reg(127,tmp)
+
+                pop = pop_reg(tmp)
+                add = add_imm_reg(d.val - len(pop) - len(proto_add),tmp)
+
+                assert len(add) == len(proto_add)
+
+                r += call_d(Displacement(0)) + pop + add
+
+        self.macro_lea = X86OpDescription('macro_lea',self.lea.overloads + [
+            Overload([d,reg],_get_rel_addr)
+        ],self.lea.param_dirs)
 
 class JumpTable:
     def __init__(self,targets : Sequence[Target]) -> None:
@@ -1379,8 +1401,18 @@ class X86OpGen(JumpCondOpGen):
         r.append(Instr(self.ops.shl if shift_dir == ShiftDir.left else self.ops.shr,amount,dest))
         return r
 
-    def get_return_address(self,v : MutableValue) -> IRCode:
-        return [Instr(self.ops.pop,v)]
+    def enter_finally(self,f: FinallyTarget,next_t: Optional[Target]=None) -> IRCode:
+        t = Target() if next_t is None else next_t
+        r = [Instr(self.ops.macro_lea,t,f.next_var)] + self.jump(f.start) # type: IRCode
+        if next_t is None:
+            r.append(t)
+            f.add_next_target(t)
+        return r
+
+    def finally_body(self,f: FinallyTarget,body: IRCode) -> IRCode:
+        if __debug__:
+            f._used = True
+        return [f.start] + body + self.jump(f.next_var,f.next_targets)
 
     def get_compiler(self,regs_used : Set[int],stack_used : int,args_used : int):
         return X86Compiler(self.abi,self.callconv,self.ops,regs_used,stack_used,args_used)

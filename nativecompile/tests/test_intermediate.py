@@ -340,24 +340,24 @@ class MyTestCase(unittest.TestCase):
         endif = ir.Target()
 
         code = [
-            ir.Instr(dummy_op),                         # 0
-            ir.Instr(write_op,a),                       # 1
-            ir.Instr(dummy_op),                         # 2
-            ir.Instr(write_op,b),                       # 3
-            ir.IRJump(else_,True,0),                    # 4
-            ir.Instr(dummy_op),                         # 5
-            ir.Instr(write_op,b),                       # 6
-            ir.IndirectMod(c,ir.LocationType.register), # 7
-            ir.Instr(read_op,a),                        # 8
-            ir.Instr(dummy_op),                         # 9
-            ir.IRJump(endif,False,0),                   # 10
-            else_,                                      # 11
-            ir.Instr(read_op,a),                        # 12
-            ir.Instr(write_op,c),                       # 13
-            endif,                                      # 14
-            ir.Instr(readwrite_op,a),                   # 15
-            ir.Instr(read_op,b),                        # 16
-            ir.Instr(read_op,c)                         # 17
+            ir.Instr(dummy_op),                                    # 0
+            ir.Instr(write_op,a),                                  # 1
+            ir.Instr(dummy_op),                                    # 2
+            ir.Instr(write_op,b),                                  # 3
+            ir.IRJump(else_,True,0),                               # 4
+            ir.Instr(dummy_op),                                    # 5
+            ir.Instr(write_op,b),                                  # 6
+            ir.IndirectMod(c,False,True,ir.LocationType.register), # 7
+            ir.Instr(read_op,a),                                   # 8
+            ir.Instr(dummy_op),                                    # 9
+            ir.IRJump(endif,False,0),                              # 10
+            else_,                                                 # 11
+            ir.Instr(read_op,a),                                   # 12
+            ir.Instr(write_op,c),                                  # 13
+            endif,                                                 # 14
+            ir.Instr(readwrite_op,a),                              # 15
+            ir.Instr(read_op,b),                                   # 16
+            ir.Instr(read_op,c)                                    # 17
         ]
         ir.calc_var_intervals(code)
 
@@ -432,58 +432,58 @@ class MyTestCase(unittest.TestCase):
         d = ir.Var('d')
 
         to5 = [0, 1, 2, 3, 4, 5]
-        code = [                                             #     a b c d
-            ir.CreateVar(a,ir.FixedRegister(9)),             # 0   w
-            ir.IRJump(target_1,True,0),                      # 1   |
-            ir.Instr(write_op,b),                            # 2   | w
-            ir.IRJump(target_2,False,0),                     # 3   | |
-            target_1,                                        # 4   |
-            ir.Instr(read_op,a),                             # 5   r
-            target_3,                                        # 6   |
-            ir.IRJump(target_4,True,0),                      # 7   |
-            ir.IRJump(target_5,True,0),                      # 8   |
-            target_5,                                        # 9   |
-            ir.IRJump(target_7,False,0),                     # 10  |
-            target_4,                                        # 11  |
-            ir.IRJump(target_8,True,0),                      # 12  |
-            ir.IRJump(target_6,False,0),                     # 13  |
-            target_8,                                        # 14  |
-            ir.IRJump(target_9,True,0),                      # 15  |
-            target_6,                                        # 16  |
-            ir.Instr(write_op,b),                            # 17  | w
-            ir.IRJump(target_2,False,0),                     # 18  | |
-            target_9,                                        # 19  |
-            ir.LockRegs((0,)),                               # 20  |
-            ir.InvalidateRegs([6,7,8,10,11,12,13,14],to5),   # 21  |
-            ir.UnlockRegs((0,)),                             # 22  |
-            ir.CreateVar(c,ir.FixedRegister(8)),             # 23  |   w
-            ir.Instr(read_op,c),                             # 24  |   r
-            ir.IRJump(target_10,True,0),                     # 25  |   |
-            ir.Instr(write_op,b),                            # 26  | w
-            ir.IRJump(target_2,False,0),                     # 27  | |
-            target_10,                                       # 28  |   |
-            ir.Instr(write_op,ir.IndirectVar(40,c,None,8)),  # 29  |   r
-            ir.LockRegs((0, 1, 2)),                          # 30  |   |
-            ir.Instr(read_op,c),                             # 31  |   r
-            ir.InvalidateRegs([6,7,8,12,13,14],to5),         # 32  |
-            ir.UnlockRegs((0, 1, 2)),                        # 33  |
-            ir.CreateVar(d,ir.FixedRegister(8)),             # 34  |     w
-            ir.Instr(read_op,d),                             # 35  |     r
-            ir.IRJump(target_11,True,0),                     # 36  |     |
-            ir.Instr(write_op,b),                            # 37  | w
-            ir.IRJump(target_2,False,0),                     # 38  | |
-            target_11,                                       # 39  |     |
-            ir.LockRegs((0,)),                               # 40  |     |
-            ir.Instr(read_op,d),                             # 41  |     r
-            ir.InvalidateRegs([6,7,8,10,11,12,13,14],to5),   # 42  |
-            ir.UnlockRegs((0,)),                             # 43  |
-            ir.IRJump(target_3,False,0),                     # 44  |
-            target_7,                                        # 45  |
-            ir.Instr(write_op,b),                            # 46  | w
-            target_2,                                        # 47  | |
-            ir.InvalidateRegs([6,7,8,9,10,11,12,13,14],to5), # 48  | |
-            ir.Instr(read_op,ir.IndirectVar(40,a,None,8)),   # 49  r |
-            ir.Instr(read_op,b)]                             # 50    r
+        code = [                                                #     a b c d
+            ir.CreateVar(a,ir.FixedRegister(9)),                # 0   w
+            ir.IRJump(target_1,True,0),                         # 1   |
+            ir.Instr(write_op,b),                               # 2   | w
+            ir.IRJump(target_2,False,0),                        # 3   | |
+            target_1,                                           # 4   |
+            ir.Instr(read_op,a),                                # 5   r
+            target_3,                                           # 6   |
+            ir.IRJump(target_4,True,0),                         # 7   |
+            ir.IRJump(target_5,True,0),                         # 8   |
+            target_5,                                           # 9   |
+            ir.IRJump(target_7,False,0),                        # 10  |
+            target_4,                                           # 11  |
+            ir.IRJump(target_8,True,0),                         # 12  |
+            ir.IRJump(target_6,False,0),                        # 13  |
+            target_8,                                           # 14  |
+            ir.IRJump(target_9,True,0),                         # 15  |
+            target_6,                                           # 16  |
+            ir.Instr(write_op,b),                               # 17  | w
+            ir.IRJump(target_2,False,0),                        # 18  | |
+            target_9,                                           # 19  |
+            ir.LockRegs((0,)),                                  # 20  |
+            ir.InvalidateRegs([6,7,8,10,11,12,13,14],to5),      # 21  |
+            ir.UnlockRegs((0,)),                                # 22  |
+            ir.CreateVar(c,ir.FixedRegister(8)),                # 23  |   w
+            ir.Instr(read_op,c),                                # 24  |   r
+            ir.IRJump(target_10,True,0),                        # 25  |   |
+            ir.Instr(write_op,b),                               # 26  | w
+            ir.IRJump(target_2,False,0),                        # 27  | |
+            target_10,                                          # 28  |   |
+            ir.Instr(write_op,ir.IndirectVar(40,c,None,8)),     # 29  |   r
+            ir.LockRegs((0, 1, 2)),                             # 30  |   |
+            ir.Instr(read_op,c),                                # 31  |   r
+            ir.InvalidateRegs([6,7,8,12,13,14],to5),            # 32  |
+            ir.UnlockRegs((0, 1, 2)),                           # 33  |
+            ir.CreateVar(d,ir.FixedRegister(8)),                # 34  |     w
+            ir.Instr(read_op,d),                                # 35  |     r
+            ir.IRJump(target_11,True,0),                        # 36  |     |
+            ir.Instr(write_op,b),                               # 37  | w
+            ir.IRJump(target_2,False,0),                        # 38  | |
+            target_11,                                          # 39  |     |
+            ir.LockRegs((0,)),                                  # 40  |     |
+            ir.IndirectMod(d,True,False,ir.LocationType.stack), # 41  |     r
+            ir.InvalidateRegs([6,7,8,10,11,12,13,14],to5),      # 42  |
+            ir.UnlockRegs((0,)),                                # 43  |
+            ir.IRJump(target_3,False,0),                        # 44  |
+            target_7,                                           # 45  |
+            ir.Instr(write_op,b),                               # 46  | w
+            target_2,                                           # 47  | |
+            ir.InvalidateRegs([6,7,8,9,10,11,12,13,14],to5),    # 48  | |
+            ir.Instr(read_op,ir.IndirectVar(40,a,None,8)),      # 49  r |
+            ir.Instr(read_op,b)]                                # 50    r
         ir.calc_var_intervals(code)
 
         self.assertEqual(a.lifetime.intervals,DInterval([(1,50)]))
