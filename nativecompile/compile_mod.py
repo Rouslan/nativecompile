@@ -432,7 +432,7 @@ class ExprCompiler:
             (self.code
                 .mov(func_args,r_args)
                 .mov(len(args.args),missing_args)
-                .sub(missing_args,CType('PyVarObject',r_args).ob_size)
+                .sub(missing_args,CType(c_types.PyVarObject,r_args).ob_size)
                 .mov(CType('Function',func_self).defaults,defaults)
                 .if_(signed(missing_args) < 0)
                     .comment('if there are more arguments than parameters')
@@ -494,14 +494,14 @@ class ExprCompiler:
                 d_index = Var(data_type=c_types.t_long)
                 default_item = tuple_item(defaults,0)
                 default_item.index = d_index
-                default_item.scale = self.abi.ptr_size
+                default_item.scale = SIZE_PTR
 
                 c_func_self = CType('Function',r_kwds)
 
                 def_len = Var(data_type=c_types.t_long)
                 item = Var(data_type=c_types.PyObject_ptr)
                 item_b = Var(data_type=c_types.PyObject_ptr)
-                s.mov(CType('PyVarObject',defaults).ob_size,def_len)
+                s.mov(CType(c_types.PyVarObject,defaults).ob_size,def_len)
 
                 for i,a in enumerate(args.args):
                     name = self.get_name(a.arg)
@@ -540,7 +540,7 @@ class ExprCompiler:
                 targets = [Target() for _ in range(len(args.args)+1)]
 
                 (s
-                    .mov(CType('PyVarObject',defaults).ob_size,def_len)
+                    .mov(CType(c_types.PyVarObject,defaults).ob_size,def_len)
                     .if_(signed(missing_args) > def_len)
                         (mark_miss)
                         .mov(def_len,missing_args)
@@ -572,7 +572,7 @@ class ExprCompiler:
                     .incref(func_args))
             else:
                 (self.code
-                    .if_(CType('PyVarObject',func_args).ob_size)
+                    .if_(CType(c_types.PyVarObject,func_args).ob_size)
                         .call('too_many_positional',func_self,func_args,func_kwds)
                         (self.exc_cleanup())
                     .endif())
@@ -1471,19 +1471,29 @@ class ExprCompiler:
             (self.code
                 .call('PyObject_CallObject',exit_,args_tup,store_ret=exit_r)
                 (args_tup.discard)
-                (exit_.discard)
                 (self.check_err(exit_r))
                 .own(exit_r)
                 .if_(exc_vals[0])
                     .call('PyObject_IsTrue',exit_r,store_ret=tmp)
+                    .if_(signed(tmp) < 0)
+                        (self.exc_cleanup())
+                    .endif()
                     .if_(tmp)
+                        (exc_vals[0].discard_non_null)
+                        (exc_vals[1].discard_non_null)
+                        (exc_vals[2].discard))
+
+            self.unwind_to(t_context.target,t_context)
+
+            (self.code
+                    .else_()
                         .call('PyErr_Restore',*[steal(v) for v in exc_vals])
                     .endif()
                 .endif()
                 (exit_r.discard))
 
         self.end_context(t_context)
-        self.code(t_context.target)
+        self.code(t_context.target)(exit_.discard)
 
     def visit_Raise(self,node):
         raise NotImplementedError()

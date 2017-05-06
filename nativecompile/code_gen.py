@@ -364,6 +364,13 @@ class PyObject(TrackedValue[ValueT]):
             PyObject.nullable_cleanup if nullable else PyObject.cleanup,
             own)
 
+    def discard_non_null(self,s):
+        """This is like discard() except the value is assumed to be non-null,
+        regardless of whether this object was initialized with "nullable"."""
+        if s.state.owned(self):
+            s.decref(self.value)
+            s.state.disown(self)
+
     if __debug__:
         @property
         def origin(self):
@@ -428,7 +435,7 @@ class ConstValue(MaybeTrackedValue[ValueT]):
 
 class TupleItem(StitchValue):
     def __init__(self,r,n):
-        self.addr = CType('PyTupleObject',r).ob_item
+        self.addr = CType(c_types.PyTupleObject,r).ob_item
         self.n = n
 
     def __call__(self,s):
@@ -450,25 +457,39 @@ class ObjArrayValue(TrackedValue[ValueT]):
 
 
 class CType(StitchValue[ValueT]):
-    def __init__(self,t: str,base: Optional[ValueT]=None,index: Optional[Value]=None,scale=SIZE_PTR) -> None:
-        self.offsets = pyinternals.member_offsets[t]
-        self.base = Var() if base is None else base
+    def __init__(self,t: Union[str,c_types.CType,None]=None,base: Optional[ValueT]=None,index: Optional[Value]=None,scale=SIZE_PTR) -> None:
+        if t is None:
+            assert base is not None
+            self.t = c_types.stripped_type(base.datatype) # type: Union[str,c_types.CType]
+        else:
+            assert t is not None
+            self.t = t if isinstance(t,str) else c_types.stripped_type(t)
+        self.base = Var(data_type=(t if isinstance(t,c_types.CType) else c_types.t_void_ptr)) if base is None else base
         self.index = index
         self.scale = scale
 
     def __getattr__(self,name):
-        offset = self.offsets.get(name)
-        if offset is None: raise AttributeError(name)
-        return SIndirect(offset,self.base,self.index,self.scale)
+        attr_t = c_types.t_void_ptr
+        if isinstance(self.t,str):
+            offset = pyinternals.member_offsets[self.t].get(name)
+            if offset is None: raise AttributeError(name)
+        else:
+            t = c_types.real_type(self.t)
+            assert isinstance(t,c_types.TStruct)
+            attr = t.attr_lookup.get(name)
+            if attr is None: raise AttributeError(name)
+            offset = attr.offset
+            attr_t = attr.datatype
+        return SIndirect(offset,self.base,self.index,self.scale,data_type=attr_t)
 
     def __call__(self,s):
         return self.base
 
 def type_of(r):
-    return CType('PyObject',r).ob_type
+    return CType(c_types.PyObject,r).ob_type
 
 def type_flags_of(r):
-    return CType('PyTypeObject',r).tp_flags
+    return CType(c_types.PyTypeObject,r).tp_flags
 
 class SImmediate(StitchValue[Immediate]):
     def __init__(self,val,size=SIZE_PTR):
@@ -819,6 +840,7 @@ class Stitch:
             self.append(top.ftarget.start)
             return self.extend(top.code)
 
+        self._cur_scope.state = top.state
         return self.extend(self.cgen.finally_body(top.ftarget,top.code))
 
     def comment(self,c,*args,inline=False):
@@ -839,7 +861,7 @@ class Stitch:
 
             return self
 
-        return self.add(CType('PyObject',val).ob_refcnt,amount)
+        return self.add(CType(c_types.PyObject,val).ob_refcnt,amount)
 
     def decref(self,val,amount=1):
         """Generate instructions equivalent to Py_DECREF"""
@@ -855,10 +877,10 @@ class Stitch:
 
         ob_type = Var(data_type=c_types.PyTypeObject_ptr)
         (self
-            .sub(CType('PyObject',val).ob_refcnt,amount)
-            .if_(not_(CType('PyObject',val).ob_refcnt))
-            .mov(CType('PyObject',val).ob_type,ob_type)
-            .call(CType('PyTypeObject',ob_type).tp_dealloc,val))
+            .sub(CType(c_types.PyObject,val).ob_refcnt,amount)
+            .if_(not_(CType(c_types.PyObject,val).ob_refcnt))
+            .mov(CType(c_types.PyObject,val).ob_type,ob_type)
+            .call(CType(base=ob_type).tp_dealloc,val))
 
         if pyinternals.COUNT_ALLOCS:
             self.call('inc_count',ob_type)

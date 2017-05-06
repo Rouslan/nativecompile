@@ -231,10 +231,28 @@ class TFunc(CType):
     def _die(self,dcu,abi,st,cache):
         raise ValueError('not implemented')
 
-class TStruct(BasicType):
-    def __init__(self,name,members):
+class Attribute:
+    def __init__(self,name,datatype,offset):
         self.name = name
-        self.members = members
+        self.datatype = datatype
+        self.offset = offset
+
+class TStruct(BasicType):
+    def __init__(self,name,attrs=None):
+        self.name = name
+        self._attrs = ()
+        self.attr_lookup = {}
+        if attrs is not None:
+            self.attrs = attrs
+
+    @property
+    def attrs(self):
+        return self._attrs
+
+    @attrs.setter
+    def attrs(self,val):
+        self._attrs = val
+        self.attr_lookup = {a.name: a for a in val}
 
     def full_name(self):
         if self.name:
@@ -274,8 +292,13 @@ def real_type(x):
 def real_isinstance(x,t):
     return isinstance(real_type(x),t)
 
+def stripped_type(x):
+    while isinstance(x,(TTypedef,TPtr,TConst)):
+        x = x.base
+    return x
+
 def typedef_struct(typedef,name=None):
-    return TTypedef(typedef,TStruct(name,pyinternals.member_offsets[typedef]))
+    return TTypedef(typedef,TStruct(name))
 
 PyObject = typedef_struct('PyObject','_object')
 PyVarObject = typedef_struct('PyVarObject')
@@ -290,8 +313,8 @@ CompiledCode = typedef_struct('CompiledCode','_CompiledCode')
 FunctionBody = typedef_struct('FunctionBody')
 Function = typedef_struct('Function')
 Generator = typedef_struct('Generator')
-PyDictObject = TTypedef('PyDictObject',TStruct(None,{}))
-PyCodeObject = TTypedef('PyCodeObject',TStruct(None,{}))
+PyDictObject = typedef_struct('PyDictObject')
+PyCodeObject = typedef_struct('PyCodeObject')
 
 t_void_ptr = TPtr(t_void)
 
@@ -307,6 +330,30 @@ Function_ptr = TPtr(Function)
 FunctionBody_ptr = TPtr(FunctionBody)
 Py_ssize_t = t_long
 size_t = t_ulong
+
+def set_attrs(t,attrs):
+    real_type(t).attrs = sorted(
+        (Attribute(name,datatype,pyinternals.member_offsets[t.name][name]) for name,datatype in attrs),
+        key=(lambda a: a.offset))
+
+set_attrs(PyObject,[
+    ('ob_refcnt',Py_ssize_t),
+    ('ob_type',PyTypeObject_ptr)
+])
+
+set_attrs(PyVarObject,[
+    ('ob_size',Py_ssize_t)
+])
+
+set_attrs(PyTypeObject,[
+    ('tp_dealloc',t_void_ptr),
+    ('tp_iternext',t_void_ptr),
+    ('tp_flags',t_void_ptr)
+])
+
+set_attrs(PyTupleObject,[
+    ('ob_item',t_void_ptr)
+])
 
 func_signatures = {
     'PyMem_Malloc' : TFunc([size_t],t_void_ptr),

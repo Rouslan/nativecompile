@@ -18,6 +18,7 @@ from typing import DefaultDict,Dict,Iterable,List,NamedTuple,Optional,Sequence,S
 
 from . import compile_mod
 from . import c_types
+from . import pyinternals
 from .intermediate import *
 
 class _Indent:
@@ -68,6 +69,8 @@ STR_CONSTS = [
     'BAD_EXCEPTION_MSG',
     'UNEXPECTED_KW_ARG_MSG',
     'DUPLICATE_VAL_MSG']
+
+OBJECTS = ['build_class']
 
 BY_VALUE = {
     'PyDict_Type',
@@ -134,9 +137,9 @@ class COpGen(OpGen[IRCCode]):
                 t = c_types.real_type(b_type.base)
                 if isinstance(t,c_types.TStruct):
                     a_offset = a.offset.val
-                    for name,offset in t.members.items():
-                        if a_offset == offset:
-                            r = '{}->{}'.format(self.arg(a.base),name)
+                    for attr in t.attrs:
+                        if a_offset == attr.offset:
+                            r = '{}->{}'.format(self.arg(a.base),attr.name)
 
                             if a.index:
                                 a_type = c_types.real_type(a.data_type)
@@ -154,7 +157,7 @@ class COpGen(OpGen[IRCCode]):
         if a.base:
             parts.append('((char*){})'.format(self.arg(a.base)))
         if a.index:
-            part = '((long){})'.format(a.index)
+            part = '((long){})'.format(self.arg(a.index))
             if a.scale != 1:
                 part += ' * ' + ptr_expr(a.scale)
             parts.append(part)
@@ -288,7 +291,7 @@ class COpGen(OpGen[IRCCode]):
         return ['do {',indent] + action + [dedent,'}} while({})'.format(self._cond(cond))]
 
     def jump_table(self,val: Value,targets: Sequence[Target]) -> IRCCode:
-        raise NotImplementedError()
+        return ['goto *(((void*[]){{{}}})[{}]);'.format(','.join('&&'+self.arg(t) for t in targets),self.arg(val))]
 
     def move(self,src: Value,dest: MutableValue) -> IRCCode:
         return ['{} = {};'.format(self.arg(dest),self.arg(src))]
@@ -299,9 +302,6 @@ class COpGen(OpGen[IRCCode]):
             self.arg(src),
             '<<' if shift_dir == ShiftDir.left else '>>',
             self.arg(amount))]
-
-    def get_return_address(self,v: Value) -> IRCCode:
-        raise NotImplementedError()
 
     def enter_finally(self,f: FinallyTarget,next_t: Optional[Target] = None) -> IRCCode:
         t = Target() if next_t is None else next_t
@@ -415,6 +415,10 @@ def external_refs():
 
     return refs,init_lines
 
+def obj_inits():
+    for i,obj in enumerate(OBJECTS):
+        yield 'if(!(other_objs[{}] = PyObject_GetAttrString(intern_mod,"{}"))) goto err;'.format(i,obj)
+
 def format_and_literal(val):
     if isinstance(val,str):
         return 's','"{}"'.format(val.encode('raw_unicode_escape').decode('latin_1'))
@@ -438,6 +442,8 @@ def format_and_literal(val):
         return 'O','Py_None'
     if val is ...:
         return 'O','Py_Ellipsis'
+    if val is pyinternals.build_class:
+        return 'O','other_objs[0]'
 
     raise TypeError('unexpected constant type: '+val.__class__.__name__)
 
@@ -539,62 +545,65 @@ static PyModuleDef module = {{
 PyMODINIT_FUNC PyInit_{modname}(void) {{
     int i;
     PyObject *mod, *tmp, *init_str, *init_fb, *new_fb=NULL, *fb_type=NULL, *new_args_tup=NULL, *f_type=NULL;
+    PyObject *other_objs[{obj_count}] = {{NULL}};
     PyObject *bodies[{body_count}] = {{NULL}};
-    
+
     if(intern_mod) Py_INCREF(intern_mod);
     else {{
         unsigned long tmp_l;
         PyObject *addrs;
-        
+
         if(!(intern_mod = PyImport_ImportModule("nativecompile.pyinternals"))) return NULL;
-        
+
         addrs = PyObject_GetAttrString(intern_mod,"raw_addresses");
-        
+
         if(!addrs) {{
             Py_DECREF(intern_mod);
             return NULL;
         }}
-        
+
         {initcode}
-        
+
     init_end:
         Py_DECREF(addrs);
-        
+
         if(PyErr_Occurred()) {{
             Py_DECREF(intern_mod);
             return NULL;
         }}
     }}
-    
+
     if(!(mod = PyModule_Create(&module))) return NULL;
-    
+
     tmp = PyEval_GetBuiltins();
     Py_INCREF(tmp);
     if(PyModule_AddObject(mod,"__builtins__",tmp)) goto err;
-    
+
     if(!(init_str = PyUnicode_FromString("__init__"))) goto err;
     if(!(fb_type = PyObject_GetAttrString(intern_mod,"FunctionBody"))) goto err;
     if(!(new_fb = PyObject_GetAttrString(fb_type,"__new__"))) goto err;
     if(!(new_args_tup = PyTuple_Pack(1,fb_type))) goto err;
-    
+
     for(i=0;i<{body_count};++i) {{
         if(!(bodies[i] = PyObject_Call(new_fb,new_args_tup,NULL))) goto err;
     }}
-    
+
+    {obj_init}
     {fb_init}
-    
+
     if(!(f_type = PyObject_GetAttrString(intern_mod,"Function"))) goto err;
     if(!(tmp = PyObject_CallFunction(f_type,"OsO",bodies[{last_body}],"__main_func",PyModule_GetDict(mod)))) goto err;
-    
+
     if(PyModule_AddObject(mod,"__main_func",tmp)) goto err;
 end:
     Py_XDECREF(f_type);
+    for(i=0;i<{obj_count};++i) Py_XDECREF(other_objs[i]);
     for(i=0;i<{body_count};++i) Py_XDECREF(bodies[i]);
     Py_XDECREF(new_args_tup);
     Py_XDECREF(new_fb);
     Py_XDECREF(fb_type);
     Py_XDECREF(init_str);
-    
+
     return mod;
 err:
     Py_DECREF(mod);
@@ -602,8 +611,10 @@ err:
     goto end;
 }}""".format(
         modname=modname,
+        obj_count=len(OBJECTS),
         body_count=len(entry_points),
         initcode='\n        '.join(init_lines),
+        obj_init='\n    '.join(obj_inits()),
         fb_init='\n    '.join(func_bodies(entry_points)),
         last_body=len(entry_points)-1))
 
